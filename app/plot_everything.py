@@ -2,9 +2,10 @@ import os
 os.environ["OMP_NUM_THREADS"] = "1"
 
 from firedrake import *
-import numpy as np
-import pyvista as pv
 import matplotlib.pyplot as plt
+import pyvista as pv
+import numpy as np
+from firedrake import Function, FunctionSpace
 
 
 def plot_2D_background_flow(mesh2d, u):
@@ -64,27 +65,34 @@ def plot_2D_background_flow(mesh2d, u):
     plt.tight_layout()
     plt.show()
 
+
 def plot_curved_channel_section_with_spherical_hole(mesh, style="wireframe", opacity=0.4, show_axes=True):
-    coords = mesh.coordinates.dat.data_ro.copy()  # (num_nodes, 3)
+
+
     Vcoord = mesh.coordinates.function_space()
-    cells = np.array(Vcoord.cell_node_list, dtype=np.int64)  # (num_cells, 4)
+    degree = Vcoord.ufl_element().degree()
+    if degree > 1:
+        print(f"Mesh is curved (degree={degree}) – linearised CG1-coordinates are used for the plot")
+    V1 = VectorFunctionSpace(mesh, "CG", 1)
+    coords_lin = Function(V1).interpolate(mesh.coordinates)
+
+    coords = coords_lin.dat.data_ro.copy()
+
+    cells = np.array(V1.cell_node_list, dtype=np.int64)
     num_cells = cells.shape[0]
-
-    cells_pv = np.hstack(
-        [np.column_stack([np.full(num_cells, 4), cells]).ravel()]
-    )
-
+    cells_pv = np.hstack([np.column_stack([np.full(num_cells, 4), cells]).ravel()])
     celltypes = np.full(num_cells, pv.CellType.TETRA, dtype=np.uint8)
 
     grid = pv.UnstructuredGrid(cells_pv, celltypes, coords)
 
     plotter = pv.Plotter()
-    plotter.add_mesh(grid, style=style, opacity=opacity)
+    plotter.add_mesh(grid, style=style, opacity=opacity, show_edges=True)
     if show_axes:
         plotter.add_axes()
     plotter.show()
 
     return grid
+
 
 def plot_background_flow(mesh3d, u_bg, p_bg, *, mode="surface", normal=(1, 0, 0), origin=None, opacity=0.15,
     show_vectors=True, vector_stride=6, vector_scale=None, streamline=True, n_seeds=300, seed_radius_factor=0.35,
@@ -173,6 +181,53 @@ def plot_background_flow(mesh3d, u_bg, p_bg, *, mode="surface", normal=(1, 0, 0)
 
     return grid
 
+
+def plot_lift_force_field_with_streamlines(grid, W, H, a, cmap="plasma", density=1.4):
+    """
+    Recreates Figure 2 from Harding et al.:
+    - background: |F_p^0|
+    - black contour: F_r = 0
+    - white contour: F_z = 0
+    - streamlines: flow of (F_r, F_z)
+    - arrows show sign
+    - dashed red lines: particle touching wall
+    """
+    r, z = grid["r"], grid["z"]
+    Fr, Fz = grid["Fr"], grid["Fz"]
+
+    Fmag = np.sqrt(Fr**2 + Fz**2)
+    Fmag_norm = Fmag / np.max(Fmag)
+
+    fig, ax = plt.subplots(figsize=(6.5, 6.0))
+
+    c = ax.contourf(r, z, Fmag_norm, levels=100, cmap=cmap)
+    plt.colorbar(c, ax=ax, label=r"$|\mathbf{F}_p^0| / \max|\mathbf{F}_p^0|$")
+
+
+    Frs = Fr / (Fmag + 1e-12)
+    Fzs = Fz / (Fmag + 1e-12)
+    ax.streamplot(z[0, :], r[:, 0], Fzs, Frs, color='k', linewidth=0.6, density=density, arrowsize=0.6)
+
+    ax.contour(r, z, Fr, levels=[0.0], colors="black", linewidths=1.3)
+    ax.contour(r, z, Fz, levels=[0.0], colors="white", linewidths=1.3)
+
+    skip = (slice(None, None, 8), slice(None, None, 8))
+    ax.quiver(r[skip], z[skip],
+              np.sign(Fr[skip]), np.sign(Fz[skip]),
+              color="k", scale=15, width=0.0025, alpha=0.6)
+
+    ax.axvline(-W/2 + a, color="red", linestyle="--", linewidth=1.4)
+    ax.axvline( W/2 - a, color="red", linestyle="--", linewidth=1.4)
+
+    ax.set_xlim(-W/2, W/2)
+    ax.set_ylim(-H/2, H/2)
+    ax.set_aspect("equal")
+    ax.set_xlabel(r"$r/W$")
+    ax.set_ylabel(r"$z/H$")
+    ax.set_title("Lift force field $\\mathbf{F}_p^0$ with streamlines")
+
+    plt.tight_layout()
+    plt.show()
 
 
 

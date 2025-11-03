@@ -31,25 +31,4 @@ def Nondimensionalizer(d_1, d_2, R, rho, mu, H, W, Q):
 
     De = Re * np.sqrt(H/(2*R))
 
-    return {
-        "scales": {
-            "L0_phys": L0_phys,
-            "U0_phys": U0_phys,
-            "T0_phys": T0_phys,
-            "M0_phys": M0_phys,
-            "Q0_phys": Q0_phys,
-            "mu0_phys": mu0_phys,
-        },
-        "dimensionless": {
-            "d1": d1_nd,
-            "d2": d2_nd,
-            "Rc": Rc_nd,
-            "H": H_nd,
-            "W": W_nd,
-            "Q": Q_nd,
-            "rho": rho_nd,
-            "mu": mu_nd,
-            "Re": Re,
-            "De": De
-        }
-    }
+    return d1_nd, d2_nd, Rc_nd, H_nd, W_nd, Q_nd, rho_nd, mu_nd, Re, De
