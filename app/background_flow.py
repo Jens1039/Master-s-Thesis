@@ -4,11 +4,6 @@ os.environ["OMP_NUM_THREADS"] = "1"
 from firedrake import *
 import numpy as np
 from math import atan2, hypot, cos, sin
-from netgen.csg import *
-from firedrake import Mesh, COMM_WORLD
-import netgen
-import math, netgen.libngpy
-from netgen.occ import Pnt, ArcOfCircle, Wire, WorkPlane, Axes, Pipe, Sphere, OCCGeometry, X, Y, Z
 
 class background_flow:
 
@@ -20,8 +15,10 @@ class background_flow:
         self.rho = rho
         self.mu = mu
         self.a = a
+        self.mesh2d = RectangleMesh(120, 120, self.W, self.H, quadrilateral=False)
 
-    def get_G(self, mesh, calculate_G=True, G = None):
+
+    def _get_G(self):
         '''
         We solve the part of the (reduced) Navier-Stokes equation, where G appears, with G = 1:
 
@@ -38,52 +35,49 @@ class background_flow:
 
         '''
 
-        if calculate_G == True:
-            x = SpatialCoordinate(mesh)
+        x = SpatialCoordinate(self.mesh2d)
 
-            r = self.R + x[0] - 0.5 * self.W
+        r = self.R + x[0] - 0.5 * self.W
 
-            V = FunctionSpace(mesh, "CG", 2)
-            u = TrialFunction(V)
-            v = TestFunction(V)
+        V = FunctionSpace(self.mesh2d, "CG", 2)
+        u = TrialFunction(V)
+        v = TestFunction(V)
 
-            a = ( inner(grad(u), grad(v)) - (u.dx(0) / r) * v + (u / (r**2)) * v ) * dx
+        a = ( inner(grad(u), grad(v)) - (u.dx(0) / r) * v + (u / (r**2)) * v ) * dx
 
-            L = ( (self.R/ r) * v ) * dx
+        L = ( (self.R/ r) * v ) * dx
 
-            bc = DirichletBC(V, Constant(0.0), "on_boundary")
+        bc = DirichletBC(V, Constant(0.0), "on_boundary")
 
-            u_sol = Function(V, name="uhat")
+        u_sol = Function(V, name="uhat")
 
-            solve(a == L, u_sol, bcs=bc,
+        solve(a == L, u_sol, bcs=bc,
                   solver_parameters=
                   {
                     "ksp_type": "preonly",
                     "pc_type": "lu"
                     })
 
-            x = SpatialCoordinate(mesh)
-            r = self.R + x[0] - 0.5 * self.W
-            Q_1 = assemble(u_sol * (r) * dx)  # weight with (R + r_local)
-            G = self.Q/Q_1
+        r = self.R + x[0] - 0.5 * self.W
+        Q_1 = assemble(u_sol * (r) * dx)  # weight with (R + r_local)
+        G = self.Q/Q_1
 
-            self.G = G
-        else:
-            assert G != None; "external value for G required"
-            G = G
-            self.G = G
+        self.G = G
         return G
 
 
-    def solve_2D_background_flow(self, mesh2d):
+    def solve_2D_background_flow(self):
+
+        self.G = self._get_G()
+
         # "Q" => Tensorproduct-elements, 2 = degrees of the polynomials
-        V = VectorFunctionSpace(mesh2d, "P", 2, dim=3)
-        Q = FunctionSpace(mesh2d, "P", 1)
+        V = VectorFunctionSpace(self.mesh2d, "P", 2, dim=3)
+        Q = FunctionSpace(self.mesh2d, "P", 1)
         # Just the Cartesian product of V and Q
         W_mixed = V * Q
 
         # extracts a UFL expression for the coordinates of the mesh
-        x_mesh, z_mesh  = SpatialCoordinate(mesh2d)
+        x_mesh, z_mesh  = SpatialCoordinate(self.mesh2d)
         # Initialise r and z so that (r,z) = (0,0) it is at the center of the cross-section
         r = x_mesh - self.W/2
         z = z_mesh - self.H/2
@@ -146,8 +140,9 @@ class background_flow:
             solver_parameters={
                 # SNES = Scalable Nonlinear Equation Solver  here: Newton with Line Search as step range criteria
                 "snes_type": "newtonls",
-                # The type of linesearch is an (Armijo) backtracking strategy where we test the descent criteria ||F(w_k + a_k*d_k)|| < (1 - ca_k)||F(w_k)|| with decreasing a_k until it is valid
-                "snes_linesearch_type": "bt",
+                # bt: test the descent criteria ||F(w_k + a_k*d_k)|| < (1 - ca_k)||F(w_k)|| with decreasing a_k until it is valid
+                # l2: solves min ||F(x_k + alpha*d_k||_(L^2) over alpha
+                "snes_linesearch_type": "l2",
                 # Tests for ||F(w_k)||/||F(w_0)|| and stops algorithm once ratio has fallen below
                 "snes_rtol": 1e-8,
                 # Tests for ||F(w_k)|| and stops algorithm once absolute value has fallen below
@@ -174,7 +169,7 @@ class background_flow:
         return u_sol, p_sol
 
 
-    def build_background_flow(self, mesh3d):
+    def build_3d_background_flow(self, mesh3d):
 
         u_2d = self.u_sol
         p_2d = self.p_sol
@@ -251,69 +246,5 @@ class background_flow:
         for j, v in enumerate(p_vals_raw):
             p_data[j] = float(np.asarray(v).reshape(-1)[0])
 
+
         return u_bar_3d, p_bar_3d
-
-
-
-def make_curved_channel_section_with_spherical_hole(R, W, H, L, a, h, r_off=0.0, z_off=0.0, order=3, global_maxh=None):
-
-    theta = L / R
-
-    p0 = Pnt(R*math.cos(0.0),       R*math.sin(0.0),       0.0)
-    pm = Pnt(R*math.cos(theta*0.5), R*math.sin(theta*0.5), 0.0)
-    p1 = Pnt(R*math.cos(theta),     R*math.sin(theta),     0.0)
-    spine = Wire([ArcOfCircle(p0, pm, p1)])
-
-    wp = WorkPlane(Axes((p0.x, p0.y, p0.z), n=Y, h=Z))
-    rect_face = wp.RectangleC(W, H).Face()   # <-- zentriert (wichtig!)  :contentReference[oaicite:0]{index=0}
-
-    channel = Pipe(spine, rect_face)
-    channel.faces.name = "walls"
-
-    cx = (R + r_off) * math.cos(theta*0.5)
-    cy = (R + r_off) * math.sin(theta*0.5)
-    cz = z_off
-    sph = Sphere(Pnt(cx, cy, cz), a)
-    sph.faces.name = "particle"
-
-    fluid = channel - sph
-
-    fluid.faces.Nearest((p0.x, p0.y, p0.z)).name = "inlet"
-    fluid.faces.Nearest((p1.x, p1.y, p1.z)).name = "outlet"
-
-
-    nrx = math.cos(theta*0.5)
-    nry = math.sin(theta*0.5)
-    probe = (cx + a*nrx, cy + a*nry, cz)
-    fpart = fluid.faces.Nearest(probe)
-    fpart.name = "particle"
-    fpart.maxh = h
-
-    if global_maxh is None:
-        global_maxh = 0.3*max(W, H)
-
-    if COMM_WORLD.rank == 0:
-        ngmesh = OCCGeometry(fluid, dim=3).GenerateMesh(maxh=global_maxh)
-
-    else:
-        ngmesh = netgen.libngpy._meshing.Mesh(3)
-
-    if order and order >= 2:
-        mesh3d = Mesh(Mesh(ngmesh, comm=COMM_WORLD).curve_field(order))
-    else:
-        mesh3d = Mesh(ngmesh, comm=COMM_WORLD)
-
-    names = ngmesh.GetRegionNames(codim=1)
-    def _id(name):
-        return names.index(name) + 1 if name in names else None
-
-    tags = {
-        "walls":    _id("walls"),
-        "inlet":    _id("inlet"),
-        "outlet":   _id("outlet"),
-        "particle": _id("particle"),
-        "theta":    theta,
-        "center":   (cx, cy, cz),
-        "backend":  "netgen_occ",
-    }
-    return mesh3d, tags

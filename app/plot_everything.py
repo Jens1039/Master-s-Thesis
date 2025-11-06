@@ -8,7 +8,7 @@ import numpy as np
 from firedrake import Function, FunctionSpace
 
 
-def plot_2D_background_flow(mesh2d, u):
+def plot_2d_background_flow(mesh2d, u):
     coords = mesh2d.coordinates.dat.data_ro
     xmin, xmax = float(coords[:, 0].min()), float(coords[:, 0].max())
     zmin, zmax = float(coords[:, 1].min()), float(coords[:, 1].max())
@@ -94,13 +94,13 @@ def plot_curved_channel_section_with_spherical_hole(mesh, style="wireframe", opa
     return grid
 
 
-def plot_background_flow(mesh3d, u_bg, p_bg, *, mode="surface", normal=(1, 0, 0), origin=None, opacity=0.15,
+def plot_3d_background_flow(mesh3d, u_bg, p_bg, *, mode="surface", normal=(1, 0, 0), origin=None, opacity=0.15,
     show_vectors=True, vector_stride=6, vector_scale=None, streamline=True, n_seeds=300, seed_radius_factor=0.35,
     cmap="viridis", show_axes=True):
 
-    coords = mesh3d.coordinates.dat.data_ro.copy()  # (n_verts, 3)
+    coords = mesh3d.coordinates.dat.data_ro.copy()
     Vcoord = mesh3d.coordinates.function_space()
-    cells_fd = np.asarray(Vcoord.cell_node_list, dtype=np.int64)  # (n_cells, 4)
+    cells_fd = np.asarray(Vcoord.cell_node_list, dtype=np.int64)
     n_cells, nverts = cells_fd.shape
     cells_pv = np.column_stack([np.full(n_cells, nverts, dtype=np.int64), cells_fd]).ravel()
     celltypes = np.full(n_cells, pv.CellType.TETRA, dtype=np.uint8)
@@ -182,50 +182,42 @@ def plot_background_flow(mesh3d, u_bg, p_bg, *, mode="surface", normal=(1, 0, 0)
     return grid
 
 
-def plot_lift_force_field_with_streamlines(grid, W, H, a, cmap="plasma", density=1.4):
-    """
-    Recreates Figure 2 from Harding et al.:
-    - background: |F_p^0|
-    - black contour: F_r = 0
-    - white contour: F_z = 0
-    - streamlines: flow of (F_r, F_z)
-    - arrows show sign
-    - dashed red lines: particle touching wall
-    """
-    r, z = grid["r"], grid["z"]
-    Fr, Fz = grid["Fr"], grid["Fz"]
+def plot_force_grid(data):
 
+    r = np.array(data["r"])
+    z = np.array(data["z"])
+    Fr = np.array(data["Fr"])
+    Fz = np.array(data["Fz"])
     Fmag = np.sqrt(Fr**2 + Fz**2)
-    Fmag_norm = Fmag / np.max(Fmag)
-
-    fig, ax = plt.subplots(figsize=(6.5, 6.0))
-
-    c = ax.contourf(r, z, Fmag_norm, levels=100, cmap=cmap)
-    plt.colorbar(c, ax=ax, label=r"$|\mathbf{F}_p^0| / \max|\mathbf{F}_p^0|$")
 
 
-    Frs = Fr / (Fmag + 1e-12)
-    Fzs = Fz / (Fmag + 1e-12)
-    ax.streamplot(z[0, :], r[:, 0], Fzs, Frs, color='k', linewidth=0.6, density=density, arrowsize=0.6)
+    Nr, Nz = data.get("N_r", int(np.sqrt(r.size))), data.get("N_z", int(np.sqrt(z.size)))
+    R = r.reshape((Nr, Nz))
+    Z = z.reshape((Nr, Nz))
+    Fr2 = Fr.reshape((Nr, Nz))
+    Fz2 = Fz.reshape((Nr, Nz))
+    Fmag2 = Fmag.reshape((Nr, Nz))
 
-    ax.contour(r, z, Fr, levels=[0.0], colors="black", linewidths=1.3)
-    ax.contour(r, z, Fz, levels=[0.0], colors="white", linewidths=1.3)
 
-    skip = (slice(None, None, 8), slice(None, None, 8))
-    ax.quiver(r[skip], z[skip],
-              np.sign(Fr[skip]), np.sign(Fz[skip]),
-              color="k", scale=15, width=0.0025, alpha=0.6)
+    fig, ax = plt.subplots(figsize=(6, 5))
 
-    ax.axvline(-W/2 + a, color="red", linestyle="--", linewidth=1.4)
-    ax.axvline( W/2 - a, color="red", linestyle="--", linewidth=1.4)
 
-    ax.set_xlim(-W/2, W/2)
-    ax.set_ylim(-H/2, H/2)
+    im = ax.contourf(R, Z, Fmag2, levels=40, cmap="viridis")
+
+
+    c1 = ax.contour(R, Z, Fr2, levels=[0], colors="black", linewidths=1.2)
+    c2 = ax.contour(R, Z, Fz2, levels=[0], colors="white", linewidths=1.2)
+
+
+    step = max(1, Nr // 20)
+    ax.quiver(R[::step, ::step], Z[::step, ::step], Fr2[::step, ::step], Fz2[::step, ::step], color="k", scale=40, width=0.004, alpha=0.8)
+
+
+    ax.set_xlabel("r / a")
+    ax.set_ylabel("z / a")
+    ax.set_title("Cross-sectional Lift Force Field")
+    fig.colorbar(im, ax=ax, label="|F′ₚ| / (ρU²a²)")
     ax.set_aspect("equal")
-    ax.set_xlabel(r"$r/W$")
-    ax.set_ylabel(r"$z/H$")
-    ax.set_title("Lift force field $\\mathbf{F}_p^0$ with streamlines")
-
     plt.tight_layout()
     plt.show()
 
