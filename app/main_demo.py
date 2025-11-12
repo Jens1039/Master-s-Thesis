@@ -14,6 +14,13 @@ from plot_everything import plot_2d_background_flow, plot_curved_channel_section
 
 if __name__ == "__main__":
 
+    bg = background_flow(R, H, W, Q, Re)
+    bg.solve_2D_background_flow()
+    plot_2d_background_flow(bg.mesh2d, bg.u_bar)
+
+    mesh3d, tags = make_curved_channel_section_with_spherical_hole(R, W, H, L, a, particle_maxh, global_maxh, r_off=0.0, z_off=0.0, order=3)
+    plot_curved_channel_section_with_spherical_hole(mesh3d)
+
     filename = f"lift_force_grid_{N_r}_times_{N_z}.pkl"
     filepath = os.path.join(os.path.join(os.path.dirname(__file__), "..", "cache"), filename)
 
@@ -23,9 +30,6 @@ if __name__ == "__main__":
                 data = pickle.load(f)
     else:
         print("Calculate data new...")
-
-        bg = background_flow(R, H, W, Q, Re)
-        bg.solve_2D_background_flow()
 
         data = sample_grid(R, H, W, Q, L, a, particle_maxh, global_maxh, Re, N_r=N_r, N_z=N_z)
 

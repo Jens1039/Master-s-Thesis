@@ -8,26 +8,31 @@ from perturbed_flow import perturbed_flow
 
 _BG = None
 
-def init_bg_worker(R, H, W, Q, rho, mu, a):
+def init_bg_worker(R, H, W, Q, Re):
     global _BG
-    _BG = background_flow(R, H, W, Q, rho, mu, a)
-    _BG._get_G()
+    _BG = background_flow(R, H, W, Q, Re)
     _BG.solve_2D_background_flow()
 
 
-def _compute_single_force(args):
-    i, j, r_loc, z_loc, R, H, W, L, a, h, Re = args
-    mesh3d, tags = make_curved_channel_section_with_spherical_hole(
-        R, W, H, L, a, h, r_off=-r_loc, z_off=z_loc
-    )
-    pf = perturbed_flow(mesh3d, tags, _BG, tags["walls"], tags["particle"])
-    F_vec = pf.F_p(r_loc, z_loc)
+def _compute_single_force(arg):
+
+    i, j, r_loc, z_loc, R, H, W, L, a, particle_maxh, global_maxh, Re = arg
+
+    mesh3d, tags = make_curved_channel_section_with_spherical_hole(R, W, H, L, a, particle_maxh, global_maxh, r_loc, z_loc)
+
+    perturbed_flow_object = perturbed_flow(mesh3d, tags, a, _BG)
+
+    F_vec = perturbed_flow_object.F_p()
+
     x0, y0, z0 = tags["center"]
+
     r0 = float(np.hypot(x0, y0))
+
     if r0 == 0.0:
         ex0 = np.array([1.0, 0.0, 0.0], dtype=float)
     else:
         ex0 = np.array([x0 / r0, y0 / r0, 0.0], dtype=float)
+
     ez0 = np.array([0.0, 0.0, 1.0], dtype=float)
     Fr_val = float(ex0 @ F_vec)
     Fz_val = float(ez0 @ F_vec)
@@ -46,7 +51,8 @@ def build_grid(W, H, a, N_r, N_z, eps=1e-6):
     return R, Z
 
 
-def sample_grid(background_flow, R, H, W, L, a, h, Re, N_r=60, N_z=60, eps=1e-10, nproc=None):
+def sample_grid(R, H, W, Q, L, a, particle_maxh, global_maxh, Re, N_r, N_z, eps=1e-10, nproc=None):
+    # eps absolutely necessary !!! without it process fails immediately
     r_min = -W / 2 + a + eps
     r_max =  W / 2 - a - eps
     z_min = -H / 2 + a + eps
@@ -59,18 +65,17 @@ def sample_grid(background_flow, R, H, W, L, a, h, Re, N_r=60, N_z=60, eps=1e-10
     Fr = np.zeros_like(r, dtype=float)
     Fz = np.zeros_like(z, dtype=float)
 
-    tasks = [(i, j, r[i, j], z[i, j], R, H, W, L, a, h, Re)
+    tasks = [(i, j, r[i, j], z[i, j], R, H, W, L, a, particle_maxh, global_maxh, Re)
              for i in range(N_r) for j in range(N_z)]
 
     if nproc is None:
-        nproc = max(1, mp.cpu_count() // 2)
+        nproc = mp.cpu_count()
 
     print(f"Start parallelisation with {nproc} processes ...")
 
     with mp.Pool(processes=nproc,
                  initializer=init_bg_worker,
-                 initargs=(R, H, W, background_flow.Q, background_flow.rho, background_flow.mu,
-                           background_flow.a)) as pool:
+                 initargs=(R, H, W, Q, Re)) as pool:
         results = []
         for res in tqdm(pool.imap_unordered(_compute_single_force, tasks),
                         total=len(tasks),

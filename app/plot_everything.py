@@ -89,7 +89,7 @@ def plot_curved_channel_section_with_spherical_hole(mesh, style="wireframe", opa
     plotter.add_mesh(grid, style=style, opacity=opacity, show_edges=True)
     if show_axes:
         plotter.add_axes()
-    plotter.show()
+    plotter.show(interactive=True)
 
     return grid
 
@@ -186,24 +186,26 @@ def plot_force_grid(data):
 
     r = np.array(data["r"])
     z = np.array(data["z"])
+
     Fr = np.array(data["Fr"])
     Fz = np.array(data["Fz"])
+
     Fmag = np.sqrt(Fr**2 + Fz**2)
 
 
     Nr, Nz = data.get("N_r", int(np.sqrt(r.size))), data.get("N_z", int(np.sqrt(z.size)))
+
     R = r.reshape((Nr, Nz))
     Z = z.reshape((Nr, Nz))
+
     Fr2 = Fr.reshape((Nr, Nz))
     Fz2 = Fz.reshape((Nr, Nz))
-    Fmag2 = Fmag.reshape((Nr, Nz))
 
+    Fmag2 = Fmag.reshape((Nr, Nz))
 
     fig, ax = plt.subplots(figsize=(6, 5))
 
-
     im = ax.contourf(R, Z, Fmag2, levels=40, cmap="viridis")
-
 
     c1 = ax.contour(R, Z, Fr2, levels=[0], colors="black", linewidths=1.2)
     c2 = ax.contour(R, Z, Fz2, levels=[0], colors="white", linewidths=1.2)
@@ -215,11 +217,12 @@ def plot_force_grid(data):
 
     ax.set_xlabel("r / a")
     ax.set_ylabel("z / a")
-    ax.set_title("Cross-sectional Lift Force Field")
+    ax.set_title("Cross-sectional Force Field")
     fig.colorbar(im, ax=ax, label="|F′ₚ| / (ρU²a²)")
     ax.set_aspect("equal")
     plt.tight_layout()
     plt.show()
+
 
 
 

@@ -8,9 +8,9 @@ d_2 = 12e-6         # diameter of the bigger cell [m]
 # Notice: right now, we're choosing standard values used in most microfluidic chips
 # ---VARIABLE ASSUMPTION--------------------------------
 R = 2800e-6         # bend radius [m]
-H = 120e-6          # duct height [m]
-W = 500e-6          # duct width  [m]
-Q = 3e-8            # volumetric flow rate [m^3/s]
+H = 240e-6 # 120e-6          # duct height [m]
+W = 240e-6 # 500e-6         # duct width  [m]
+Q = 2e-8   # 3e-8         # volumetric flow rate [m^3/s]
 # ------------------------------------------------------
 
 # ---FIXED ASSUMPTIONS----------------------------------
@@ -18,10 +18,7 @@ rho = 998           # density [kg/m^3]
 mu  = 10.02e-4      # dyn. viscosity [Pa·s]
 # ------------------------------------------------------
 
-# ---RESOLUTION OF THE GRID OF PARTICLE FORCES----------
-N_r = 20
-N_z = 20
-# ------------------------------------------------------
+# For numerical conditioning and comparability reasons, all our computations should be done in the nondimensional settings
 
 def nondimensionalize(d_1, d_2, R, H, W, Q, rho, mu, print_values=False):
 
@@ -65,9 +62,32 @@ def nondimensionalize(d_1, d_2, R, H, W, Q, rho, mu, print_values=False):
 
     return a_1_nd, a_2_nd, H_nd, W_nd, R_nd, Re, Re_p
 
-a_1, a_2, H, W, R, Re, Re_p = nondimensionalize(d_1, d_2, R, H, W, Q, rho, mu, print_values=False)
+a_1, a, H, W, R, Re, Re_p = nondimensionalize(d_1, d_2, R, H, W, Q, rho, mu)
 
-Q = Re * mu * H / rho # in an updatet Version the computation of G will take place here and Q will be eleviated from the main
+'''
+H =  1.0000000000000002
+W =  1.0000000000000002
+R =  11.666666666666668
+a_1 =  0.016666666666666666
+a_2 =  0.025
+Re =  83.00066533599465
+Re_p =  0.05187541583499667
+De =  17.18277016526121
+'''
+
+# ---LENGTH OF THE DUCT SECTION WE'RE LOOKING AT--------
+L = 3
+# ------------------------------------------------------
+
+# ---RESOLUTION OF THE GRID OF PARTICLE FORCES----------
+N_r = 20
+N_z = 20
+# ------------------------------------------------------
+
+# ---RESOLUTION OF THE MESH AROUND THE PARTICLE---------
+particle_maxh = 0.02
+global_maxh = 0.3*max(W,H)
+# ------------------------------------------------------
 
 
 
