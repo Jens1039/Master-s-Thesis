@@ -1,12 +1,10 @@
-from netgen.csg import *
+import math
 from firedrake import Mesh, COMM_WORLD
-import netgen
-import math, netgen.libngpy
-from netgen.occ import Pnt, ArcOfCircle, Wire, WorkPlane, Axes, Pipe, Sphere, OCCGeometry, X, Y, Z
+from netgen.occ import *
+import netgen.meshing
 
 
-
-def make_curved_channel_section_with_spherical_hole(R, W, H, L, a, particle_maxh, global_maxh, r_off=0.0, z_off=0.0, order=3):
+def make_curved_channel_section_with_spherical_hole(R, H, W, L, a, particle_maxh, global_maxh, r_off=0.0, z_off=0.0, order=3):
 
     theta = L / R
 
@@ -60,11 +58,7 @@ def make_curved_channel_section_with_spherical_hole(R, W, H, L, a, particle_maxh
     else:
         netgenmesh = netgen.libngpy._meshing.Mesh(3)
 
-
-    if order and order >= 2:
-        mesh3d = Mesh(Mesh(netgenmesh, comm=COMM_WORLD).curve_field(order))
-    else:
-        mesh3d = Mesh(netgenmesh, comm=COMM_WORLD)
+    mesh3d = Mesh(Mesh(netgenmesh, comm=COMM_WORLD).curve_field(order))
 
     names = netgenmesh.GetRegionNames(codim=1)
     def _id(name):
@@ -76,6 +70,6 @@ def make_curved_channel_section_with_spherical_hole(R, W, H, L, a, particle_maxh
         "outlet":   _id("outlet"),
         "particle": _id("particle"),
         "theta":    theta,
-        "center":   (cx, cy, cz),
+        "particle_center":   (cx, cy, cz),
     }
     return mesh3d, tags

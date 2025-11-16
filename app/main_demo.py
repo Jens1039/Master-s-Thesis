@@ -1,40 +1,101 @@
+import warnings
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", message=".*import SLEPc.*", category=UserWarning)
+
 import os
-os.environ["OMP_NUM_THREADS"]="1"
-import pickle
+os.environ["OMP_NUM_THREADS"] = "1"
 
-from config_lab_parameters import *
+from firedrake import *
+from matplotlib import pyplot as plt
 
-from background_flow import background_flow
-from build_3d_geometry import make_curved_channel_section_with_spherical_hole
-from perturbed_flow import perturbed_flow
-from compute_force_grid import sample_grid
-from plot_everything import plot_2d_background_flow, plot_curved_channel_section_with_spherical_hole, plot_3d_background_flow, plot_force_grid
+from config_paper_parameters import *
+from find_equilbrium_points import *
 
 
+# --------------------------------------------------------
+# Monitoring-Funktion (optional)
+# --------------------------------------------------------
+def newton_monitor(iter, x, Fx, delta):
+    print(
+        f"[Newton iter {iter:02d}] "
+        f"x = ({x[0]:.5f}, {x[1]:.5f}) | "
+        f"|F| = {np.linalg.norm(Fx):.3e} | "
+        f"|dx| = {np.linalg.norm(delta):.3e}"
+    )
 
+
+# --------------------------------------------------------
+# MAIN PROGRAM
+# --------------------------------------------------------
 if __name__ == "__main__":
 
-    bg = background_flow(R, H, W, Q, Re)
-    bg.solve_2D_background_flow()
-    plot_2d_background_flow(bg.mesh2d, bg.u_bar)
+    print("=== Setup FpEvaluator + Background Flow ===")
 
-    mesh3d, tags = make_curved_channel_section_with_spherical_hole(R, W, H, L, a, particle_maxh, global_maxh, r_off=0.0, z_off=0.0, order=3)
-    plot_curved_channel_section_with_spherical_hole(mesh3d)
+    fp_eval = FpEvaluator(
+        R, W, H, L, a,
+        particle_maxh, global_maxh,
+        Re, Re_p
+    )
 
-    filename = f"lift_force_grid_{N_r}_times_{N_z}.pkl"
-    filepath = os.path.join(os.path.join(os.path.dirname(__file__), "..", "cache"), filename)
+    print("\n=== Coarse Grid (nur ein Run!) ===")
 
-    if os.path.exists(filepath):
-        print(f"Load data from cache: {filepath}")
-        with open(filepath, "rb") as f:
-                data = pickle.load(f)
+    # coarse grid EINMAL berechnen
+    coarse_data = coarse_candidates_parallel_deflated(
+        fp_eval,
+        n_r=9,
+        n_z=9,
+        verbose=True
+    )
+
+    candidates, r_vals, z_vals, phi = coarse_data
+
+    print("\n=== Newton + Deflation ===")
+
+    equilibria = find_equilibria_with_deflation(
+        fp_eval,
+        n_r=9,
+        n_z=9,
+        max_roots=10,
+        skip_radius=0.02,
+        newton_kwargs=dict(
+            alpha=1e-2,
+            p=2.0,
+            tol_F=1e-2,  # <-- WICHTIG: realistischer Wert
+            tol_x=1e-6,
+            max_iter=15,
+            monitor=newton_monitor,
+            ls_max_steps=8,
+            ls_reduction=0.5,
+        ),
+        verbose=True,
+        coarse_data=coarse_data,
+        max_candidates=10,
+        refine_factor=4,
+    )
+
+    print("\n=== Gefundene Gleichgewichtslagen ===")
+    for i, (r_eq, z_eq) in enumerate(equilibria, start=1):
+        print(f"{i}: r = {r_eq:.6f}, z = {z_eq:.6f}")
+
+    if equilibria.size > 0:
+        print("\n=== Stabilitätsklassifikation (x_dot = -F_p) ===")
+        stability_info = classify_equilibria(
+            fp_eval,
+            equilibria,
+            eps_rel=1e-4,
+            ode_sign=-1.0,
+            tol_eig=1e-6,
+            verbose=True,
+        )
     else:
-        print("Calculate data new...")
+        print("\nKeine Gleichgewichtslagen gefunden – nichts zu klassifizieren.")
 
-        data = sample_grid(R, H, W, Q, L, a, particle_maxh, global_maxh, Re, N_r=N_r, N_z=N_z)
-
-        with open(filepath, "wb") as f:
-            pickle.dump(data, f)
-        print(f"Data stored in the cache under: {filepath}")
-
-    plot_force_grid(data)
+    print("\n=== Visualisierung ===")
+    plot_equilibria_contour(
+        fp_eval,
+        r_vals,
+        z_vals,
+        phi,
+        equilibria,
+        stability_info=stability_info
+    )

@@ -20,35 +20,35 @@ mu  = 10.02e-4      # dyn. viscosity [Pa·s]
 
 # For numerical conditioning and comparability reasons, all our computations should be done in the nondimensional settings
 
-def nondimensionalize(d_1, d_2, R, H, W, Q, rho, mu, print_values=False):
+def nondimensionalize(d_1, d_2, R, H, W, Q, rho, mu, print_values=True):
 
     # Characteristic length is the hydraulic diameter D_h
-    L_ref = (2*H*W)/(W + H)
+    L_c = (2*H*W)/(W + H)
 
     # Characteristic velocity is the velocity of a fluid particle without perturbations (based on the input flow rate)
-    U_ref = Q/(W*H)
+    U_c = Q/(W*H)
 
     # Characteristic time is the time, that it takes for a fluid particle to cross the hydraulic diameter
-    T_ref = L_ref/U_ref
+    T_ref = L_c/U_c
 
     # typical reference pressure in fluid dynamics
-    P_ref = rho*(U_ref**2)
+    P_ref = rho*(U_c**2)
 
     # nondimensionalize every input variable
-    a_1_nd = d_1/(2*L_ref)
-    a_2_nd = d_2/(2*L_ref)
-    R_nd = R/L_ref
-    H_nd = H/L_ref
-    W_nd = W/L_ref
+    a_1_nd = d_1/(2*L_c)
+    a_2_nd = d_2/(2*L_c)
+    R_nd = R/L_c
+    H_nd = H/L_c
+    W_nd = W/L_c
 
     # we nondimensionalize the Navier-Stokes equation (and its reduced forms) in the classical way, therefore mu and rho are contained in Re
-    Re = (rho*U_ref*L_ref)/mu
+    Re = (rho*U_c*L_c)/mu
 
     # in our case Re_p to is a second important quantity to determine whether we can use a perturbation expansion to calculate the perturbed flow
     Re_p = Re*(a_2_nd)**2
 
     # the dean number is important to determine the secondary fluid regime
-    De = Re * np.sqrt(L_ref / (2 * R))
+    De = Re * np.sqrt(L_c / (2 * R))
 
     if print_values:
         print("H = ", H_nd)
@@ -80,8 +80,8 @@ L = 3
 # ------------------------------------------------------
 
 # ---RESOLUTION OF THE GRID OF PARTICLE FORCES----------
-N_r = 20
-N_z = 20
+N_r = 10
+N_z = 10
 # ------------------------------------------------------
 
 # ---RESOLUTION OF THE MESH AROUND THE PARTICLE---------

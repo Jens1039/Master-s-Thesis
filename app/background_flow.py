@@ -130,9 +130,9 @@ class background_flow:
                 "pc_factor_mat_solver_type": "mumps",
                 # Theese two parameters can be used for monitoring the optimization process
                 # "snes_linesearch_monitor": None,
-                "snes_monitor": None,
+                # "snes_monitor": None,
                 "snes_linesearch_maxlambda": 1,
-                "snes_monitor_convergence_criteria": None,
+                # "snes_monitor_convergence_criteria": None,
             },
         )
 
