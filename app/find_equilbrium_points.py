@@ -589,15 +589,6 @@ def plot_equilibria_contour(fp_eval, r_vals, z_vals, phi,
                             cmap="viridis",
                             levels=20,
                             figsize=(7, 5)):
-    """
-    Visualisiert:
-      - Konturen von phi = ||F||
-      - Gleichgewichtslagen, farblich codiert nach Stabilität:
-            stabil: grün
-            Sattel: gelb
-            instabil: rot
-            unklar: grau
-    """
 
     R, Z = np.meshgrid(r_vals, z_vals, indexing="ij")
 
@@ -605,7 +596,7 @@ def plot_equilibria_contour(fp_eval, r_vals, z_vals, phi,
     cs = plt.contourf(R, Z, phi, levels=levels, cmap=cmap)
     plt.colorbar(cs, label=r"$\|\mathbf{F}_p(r,z)\|$")
 
-    # Farben nach Stabilität
+
     color_map = {
         "stabil": "green",
         "Sattel": "yellow",

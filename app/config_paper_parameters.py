@@ -1,14 +1,14 @@
 import numpy as np
 
 # ---DIMENSIONLESS CELL SIZE---------------------------
-a = 0.15
+a = 0.05
 # -----------------------------------------------------
 
 # ---DIMENSIONLESS ENGINEERING SETUP-------------------
 R = 160
 W = 2.0
 H = 2.0
-Q = 1
+Q = 0.3
 # -----------------------------------------------------
 
 # ---DERIVED QUANTITIES--------------------------------
@@ -19,9 +19,9 @@ Re = (D_h*U_c)
 Re_p = Re*(a/D_h)**2
 De = Re*np.sqrt(D_h/(2*R))
 
-print("Re = ",Re)
-print("Re_p = ",Re_p)
-print("De = ",De)
+# print("Re = ",Re)
+# print("Re_p = ",Re_p)
+# print("De = ",De)
 # ------------------------------------------------------
 
 # ---LENGTH OF THE DUCT SECTION WE'RE LOOKING AT--------
