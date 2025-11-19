@@ -58,9 +58,6 @@ class perturbed_flow:
         self.v_bc = Function(self.V)
         self.u_bar_3d, self.p_bar_3d = self.background_flow.build_3d_background_flow(self.mesh3d)
 
-        # rescale u_bar and p_bar with the new dimensionless scale
-        # self.u_bar_3d, self.p_bar_3d = self.u_bar_3d*(1/self.a), self.p_bar_3d*self.Re
-
 
     def Stokes_solver_3d(self, particle_bcs):
 
@@ -152,6 +149,7 @@ class perturbed_flow:
         u_bar_3d_a = scale_bg * u_bar_3d_a
         u_bar_3d_s = scale_bg * u_bar_3d_s
 
+
         x0, y0, z0 = self.tags["particle_center"]
         r0 = float(np.hypot(x0, y0))
         if r0 == 0.0:
@@ -200,11 +198,41 @@ class perturbed_flow:
         u_hat_r, _ = self.Stokes_solver_3d(Constant((float(ex0[0]), float(ex0[1]), float(ex0[2]))))
         u_hat_z, _ = self.Stokes_solver_3d(Constant((0.0, 0.0, 1.0)))
 
+
         F_0_a = self.compute_F_0_a(v_0_a, u_hat_r, u_hat_z, u_bar_3d_a, x, Theta)
         F_0_s = self.compute_F_0_s(v_0_s, u_hat_r, u_hat_z, u_bar_3d_s)
-        F_0 = F_0_a + F_0_s
 
-        Ftot = (1.0 / float(self.Re_p)) * np.asarray(F_minus_1_s, dtype=float) + np.asarray(F_0, dtype=float)
+        pt = self.tags["particle_center"]
+        r_vec = np.array([pt[0], pt[1], 0.0])
+        R_loc = np.linalg.norm(r_vec)
+        e_r = r_vec / R_loc
+
+        ell = min(self.H, self.W)
+        Um = float(self.background_flow.Um)
+        scale_bg = ell / (self.a * Um)
+
+        r_local = R_loc - self.background_flow.R
+        z_local = pt[2]
+
+        X_2d = r_local + 0.5 * self.W
+        Y_2d = z_local + 0.5 * self.H
+
+        u_vec_2d = self.background_flow.u_bar.at([X_2d, Y_2d])
+
+        u_theta_unscaled = u_vec_2d[2]
+
+        u_mag = u_theta_unscaled * scale_bg
+
+        F_centrifugal = (4.0 / 3.0) * np.pi * (Theta ** 2) * R_loc * e_r
+
+        integral_grad_u = - (u_mag ** 2 / R_loc) * e_r
+        F_fluid_inertia = (4.0 / 3.0) * np.pi * integral_grad_u
+
+        F_missing = F_centrifugal + F_fluid_inertia
+
+        F_0_total = F_0_a + F_0_s + F_missing
+
+        Ftot = (1.0 / float(self.Re_p)) * np.asarray(F_minus_1_s, dtype=float) + np.asarray(F_0_total, dtype=float)
 
         self.F_p = F_p = (ex0 @ Ftot) * ex0 + (ez0 @ Ftot) * ez0
 

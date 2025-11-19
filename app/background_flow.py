@@ -21,6 +21,7 @@ class background_flow:
 
         self.mesh2d = RectangleMesh(120, 120, self.W, self.H, quadrilateral=False)
 
+
     def solve_2D_background_flow(self, H_1_seminorm=False):
 
         # "P": "Polynomial" Complete Lagrange-polynoms e.g. P(dim=2) = span{1, x, y, xy, x^2, y^2} => triangle in 2d, tetraeder in 3d
@@ -150,6 +151,7 @@ class background_flow:
             print(sqrt(assemble(inner(grad(self.u_bar), grad(self.u_bar)) * dx)))
 
         return u_bar, p_bar
+
 
     def build_3d_background_flow(self, mesh3d):
 
