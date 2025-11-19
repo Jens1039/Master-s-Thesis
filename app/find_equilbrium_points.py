@@ -1,19 +1,17 @@
-from background_flow import background_flow
-from build_3d_geometry import make_curved_channel_section_with_spherical_hole
-from perturbed_flow import perturbed_flow
 import matplotlib.pyplot as plt
-from matplotlib.patches import Rectangle
 import multiprocessing as mp
 from tqdm import tqdm
 import numpy as np
 
 
+from background_flow import background_flow
+from build_3d_geometry import make_curved_channel_section_with_spherical_hole
+from perturbed_flow import perturbed_flow
 
-###############################################################################
-#   DROP-IN Ersatz für coarse_candidates_parallel, kompatibel mit Deflation   #
-###############################################################################
 
-_BG = None   # globaler Background-Flow-Holder wie in deiner Vorlage
+_BG = None
+
+
 
 def _init_bg_worker_defl(R, H, W, Q, Re):
     """
@@ -25,63 +23,55 @@ def _init_bg_worker_defl(R, H, W, Q, Re):
     _BG.solve_2D_background_flow()
 
 
+
 def _compute_single_F_defl(task):
     """
-    Berechnet EINEN Gitterpunkt (Fr,Fz) für das Deflations-Coarse-Grid.
-    Gibt (i, j, ||F||) zurück.
+    Compute ONE coarse-grid force evaluation for the deflation solver.
+    Returns:
+        (i, j, Fr, Fz)
+    where Fr, Fz are the force components in (r,z)-coordinates.
     """
+
     (i, j, r_loc, z_loc,
      R, H, W, Q, L, a,
      particle_maxh, global_maxh, Re) = task
 
-    # 3D Geometrie + Flow
+    # --- 3D Geometry with particle at (r_loc, z_loc) ---
     mesh3d, tags = make_curved_channel_section_with_spherical_hole(
         R, W, H, L, a,
         particle_maxh, global_maxh,
         r_off=r_loc, z_off=z_loc
     )
 
-    # Re_p neu berechnen wie in deiner Vorlage
+    # --- Particle Reynolds number ---
+    Re = 8.8
     D_h = (2 * H * W) / (H + W)
     Re_p = Re * (a / D_h)**2
 
+    # --- Perturbed flow ---
     pf = perturbed_flow(mesh3d, tags, a, Re_p, _BG)
-    F_vec = pf.F_p()
+    F_vec = pf.F_p()       # Cartesian 3D force vector
 
-    # lokale (r,z)-Richtungen
-    x0, y0, z0 = tags["particle_center"]
-    r0 = float(np.hypot(x0, y0))
+    # --- Local r,z directions at particle center ---
+    cx, cy, cz = tags["particle_center"]
+    r0 = float(np.hypot(cx, cy))
 
-    if r0 == 0.0:
+    if r0 < 1e-14:
         ex0 = np.array([1.0, 0.0, 0.0], dtype=float)
     else:
-        ex0 = np.array([x0 / r0, y0 / r0, 0.0], dtype=float)
+        ex0 = np.array([cx / r0, cy / r0, 0.0], dtype=float)
 
     ez0 = np.array([0.0, 0.0, 1.0], dtype=float)
 
-    # Projektion
+    # --- Projections ---
     Fr = float(ex0 @ F_vec)
     Fz = float(ez0 @ F_vec)
 
-    return (i, j, np.sqrt(Fr**2 + Fz**2))
+    return (i, j, Fr, Fz)
 
 
-def coarse_candidates_parallel_deflated(fp_eval,
-                                        n_r=7,
-                                        n_z=7,
-                                        verbose=True,
-                                        nproc=None):
-    """
-    Drop-in Replacement für coarse_candidates_parallel.
 
-    Gibt zurück:
-      candidates, r_vals, z_vals, phi
-
-    candidates: Liste von Koordinaten [r,z] lokaler Minima
-    phi[i,j]: ||F(r_i,z_j)||
-
-    Kompatibel mit deinem Deflationsverfahren.
-    """
+def coarse_candidates_parallel_deflated(fp_eval, n_r=7, n_z=7, verbose=True, nproc=None):
 
     R = fp_eval.R
     H = fp_eval.H
@@ -93,8 +83,7 @@ def coarse_candidates_parallel_deflated(fp_eval,
     global_maxh = fp_eval.global_maxh
     Re = fp_eval.Re
 
-    # EPS-Rand, super wichtig für Netgen – wie in deiner Vorlage:
-    eps = 3 * particle_maxh
+    eps = particle_maxh
 
     r_min = -W/2 + a + eps
     r_max =  W/2 - a - eps
@@ -104,9 +93,10 @@ def coarse_candidates_parallel_deflated(fp_eval,
     r_vals = np.linspace(r_min, r_max, n_r)
     z_vals = np.linspace(z_min, z_max, n_z)
 
-    phi = np.zeros((n_r, n_z))
+    # NEW: allocate grids
+    Fr_grid = np.zeros((n_r, n_z))
+    Fz_grid = np.zeros((n_r, n_z))
 
-    # Tasks generieren
     tasks = [
         (i, j, r_vals[i], z_vals[j],
          R, H, W, Q, L, a, particle_maxh, global_maxh, Re)
@@ -120,26 +110,26 @@ def coarse_candidates_parallel_deflated(fp_eval,
     if verbose:
         print(f"Starte paralleles coarse grid mit {nproc} Prozessen...")
 
-    # Stabiler mp.Pool wie in deiner Vorlage
     with mp.Pool(
-        processes=nproc,
-        initializer=_init_bg_worker_defl,
-        initargs=(R, H, W, Q, Re)
+            processes=nproc,
+            initializer=_init_bg_worker_defl,
+            initargs=(R, H, W, Q, Re)
     ) as pool:
 
         results = []
-        for res in tqdm(
-                pool.imap_unordered(_compute_single_F_defl, tasks),
-                total=len(tasks),
-                desc="Compute coarse grid",
-                ncols=80):
+        for res in tqdm(pool.imap_unordered(_compute_single_F_defl, tasks),
+                        total=len(tasks), ncols=80):
             results.append(res)
 
-    # Resultate einsortieren
-    for (i, j, normF) in results:
-        phi[i, j] = normF
+    # Fill grids
+    for (i, j, Fr, Fz) in results:
+        Fr_grid[i, j] = Fr
+        Fz_grid[i, j] = Fz
 
-    # → lokale Minima sammeln
+    # Build |F|
+    phi = np.sqrt(Fr_grid**2 + Fz_grid**2)
+
+    # Detect local minima as before
     candidates = []
     for i in range(n_r):
         for j in range(n_z):
@@ -157,16 +147,9 @@ def coarse_candidates_parallel_deflated(fp_eval,
         for c in candidates:
             print(f"  {c}")
 
-    return candidates, r_vals, z_vals, phi
+    # NOTE: now returns 6 items
+    return candidates, r_vals, z_vals, phi, Fr_grid, Fz_grid
 
-
-
-# fp_evaluator.py (oder ans Ende deines Skripts)
-
-import numpy as np
-from background_flow import background_flow
-from build_3d_geometry import make_curved_channel_section_with_spherical_hole
-from perturbed_flow import perturbed_flow
 
 
 class FpEvaluator:
@@ -252,39 +235,60 @@ class FpEvaluator:
         return np.array([Fr, Fz], dtype=float)
 
 
-import numpy as np
 
-def approx_jacobian(F, x, Fx=None, eps_rel=1e-6):
-    """
-    Numerische Approximation der 2x2-Jacobi-Matrix von F an x
-    mit Vorwärtsdifferenzen.
+def approx_jacobian(F, x, Fx=None, eps_rel=1e-3, eps_abs=1e-4,
+                    r_min=None, r_max=None, z_min=None, z_max=None):
 
-    F: R^2 -> R^2, x: shape (2,)
-    Fx: optional F(x), um eine Auswertung zu sparen.
-    """
-    x = np.asarray(x, dtype=float)
+
+    x = np.asarray(x, float)
+
     if Fx is None:
         Fx = F(x)
 
-    J = np.zeros((2, 2), dtype=float)
+    # If bounds are not provided, do *not* clamp
+    # (F_defl will throw a ValueError as before)
+    clamp = not (r_min is None or r_max is None or z_min is None or z_max is None)
+
+    J = np.zeros((2, 2), float)
 
     for i in range(2):
-        h = eps_rel * (1.0 + abs(x[i]))
-        dx = np.zeros(2, dtype=float)
+        # Compute step size
+        h = max(eps_rel * (1.0 + abs(x[i])), eps_abs)
+
+        dx = np.zeros(2)
         dx[i] = h
-        fp = F(x + dx)
-        J[:, i] = (fp - Fx) / h
+
+        xp = x + dx
+        xm = x - dx
+
+        if clamp:
+            # Clamp to allowed domain
+            xp[0] = np.clip(xp[0], r_min, r_max)
+            xp[1] = np.clip(xp[1], z_min, z_max)
+            xm[0] = np.clip(xm[0], r_min, r_max)
+            xm[1] = np.clip(xm[1], z_min, z_max)
+
+        fp = F(xp)
+        fm = F(xm)
+
+        # Use actual distance for denominator in case clamping changed step size
+        denom = xp[i] - xm[i]
+        if abs(denom) < 1e-14:
+            # fallback to forward difference
+            denom = h
+            fp = F(x + dx)
+            J[:, i] = (fp - Fx) / denom
+        else:
+            J[:, i] = (fp - fm) / denom
 
     return J
 
 
 
+
+
 def make_deflated_F(F, known_roots, alpha=1e-2, p=2.0):
-    """
-    Deflation:
-        F_defl(x) = (Produkt_k (1/||x-x_k||^p + alpha)) * F(x)
-    Nullstellen von F bleiben Nullstellen von F_defl.
-    """
+
     roots = [np.asarray(rz, dtype=float) for rz in known_roots]
 
     def F_defl(x):
@@ -303,42 +307,25 @@ def make_deflated_F(F, known_roots, alpha=1e-2, p=2.0):
     return F_defl
 
 
-def newton_deflated_2d(fp_eval,
-                        x0,
-                        known_roots,
-                        alpha=1e-2,      # Deflation-Parameter
-                        p=2.0,           # Deflations-Exponent
-                        tol_F=1e-3,      # sinnvoller: 1e-3 statt 1e-6
-                        tol_x=1e-6,
-                        max_iter=15,
-                        monitor=None,
-                        ls_max_steps=8,
-                        ls_reduction=0.5):
-    """
-    Newton-Verfahren auf F_p(r,z)=0 mit Deflation + Backtracking-Linesearch.
 
-    - F_orig(x) = echte Kraft F_p(r,z)
-    - F_defl(x) = defl_factor(x) * F_orig(x)
-    - Newton-Richtung aus J(F_defl)
-    - Linesearch minimiert ||F_orig(x + alpha * delta)|| entlang delta
-      (monotone Abnahme von ||F|| angestrebt)
-
-    known_roots: Liste schon gefundener Wurzeln (für Deflation).
-    """
+def newton_deflated_2d(fp_eval, x0, known_roots,
+                       alpha=1e-2, p=2.0,
+                       tol_F=1e-3, tol_x=1e-6,
+                       max_iter=15, monitor=None,
+                       ls_max_steps=8, ls_reduction=0.5):
 
     x = np.asarray(x0, dtype=float)
 
-    # --- echte Kraft ---
+    # Original force
     def F_orig(x_vec):
         return np.asarray(fp_eval.evaluate_F(x_vec), dtype=float)
 
-    # --- Deflationsfaktor ---
+    # Already found roots (for deflation)
     roots = [np.asarray(rz, dtype=float) for rz in known_roots]
 
     def defl_factor(x_vec):
         if not roots:
             return 1.0
-        x_vec = np.asarray(x_vec, dtype=float)
         fac = 1.0
         for rstar in roots:
             dist = np.linalg.norm(x_vec - rstar)
@@ -350,7 +337,7 @@ def newton_deflated_2d(fp_eval,
     def F_defl(x_vec):
         return defl_factor(x_vec) * F_orig(x_vec)
 
-    # helper: Domain-Check / alpha_max
+    # Compute step-size limit to stay inside domain
     def compute_alpha_max(x_vec, delta):
         alpha_max = 1.0
         r_min, r_max = fp_eval.r_min, fp_eval.r_max
@@ -362,20 +349,15 @@ def newton_deflated_2d(fp_eval,
         ]:
             if abs(di) < 1e-14:
                 continue
-            if di > 0.0:
+            if di > 0:
                 a_k = (xmax - xi) / di
             else:
                 a_k = (xmin - xi) / di
-            if a_k < alpha_max:
-                alpha_max = a_k
+            alpha_max = min(alpha_max, a_k)
 
-        if alpha_max < 0.0:
-            alpha_max = 0.0
-        if alpha_max > 1.0:
-            alpha_max = 1.0
-        return alpha_max
+        return max(min(alpha_max, 1.0), 0.0)
 
-    # --- initial ---
+    # Initial residual
     F0 = F_orig(x)
     F0_norm = np.linalg.norm(F0)
     F0_defl = defl_factor(x) * F0
@@ -383,34 +365,44 @@ def newton_deflated_2d(fp_eval,
     if monitor is not None:
         monitor(0, x, F0, np.zeros_like(x))
 
-    # Falls wir zufällig schon sehr nah an einer Wurzel sind:
+    # Already at solution
     if F0_norm < tol_F:
         return x, True
 
+    # Newton loop
     for k in range(1, max_iter + 1):
 
-        # Jacobian der deflatierten Funktion
-        J = approx_jacobian(F_defl, x, Fx=F0_defl)
+        # -----------------------------
+        #  NEW: robust Jacobian call
+        # -----------------------------
+        J = approx_jacobian(
+                F_defl, x, Fx=F0_defl,
+                r_min=fp_eval.r_min, r_max=fp_eval.r_max,
+                z_min=fp_eval.z_min, z_max=fp_eval.z_max
+            )
+        # -----------------------------
 
+        # Solve J * delta = -F_defl(x)
         try:
             delta = np.linalg.solve(J, -F0_defl)
         except np.linalg.LinAlgError:
+            print(f"[Abort] LinAlgError (singuläre Jacobi-Matrix) bei Iteration {k}, x={x}")
             return x, False
 
-        # maximaler Schritt, um im zulässigen (r,z)-Bereich zu bleiben
+        # Bound step inside domain
         alpha_max = compute_alpha_max(x, delta)
-        if alpha_max <= 0.0:
+        if alpha_max <= 0:
+            print(f"[Abort] alpha_max <= 0 (Randschnitt) bei Iteration {k}, x={x}, delta={delta}")
             return x, False
 
-        # Backtracking-Linesearch auf ||F_orig||
+        # Line search
         alpha_ls = alpha_max
         F_trial = None
-        F_trial_norm = None
 
-        for ls_it in range(ls_max_steps):
+        for _ in range(ls_max_steps):
             x_trial = x + alpha_ls * delta
 
-            # Domain-Check (nochmal zur Sicherheit)
+            # still inside domain?
             if not (fp_eval.r_min <= x_trial[0] <= fp_eval.r_max and
                     fp_eval.z_min <= x_trial[1] <= fp_eval.z_max):
                 alpha_ls *= ls_reduction
@@ -419,23 +411,26 @@ def newton_deflated_2d(fp_eval,
             F_trial = F_orig(x_trial)
             F_trial_norm = np.linalg.norm(F_trial)
 
-            if F_trial_norm < F0_norm:
-                # Verbesserungs-Schritt gefunden
+            # acceptance rule
+            if F0_norm > 1e-1:
+                accept = (F_trial_norm < F0_norm * (1 - 1e-2))
+            else:
+                accept = (F_trial_norm < F0_norm)
+
+            if accept:
                 break
 
             alpha_ls *= ls_reduction
 
-        # Linesearch hat nix Besseres gefunden → Abbruch (stagnation)
+        # line search failed
         if F_trial is None or F_trial_norm >= F0_norm:
-            # akzeptiere aktuellen Punkt, falls schon klein genug
-            if F0_norm < tol_F:
-                return x, True
-            else:
-                return x, False
+            print(f"[Abort] Linesearch-Stagnation bei Iteration {k}, x={x}, |F|={F0_norm:.3e}")
+            return x, (F0_norm < tol_F)
 
-        # Update
+        # update
         step = alpha_ls * delta
         x = x + step
+
         F0 = F_trial
         F0_norm = F_trial_norm
         F0_defl = defl_factor(x) * F0
@@ -443,17 +438,14 @@ def newton_deflated_2d(fp_eval,
         if monitor is not None:
             monitor(k, x, F0, step)
 
-        # Konvergenzkriterium
+        # convergence checks
         if F0_norm < tol_F:
             return x, True
         if np.linalg.norm(step) < tol_x:
-            # Schritt sehr klein, aber Residuum noch nicht: als stagnation werten
             return x, (F0_norm < tol_F)
 
-    # nach max_iter: letzter Check auf ||F||
-    if F0_norm < tol_F:
-        return x, True
-    return x, False
+    # iteration limit reached
+    return x, (F0_norm < tol_F)
 
 
 
@@ -469,33 +461,29 @@ def newton_monitor(iter, x, F_orig, delta):
 
 
 
-def find_equilibria_with_deflation(fp_eval,
-                                   n_r=9,
-                                   n_z=9,
-                                   max_roots=20,
-                                   skip_radius=0.02,
+def find_equilibria_with_deflation(fp_eval, n_r=10, n_z=10, max_roots=20, skip_radius=0.02,
                                    newton_kwargs=None,
                                    verbose=True,
                                    coarse_data=None,
                                    max_candidates=None,
-                                   refine_factor=4):
+                                   refine_factor=4,
+                                   boundary_tol=5e-3):
     """
-    Findet mehrere Gleichgewichtslagen F_p(r,z)=0.
-
-    Strategie:
-      1) coarse grid (echter PDE-Aufruf) -> phi(r,z) = ||F_p||
-      2) Interpolation von phi auf feineres Gitter
-      3) lokale Minima dieses interpolierten Feldes als Startpunkte
-      4) Newton + Deflation mit exakter Liniensuche auf echter Kraft
+    Find equilibrium points using:
+      - coarse grid
+      - (optional) interpolation refinement
+      - Newton + deflation
+    Now includes:
+      - SKIP of boundary-near candidates (within boundary_tol)
     """
 
     if newton_kwargs is None:
         newton_kwargs = {}
 
-    # --- 1) coarse grid holen ---
+    # --- coarse grid ---
     if coarse_data is None:
         if verbose:
-            print("=== Coarse Grid (nur ein Run!) ===")
+            print("=== Coarse Grid ===")
         _, r_vals, z_vals, phi = coarse_candidates_parallel_deflated(
             fp_eval,
             n_r=n_r,
@@ -505,33 +493,46 @@ def find_equilibria_with_deflation(fp_eval,
     else:
         _, r_vals, z_vals, phi = coarse_data
 
-    # --- 2) verfeinerte Kandidaten aus Interpolation ---
+    # --- candidate refinement ---
     if verbose:
         print("\n=== Kandidaten aus interpoliertem coarse grid ===")
     refined_candidates = refine_candidates_by_interpolation(
-        r_vals,
-        z_vals,
-        phi,
+        r_vals, z_vals, phi,
         refine_factor=refine_factor,
         max_candidates=max_candidates
     )
 
+    # --- filter boundary candidates ---
+    filtered_candidates = []
+    for x0 in refined_candidates:
+        r0, z0 = x0
+
+        if (abs(r0 - fp_eval.r_min) < boundary_tol or
+            abs(r0 - fp_eval.r_max) < boundary_tol or
+            abs(z0 - fp_eval.z_min) < boundary_tol or
+            abs(z0 - fp_eval.z_max) < boundary_tol):
+
+            if verbose:
+                print(f"[Skip] x0={x0} liegt zu nahe am Rand → verworfen.")
+            continue
+
+        filtered_candidates.append(x0)
+
     if verbose:
-        for x in refined_candidates:
+        for x in filtered_candidates:
             print(f"  Startkandidat x = ({x[0]: .4f}, {x[1]: .4f})")
 
+    # --- Newton + deflation ---
     roots = []
-
     if verbose:
         print("\n=== Newton + Deflation ===")
 
-    # --- 3) Newton + Deflation über verfeinerte Startpunkte ---
-    for x0 in refined_candidates:
+    for x0 in filtered_candidates:
 
         if len(roots) >= max_roots:
             break
 
-        # skip, falls nahe an bereits gefundener Wurzel
+        # Skip close to existing roots
         if any(np.linalg.norm(x0 - r) < skip_radius for r in roots):
             if verbose:
                 print(f"[Skip] x0={x0} (zu nah an existierender Wurzel).")
@@ -548,7 +549,7 @@ def find_equilibria_with_deflation(fp_eval,
             p=newton_kwargs.get("p", 2.0),
             tol_F=newton_kwargs.get("tol_F", 1e-3),
             tol_x=newton_kwargs.get("tol_x", 1e-6),
-            max_iter=newton_kwargs.get("max_iter", 15),
+            max_iter=newton_kwargs.get("max_iter", 20),
             monitor=newton_kwargs.get("monitor", None),
             ls_max_steps=newton_kwargs.get("ls_max_steps", 8),
             ls_reduction=newton_kwargs.get("ls_reduction", 0.5)
@@ -559,7 +560,7 @@ def find_equilibria_with_deflation(fp_eval,
                 print(f"[Fail] Newton konvergiert nicht für x0={x0}")
             continue
 
-        # Duplikate vermeiden
+        # remove duplicates
         if any(np.linalg.norm(x_root - r) < skip_radius for r in roots):
             if verbose:
                 print(f"[Dup] x_root={x_root} ist Duplikat.")
@@ -578,25 +579,56 @@ def find_equilibria_with_deflation(fp_eval,
 
 
 
-import numpy as np
-import matplotlib.pyplot as plt
-
-
-def plot_equilibria_contour(fp_eval, r_vals, z_vals, phi,
-                            equilibria=None,
-                            stability_info=None,
-                            title="Force field and equilibrium positions",
-                            cmap="viridis",
-                            levels=20,
-                            figsize=(7, 5)):
+def plot_equilibria_contour_with_zero_sets(fp_eval, r_vals, z_vals, phi,
+                                           equilibria=None,
+                                           stability_info=None,
+                                           title="Force field and equilibrium positions",
+                                           cmap="viridis",
+                                           levels=20,
+                                           figsize=(7, 5)):
+    """
+    Plot |F| contour plus zero level sets of F_r and F_z.
+    Designed as a drop-in replacement for the existing plot function.
+    """
 
     R, Z = np.meshgrid(r_vals, z_vals, indexing="ij")
 
+    # --- Compute force components (slow!) ---
+    F_r = np.zeros_like(R)
+    F_z = np.zeros_like(Z)
+
+    for i in range(len(r_vals)):
+        for j in range(len(z_vals)):
+            Fr, Fz = fp_eval.evaluate_F([r_vals[i], z_vals[j]])
+            F_r[i, j] = Fr
+            F_z[i, j] = Fz
+
     plt.figure(figsize=figsize)
+
+    # Background contour |F|
     cs = plt.contourf(R, Z, phi, levels=levels, cmap=cmap)
     plt.colorbar(cs, label=r"$\|\mathbf{F}_p(r,z)\|$")
 
+    # --- Zero level sets ---
+    c1 = plt.contour(
+        R, Z, F_r,
+        levels=[0],
+        colors="cyan",
+        linestyles="--",
+        linewidths=2
+    )
+    c1.collections[0].set_label("F_r = 0")
 
+    c2 = plt.contour(
+        R, Z, F_z,
+        levels=[0],
+        colors="magenta",
+        linestyles="-",
+        linewidths=2
+    )
+    c2.collections[0].set_label("F_z = 0")
+
+    # Stability color map
     color_map = {
         "stabil": "green",
         "Sattel": "yellow",
@@ -605,6 +637,7 @@ def plot_equilibria_contour(fp_eval, r_vals, z_vals, phi,
         "unklar (NaN in Eigenwerten)": "gray",
     }
 
+    # Plot equilibrium points
     if equilibria is not None and len(equilibria) > 0:
         for i, x in enumerate(equilibria):
             if stability_info is not None:
@@ -615,12 +648,14 @@ def plot_equilibria_contour(fp_eval, r_vals, z_vals, phi,
                 color = "red"
                 label = f"EQ {i+1}"
 
-            plt.scatter(x[0], x[1],
-                        s=120,
-                        color=color,
-                        edgecolors='black',
-                        linewidths=1.0,
-                        label=label)
+            plt.scatter(
+                x[0], x[1],
+                s=120,
+                color=color,
+                edgecolors="black",
+                linewidths=1.0,
+                label=label
+            )
 
     plt.xlabel("r")
     plt.ylabel("z")
@@ -628,6 +663,7 @@ def plot_equilibria_contour(fp_eval, r_vals, z_vals, phi,
     plt.legend(loc="upper right")
     plt.tight_layout()
     plt.show()
+
 
 
 
@@ -681,7 +717,7 @@ def local_patch_test(x0, r_vals, z_vals, phi,
 
     return True
 
-import numpy as np
+
 
 def refine_candidates_by_interpolation(r_vals,
                                        z_vals,
@@ -689,61 +725,45 @@ def refine_candidates_by_interpolation(r_vals,
                                        refine_factor=4,
                                        max_candidates=None,
                                        min_dist=None):
-    """
-    Verfeinert die Kandidaten durch bilineare Interpolation des coarse grids.
-
-    Eingabe:
-      r_vals: 1D-Array der coarse r-Koordinaten (monoton)
-      z_vals: 1D-Array der coarse z-Koordinaten (monoton)
-      phi:    2D-Array (n_r x n_z) mit ||F||-Werten auf dem coarse grid
-
-    Parameter:
-      refine_factor: wie viele Unterteilungen pro coarse-Zelle
-      max_candidates: wie viele Minima maximal zurückgeben
-      min_dist: minimaler Abstand zwischen zwei Kandidaten (in (r,z)-Ebene)
-
-    Ausgabe:
-      candidates_refined: Liste von np.array([r,z]) der verfeinerten Minima
-    """
 
     n_r, n_z = phi.shape
 
-    # Feineres Gitter
+    # Fine grid sizes
     n_r_fine = (n_r - 1) * refine_factor + 1
     n_z_fine = (n_z - 1) * refine_factor + 1
 
     r_fine = np.linspace(r_vals[0], r_vals[-1], n_r_fine)
     z_fine = np.linspace(z_vals[0], z_vals[-1], n_z_fine)
 
-    # Bilineare Interpolation via zwei 1D-Interpolationen:
-    # 1) in r-Richtung
+    # 1D interpolation in r
     phi_r_interp = np.zeros((n_r_fine, n_z), dtype=float)
     for j in range(n_z):
         phi_r_interp[:, j] = np.interp(r_fine, r_vals, phi[:, j])
 
-    # 2) in z-Richtung
+    # 1D interpolation in z
     phi_fine = np.zeros((n_r_fine, n_z_fine), dtype=float)
     for i in range(n_r_fine):
         phi_fine[i, :] = np.interp(z_fine, z_vals, phi_r_interp[i, :])
 
-    # Lokale Minima auf dem feinen Gitter finden (nur innere Punkte)
+    # --- Lokale Minima auf feinem Gitter mit boundary-safe Nachbarn ---
     minima = []
-    for i in range(1, n_r_fine - 1):
-        for j in range(1, n_z_fine - 1):
+    for i in range(n_r_fine):
+        for j in range(n_z_fine):
             val = phi_fine[i, j]
-            neighbors = [
-                phi_fine[i-1, j], phi_fine[i+1, j],
-                phi_fine[i, j-1], phi_fine[i, j+1]
-            ]
-            if all(val <= nb for nb in neighbors):
+            neighbors = []
+            for di, dj in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                ii, jj = i + di, j + dj
+                if 0 <= ii < n_r_fine and 0 <= jj < n_z_fine:
+                    neighbors.append(phi_fine[ii, jj])
+            if neighbors and all(val <= nb for nb in neighbors):
                 minima.append((i, j, val))
 
-    # sortiere nach kleinster phi
+    # Sortiere Minima nach Funktionswert (kleinste zuerst)
     minima.sort(key=lambda t: t[2])
 
+    # Abstands-basiertes Clustering der Kandidaten
     candidates = []
     if min_dist is None:
-        # grobe default-Wahl: halbe coarse-Zellengröße
         dr_coarse = abs(r_vals[1] - r_vals[0])
         dz_coarse = abs(z_vals[1] - z_vals[0])
         min_dist = 0.5 * np.sqrt(dr_coarse**2 + dz_coarse**2)
@@ -753,7 +773,6 @@ def refine_candidates_by_interpolation(r_vals,
         z0 = z_fine[j]
         x0 = np.array([r0, z0], float)
 
-        # Duplikate vermeiden
         if any(np.linalg.norm(x0 - c) < min_dist for c in candidates):
             continue
 
@@ -764,7 +783,7 @@ def refine_candidates_by_interpolation(r_vals,
 
     return candidates
 
-import numpy as np
+
 
 def classify_single_equilibrium(fp_eval,
                                 x_eq,

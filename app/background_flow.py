@@ -17,7 +17,7 @@ class background_flow:
         self.Re = Re
 
         # This needs to be adapted once we know how
-        self.G = Constant(1)
+        self.G = 0.35
 
         self.mesh2d = RectangleMesh(120, 120, self.W, self.H, quadrilateral=False)
 
@@ -140,6 +140,11 @@ class background_flow:
         u_bar, p_bar = w.subfunctions
         self.u_bar = u_bar
         self.p_bar = p_bar
+
+
+        u_data = self.u_bar.dat.data_ro
+        Um = np.max(np.abs(u_data[:, 2]))
+        self.Um = float(Um)
 
         if H_1_seminorm:
             print(sqrt(assemble(inner(grad(self.u_bar), grad(self.u_bar)) * dx)))

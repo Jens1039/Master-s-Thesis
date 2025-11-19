@@ -8,7 +8,7 @@ a = 0.05
 R = 160
 W = 2.0
 H = 2.0
-Q = 0.3
+Q = 20
 # -----------------------------------------------------
 
 # ---DERIVED QUANTITIES--------------------------------
@@ -18,10 +18,7 @@ U_c = Q/(H*W)
 Re = (D_h*U_c)
 Re_p = Re*(a/D_h)**2
 De = Re*np.sqrt(D_h/(2*R))
-
-# print("Re = ",Re)
-# print("Re_p = ",Re_p)
-# print("De = ",De)
+kappa = (D_h**4)/(4*(a**3)*R)
 # ------------------------------------------------------
 
 # ---LENGTH OF THE DUCT SECTION WE'RE LOOKING AT--------
@@ -29,11 +26,11 @@ L = 3
 # ------------------------------------------------------
 
 # ---RESOLUTION OF THE GRID OF PARTICLE FORCES----------
-N_r = 10
-N_z = 10
+N_r = 14
+N_z = 14
 # ------------------------------------------------------
 
 # ---RESOLUTION OF THE MESH AROUND THE PARTICLE---------
-particle_maxh = 0.03
-global_maxh = 0.3*max(W,H)
+particle_maxh = 0.01
+global_maxh = 0.05*max(W,H)
 # ------------------------------------------------------

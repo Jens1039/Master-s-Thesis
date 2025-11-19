@@ -59,7 +59,7 @@ class perturbed_flow:
         self.u_bar_3d, self.p_bar_3d = self.background_flow.build_3d_background_flow(self.mesh3d)
 
         # rescale u_bar and p_bar with the new dimensionless scale
-        self.u_bar_3d, self.p_bar_3d = self.u_bar_3d*(1/self.a), self.p_bar_3d*self.Re
+        # self.u_bar_3d, self.p_bar_3d = self.u_bar_3d*(1/self.a), self.p_bar_3d*self.Re
 
 
     def Stokes_solver_3d(self, particle_bcs):
@@ -138,8 +138,19 @@ class perturbed_flow:
         rmag_eps = conditional(rmag > 1e-14, rmag, 1.0)
         e_theta = as_vector((-x[1] / rmag_eps, x[0] / rmag_eps, 0.0))
 
+
         u_bar_3d_a = dot(self.u_bar_3d, e_theta) * e_theta
         u_bar_3d_s = self.u_bar_3d - u_bar_3d_a
+
+
+        ell = min(self.H, self.W)  # ℓ
+        Um = float(self.background_flow.Um)
+
+
+        scale_bg = ell / (self.a * Um)
+
+        u_bar_3d_a = scale_bg * u_bar_3d_a
+        u_bar_3d_s = scale_bg * u_bar_3d_s
 
         x0, y0, z0 = self.tags["particle_center"]
         r0 = float(np.hypot(x0, y0))
