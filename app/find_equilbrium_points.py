@@ -3,46 +3,15 @@ import multiprocessing as mp
 from tqdm import tqdm
 import numpy as np
 import os
+import matplotlib.patches as patches
 
-
+from config_paper_parameters import *
 from background_flow import background_flow
 from build_3d_geometry import make_curved_channel_section_with_spherical_hole
 from perturbed_flow import perturbed_flow
 
 
 _BG = None
-
-
-def plot_coarse_grid_with_zero_level_sets(fp_eval, r_vals, z_vals, phi, Fr_grid, Fz_grid, title="Coarse grid with zero level sets",
-                                          cmap="viridis", levels=20, figsize=(7, 5)):
-    R, Z = np.meshgrid(r_vals, z_vals, indexing='ij')
-
-    plt.figure(figsize=figsize)
-
-    cs = plt.contourf(R, Z, phi, levels=levels, cmap=cmap)
-    plt.colorbar(cs, label=r"$\|\mathbf{F}\|$")
-
-    plt.contour(R, Z, Fr_grid, levels=[0],
-                colors="cyan", linestyles="--", linewidths=2)
-
-    plt.contour(R, Z, Fz_grid, levels=[0],
-                colors="magenta", linestyles="-", linewidths=2)
-
-    plt.xlabel("r")
-    plt.ylabel("z")
-    plt.title(title)
-    plt.tight_layout()
-    plt.show()
-
-
-def newton_monitor(iter, x, Fx, delta):
-    print(
-        f"[Newton iter {iter:02d}] "
-        f"x = ({x[0]:.5f}, {x[1]:.5f}) | "
-        f"|F| = {np.linalg.norm(Fx):.3e} | "
-        f"|dx| = {np.linalg.norm(delta):.3e}"
-    )
-
 
 def _init_bg_worker_defl(R, H, W, Q, Re):
 
@@ -84,9 +53,8 @@ def _compute_single_F_defl(task):
 
 
 def coarse_candidates_parallel_deflated(fp_eval, n_r=7, n_z=7, verbose=True, nproc=None,
-                                        Re_bg_input=None):  # <-- NEUES ARGUMENT
+                                        Re_bg_input=None):
 
-    # Parameter aus fp_eval holen
     R = fp_eval.R
     H = fp_eval.H
     W = fp_eval.W
@@ -96,10 +64,9 @@ def coarse_candidates_parallel_deflated(fp_eval, n_r=7, n_z=7, verbose=True, npr
     particle_maxh = fp_eval.particle_maxh
     global_maxh = fp_eval.global_maxh
 
-    # Re_p (korrekt) aus fp_eval holen
+
     Re_p_correct = fp_eval.Re_p
 
-    # Sicherstellen, dass wir die Input-Re für den Background haben
     if Re_bg_input is None:
         raise ValueError("Re_bg_input (Input Reynolds number) must be provided for correct background flow physics!")
 
@@ -115,7 +82,7 @@ def coarse_candidates_parallel_deflated(fp_eval, n_r=7, n_z=7, verbose=True, npr
     Fr_grid = np.zeros((n_r, n_z))
     Fz_grid = np.zeros((n_r, n_z))
 
-    # Task-Liste: Wir übergeben Re_p_correct direkt!
+
     tasks = [
         (i, j, r_vals[i], z_vals[j],
          R, H, W, Q, L, a, particle_maxh, global_maxh, Re_p_correct)
@@ -134,7 +101,7 @@ def coarse_candidates_parallel_deflated(fp_eval, n_r=7, n_z=7, verbose=True, npr
     with mp.Pool(
             processes=nproc,
             initializer=_init_bg_worker_defl,
-            initargs=(R, H, W, Q, Re_bg_input)  # <-- HIER Re_input nutzen!
+            initargs=(R, H, W, Q, Re_bg_input)
     ) as pool:
 
         results = []
@@ -147,8 +114,6 @@ def coarse_candidates_parallel_deflated(fp_eval, n_r=7, n_z=7, verbose=True, npr
         Fz_grid[i, j] = Fz
 
     phi = np.sqrt(Fr_grid ** 2 + Fz_grid ** 2)
-
-    # ... (Kandidatensuche wie gehabt) ...
 
     candidates = []
     for i in range(n_r):
@@ -164,6 +129,108 @@ def coarse_candidates_parallel_deflated(fp_eval, n_r=7, n_z=7, verbose=True, npr
 
     return candidates, r_vals, z_vals, phi, Fr_grid, Fz_grid
 
+
+def plot_paper_reproduction(fp_eval, r_vals, z_vals, phi, Fr_grid, Fz_grid,
+                            title="Figure 2 Reproduction", invert_xaxis=False):
+    # Gitter für den Plot
+    R_grid, Z_grid = np.meshgrid(r_vals, z_vals, indexing='ij')
+
+    # Physikalische Parameter holen
+    W = fp_eval.W
+    H = fp_eval.H
+    a = fp_eval.a
+
+    # Dein Sicherheitsabstand (aus dem Code rekonstruiert)
+    # In deiner Berechnung: eps = particle_maxh = 0.2 * a
+    eps = fp_eval.particle_maxh
+
+    # Berechnete "verbotene Zone" für den Partikel-MITTELPUNKT
+    # Das ist der Bereich: Radius (a) + Sicherheitsabstand (eps)
+    exclusion_dist = a + eps
+
+    fig, ax = plt.subplots(figsize=(8, 8))
+
+    # 1. Kontur-Plot der Daten (nur dort, wo wir gerechnet haben)
+    # Mehr Levels (40) für weichere Übergänge
+    levels = np.linspace(phi.min(), phi.max(), 40)
+    cs = ax.contourf(R_grid, Z_grid, phi, levels=levels, cmap="viridis", alpha=0.9)
+    cbar = plt.colorbar(cs, ax=ax, fraction=0.046, pad=0.04)
+    cbar.set_label(r"Force Magnitude $\|\mathbf{F}\|$")
+
+    # 2. Null-Linien (Gleichgewichtslagen)
+    # Fr = 0 (Radiales Gleichgewicht)
+    ax.contour(R_grid, Z_grid, Fr_grid, levels=[0], colors="cyan", linestyles="--", linewidths=2)
+    # Fz = 0 (Axiales Gleichgewicht)
+    ax.contour(R_grid, Z_grid, Fz_grid, levels=[0], colors="magenta", linestyles="-", linewidths=2)
+
+    # 3. VISUALISIERUNG DES ECHTEN KANALS
+
+    # A) Die echte Kanalwand (schwarzer Rahmen)
+    wall_rect = patches.Rectangle((-W / 2, -H / 2), W, H,
+                                  linewidth=3, edgecolor='black', facecolor='none', zorder=10)
+    ax.add_patch(wall_rect)
+
+    # B) Der "verbotene Bereich" (Grau)
+    # Das ist der Bereich, in dem der Partikelmittelpunkt nicht sein darf.
+    # Wir füllen den Bereich zwischen der echten Wand und deinen Daten grau.
+
+    # Links
+    ax.add_patch(patches.Rectangle((-W / 2, -H / 2), exclusion_dist, H,
+                                   facecolor='gray', alpha=0.3, hatch='///'))
+    # Rechts
+    ax.add_patch(patches.Rectangle((W / 2 - exclusion_dist, -H / 2), exclusion_dist, H,
+                                   facecolor='gray', alpha=0.3, hatch='///'))
+    # Unten
+    ax.add_patch(patches.Rectangle((-W / 2, -H / 2), W, exclusion_dist,
+                                   facecolor='gray', alpha=0.3, hatch='///'))
+    # Oben
+    ax.add_patch(patches.Rectangle((-W / 2, H / 2 - exclusion_dist), W, exclusion_dist,
+                                   facecolor='gray', alpha=0.3, hatch='///'))
+
+    # 4. Achsen hart auf die physikalischen Maße setzen (+ etwas Rand)
+    margin = 0.1
+    ax.set_xlim(-W / 2 - margin, W / 2 + margin)
+    ax.set_ylim(-H / 2 - margin, H / 2 + margin)
+    ax.set_aspect('equal')  # Wichtig! Sonst verzerrt
+
+    ax.set_xlabel("r (Radial coordinate)")
+    ax.set_ylabel("z (Axial coordinate)")
+
+    # Spiegelung korrigieren, falls gewünscht
+    if invert_xaxis:
+        ax.invert_xaxis()
+        title += " (Inverted X)"
+
+    ax.set_title(title)
+
+    # Manuelle Legende erstellen
+    from matplotlib.lines import Line2D
+    legend_elements = [
+        Line2D([0], [0], color='cyan', lw=2, ls='--', label='$F_r=0$'),
+        Line2D([0], [0], color='magenta', lw=2, ls='-', label='$F_z=0$'),
+        patches.Patch(facecolor='gray', alpha=0.3, hatch='///', label='Wall exclusion ($a+\epsilon$)'),
+        patches.Patch(facecolor='none', edgecolor='black', lw=2, label='Physical Wall')
+    ]
+    ax.legend(handles=legend_elements, loc='upper right')
+
+    plt.tight_layout()
+    plt.savefig(f"force_contour_a={a}.png", dpi=300)
+
+
+
+
+
+
+
+
+
+def newton_monitor(iter, x, Fx, delta):
+    print(
+        f"[Newton iter {iter:02d}] "
+        f"x = ({x[0]:.5f}, {x[1]:.5f}) | "
+        f"|F| = {np.linalg.norm(Fx):.3e} | "
+        f"|dx| = {np.linalg.norm(delta):.3e}"
+    )
 
 
 class FpEvaluator:
@@ -185,13 +252,11 @@ class FpEvaluator:
         self.Re_p = float(Re_p)
         self.Q = float(Q)
 
-        # Bereich für (r,z) im Kanal (Partikel muss reinpassen)
         self.r_min = -0.5 * self.W + self.a
         self.r_max =  0.5 * self.W - self.a
         self.z_min = -0.5 * self.H + self.a
         self.z_max =  0.5 * self.H - self.a
 
-        # Hintergrundströmung nur einmal berechnen
         if bg_flow is None:
             self.bg_flow = background_flow(self.R, self.H, self.W, self.Q, self.Re)
             self.bg_flow.solve_2D_background_flow()
@@ -202,30 +267,21 @@ class FpEvaluator:
         return (self.r_min <= r <= self.r_max) and (self.z_min <= z <= self.z_max)
 
     def evaluate_F(self, x):
-        """
-        Eingabe: x = (r,z) in lokalen Kanal-Koordinaten.
-        Ausgabe: np.array([F_r, F_z])
-        """
 
         r, z = float(x[0]), float(x[1])
 
         if not self._check_inside_box(r, z):
-            # Bei Bedarf kannst du hier z.B.  große Kraft zurückgeben,
-            # statt zu raisen.
             raise ValueError(f"(r,z)=({r},{z}) außerhalb des zulässigen Bereichs.")
 
-        # 3D-Geometrie mit Partikel an Position (r_off=r, z_off=z)
         mesh3d, tags = make_curved_channel_section_with_spherical_hole(
             self.R, self.H, self.W, self.L, self.a,
             self.particle_maxh, self.global_maxh,
             r_off=r, z_off=z
         )
 
-        # Perturbed flow + Kraftberechnung
         pf = perturbed_flow(mesh3d, tags, self.a, self.Re_p, self.bg_flow)
-        F_cart = pf.F_p()   # 3D-Vektor in globalen kartesischen Koordinaten
+        F_cart = pf.F_p()
 
-        # Radial-/Axial-Richtung am Partikel-Zentrum konstruieren
         cx, cy, cz = tags["particle_center"]
         r0 = np.hypot(cx, cy)
         if r0 < 1e-14:
@@ -234,7 +290,6 @@ class FpEvaluator:
             ex0 = np.array([cx / r0, cy / r0, 0.0], dtype=float)
         ez0 = np.array([0.0, 0.0, 1.0], dtype=float)
 
-        # Da pf.F_p bereits auf ex0, ez0 projiziert ist, reicht einfaches Skalarprodukt
         Fr = float(ex0 @ F_cart)
         Fz = float(ez0 @ F_cart)
 
@@ -698,11 +753,7 @@ def refine_candidates_by_interpolation(r_vals,
 
 
 
-def classify_single_equilibrium(fp_eval,
-                                x_eq,
-                                eps_rel=1e-4,
-                                ode_sign=-1.0,
-                                tol_eig=1e-6):
+def classify_single_equilibrium(fp_eval, x_eq, eps_rel=1e-4, ode_sign=-1.0, tol_eig=1e-6):
 
     x_eq = np.asarray(x_eq, dtype=float)
 
@@ -769,5 +820,7 @@ def classify_equilibria(fp_eval, equilibria, eps_rel=1e-4, ode_sign=-1.0, tol_ei
             print(f"        Typ: {info['type']}\n")
 
     return results
+
+
 
 

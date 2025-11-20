@@ -4,6 +4,10 @@ warnings.filterwarnings("ignore", message=".*import SLEPc.*", category=UserWarni
 
 import os
 os.environ["OMP_NUM_THREADS"] = "1"
+from firedrake import *
+
+import matplotlib.pyplot as plt
+import matplotlib.image as mpimg
 
 from config_paper_parameters import *
 from find_equilbrium_points import *
@@ -14,41 +18,44 @@ from find_equilbrium_points import *
 
 if __name__ == "__main__":
 
-    Re_input = (D_h * U_c)
+    print("Re_imposed = ", Re)
 
-    bg = background_flow(R, H, W, Q, Re_input)
-    bg.solve_2D_background_flow()
+    img = mpimg.imread("images/background_flow_paper.png")
+    plt.imshow(img)
+    plt.axis("off")
+    plt.show()
 
-    Re_paper = Re_input * bg.Um
-    Re_p_correct = Re_paper * (a / D_h) ** 2
+    img = mpimg.imread("images/3_cross_sections_background_flow.png")
+    plt.imshow(img)
+    plt.axis("off")
+    plt.show()
 
-    print(f"Re_input: {Re_input:.2f}")
-    print(f"Re_paper: {Re_paper:.2f}")
-    print(f"Re_p:     {Re_p_correct:.4f}")
-
-
-    fp_eval = FpEvaluator(
-            R, W, H, L, a,
-            particle_maxh, global_maxh,
-            Re_paper,
-            Re_p_correct,
-            bg_flow=bg
-        )
+    img = mpimg.imread("images/3_cross_sections_background_flow_with_wireframe.png")
+    plt.imshow(img)
+    plt.axis("off")
+    plt.show()
 
 
-    coarse_data = coarse_candidates_parallel_deflated(
-            fp_eval,
-            n_r=N_r,
-            n_z=N_z,
-            verbose=True,
-            Re_bg_input=Re_input,
-            nproc=nproc
-        )
+
+    exit()
+
+    Re_new = Re * (bg.U_m/U_c)
+    print("Re_new = ", Re_new)
+
+    Re_p = Re_new*((a/H)**2)
+    print("Re_p = ", Re_p)
+
+
+
+
+    fp_eval = FpEvaluator(R, W, H, L, a, particle_maxh, global_maxh, Re_new, Re_p, bg_flow=bg)
+
+    coarse_data = coarse_candidates_parallel_deflated(fp_eval, n_r=N_r, n_z=N_z, verbose=True, Re_bg_input=Re, nproc=nproc)
 
     candidates, r_vals, z_vals, phi, Fr_grid, Fz_grid = coarse_data
 
-    plot_coarse_grid_with_zero_level_sets(fp_eval, r_vals, z_vals, phi, Fr_grid, Fz_grid)
-
+    plot_paper_reproduction(fp_eval, r_vals, z_vals, phi, Fr_grid, Fz_grid)
+    exit()
 
     equilibria = find_equilibria_with_deflation(fp_eval,
         n_r=10,

@@ -166,10 +166,10 @@ class background_flow:
         self.u_bar = u_bar
         self.p_bar = p_bar
 
-
+        # necessary for rescale Re as in the paper
         u_data = self.u_bar.dat.data_ro
-        Um = np.max(np.abs(u_data[:, 2]))
-        self.Um = float(Um)
+        U_m = np.max(np.abs(u_data[:, 2]))
+        self.U_m = float(U_m)
 
         if H_1_seminorm:
             print(sqrt(assemble(inner(grad(self.u_bar), grad(self.u_bar)) * dx)))

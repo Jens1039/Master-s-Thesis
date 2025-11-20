@@ -1,54 +1,77 @@
+import warnings
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", message=".*import SLEPc.*", category=UserWarning)
+
 import os
 os.environ["OMP_NUM_THREADS"] = "1"
+from firedrake import *
+
+import matplotlib.pyplot as plt
+import matplotlib.image as mpimg
 
 from config_paper_parameters import *
+from find_equilbrium_points import *
 
-from background_flow import background_flow
-from Backup.plot_everything import (
-    plot_2d_background_flow,
-    plot_curved_channel_section_with_spherical_hole,
-    plot_3d_background_flow,
-    plot_force_grid,
-)
-from find_equilbrium_points import FpEvaluator, DeflatedRootFinder, coarse_candidates, plot_equilibria
+
+
 
 
 if __name__ == "__main__":
 
-    # 1. Hintergrundströmung einmal lösen
-    bg_flow = background_flow(R, H, W, Q, Re)
-    bg_flow.solve_2D_background_flow()
+    bg = background_flow(R, H, W, Q, Re)
+    bg.solve_2D_background_flow()
 
-    # 2. Evaluator für F_p erstellen
-    fp_eval = FpEvaluator(R, W, H, L, a,
-                          particle_maxh, global_maxh,
-                          Re, Re_p,
-                          bg_flow=bg_flow)
+    Re_new = Re * (bg.U_m/U_c)
 
-    # 3. Grobes Gitter zur Kandidatensuche (z.B. 5x5)
-    #    Du kannst n_r / n_z hier natürlich ändern (z.B. 7x7 etc.)
-    candidate_x0 = coarse_candidates(fp_eval, n_r=5, n_z=5, verbose=True)
+    Re_p = Re_new*((a/H)**2)
 
-    # 4. Deflations-Solver aufsetzen
-    #    tol_F hier absichtlich etwas entspannter (10^-6)
-    root_finder = DeflatedRootFinder(fp_eval,
-                                     alpha=1.0,
-                                     power=2.0,
-                                     tol_F=1e-6,
-                                     tol_x=1e-3,
-                                     max_newton_it=12,
-                                     fd_step=1e-4,
-                                     min_root_dist=5e-3)
+    fp_eval = FpEvaluator(R, W, H, L, a, particle_maxh, global_maxh, Re_new, Re_p, bg_flow=bg)
 
-    # 5. Alle Nullstellen suchen, beginnend von den Kandidaten
-    roots = root_finder.find_all_roots(candidate_x0, verbose=True)
+    coarse_data = coarse_candidates_parallel_deflated(fp_eval, n_r=N_r, n_z=N_z, verbose=True, Re_bg_input=Re, nproc=nproc)
 
-    print("\nGefundene Gleichgewichtslagen (r_off, z_off):")
-    for r in roots:
-        print(r)
+    candidates, r_vals, z_vals, phi, Fr_grid, Fz_grid = coarse_data
 
-    # 6. Visualisieren und Typ bestimmen
-    fig, ax, eq_info = plot_equilibria(fp_eval, roots, fd_step=1e-3, title="Equilibria & Stabilität")
-    fig.tight_layout()
-    fig.savefig("equilibria_stability.png", dpi=200)
-    # oder plt.show()
+    plot_paper_reproduction(fp_eval, r_vals, z_vals, phi, Fr_grid, Fz_grid)
+    exit()
+
+    equilibria = find_equilibria_with_deflation(fp_eval,
+        n_r=10,
+        n_z=10,
+        max_roots=10,
+        skip_radius=0.02,
+        newton_kwargs=dict(
+            alpha=1e-2,
+            p=2.0,
+            tol_F=2e-2,
+            tol_x=1e-6,
+            max_iter=30,
+            monitor=newton_monitor,
+            ls_max_steps=8,
+            ls_reduction=0.5,
+        ),
+        verbose=True,
+        coarse_data=coarse_data,
+        max_candidates=10,
+        refine_factor=6,
+    )
+
+    print("\n=== Found equilibria ===")
+    for i, (r_eq, z_eq) in enumerate(equilibria, start=1):
+        print(f"{i}: r = {r_eq:.6f}, z = {z_eq:.6f}")
+
+    stability_info = []
+
+    if equilibria.size > 0:
+        print("\n=== Equilibria clasification (x_dot = F_p) ===")
+        stability_info = classify_equilibria(
+            fp_eval,
+            equilibria,
+            eps_rel=1e-4,
+            ode_sign=-1.0,
+            tol_eig=1e-6,
+            verbose=True,
+        )
+    else:
+        print("\nNo equilibria found, nothing to classify")
+
+
