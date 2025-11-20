@@ -16,9 +16,6 @@ class background_flow:
         self.Q = Q
         self.Re = Re
 
-        # This needs to be adapted once we know how
-        self.G = 0.35
-
         self.mesh2d = RectangleMesh(120, 120, self.W, self.H, quadrilateral=False)
 
 
@@ -35,9 +32,10 @@ class background_flow:
         # Velocity space (3 components: u_r, u_z, u_theta), pressure space, and scalar space for \hat{G}
         V = VectorFunctionSpace(self.mesh2d, "CG", 2, dim=3)
         Q = FunctionSpace(self.mesh2d, "CG", 1)
+        G_space = FunctionSpace(self.mesh2d, "R", 0)
 
         # Just the Cartesian product of V, Q and R
-        W_mixed = V * Q
+        W_mixed = V * Q * G_space
 
         # extracts a UFL expression for the coordinates of the mesh (non-dimensional!)
         x_mesh, z_mesh = SpatialCoordinate(self.mesh2d)
@@ -47,8 +45,8 @@ class background_flow:
         z = z_mesh - 0.5 * self.H
 
         w = Function(W_mixed)
-        u, p = split(w)
-        v, q = TestFunctions(W_mixed)
+        u, p, G = split(w)
+        v, q, g = TestFunctions(W_mixed)
 
         # Transformation of the velocity components to our local coordinate system
         # u = (u_x, u_z, u_theta) in the mesh coordinates, we interpret them as:
@@ -72,7 +70,7 @@ class background_flow:
 
         # weak form of the azimuthal component
         F_theta = ((u_r * del_r(u_theta) + u_z * del_z(u_theta) + (u_theta * u_r) / (self.R +r)) * v_theta
-                - ((self.G*self.R) / (self.R + r)) * v_theta
+                - ((G*self.R) / (self.R + r)) * v_theta
                 + 1/self.Re * dot(grad(u_theta), grad(v_theta))
                 + 1/self.Re * ((1.0/(self.R + r)) * del_r(u_theta) - (u_theta / (self.R + r)**2)) * v_theta) * (self.R + r) * dx
 
@@ -85,8 +83,11 @@ class background_flow:
         # weak form of the continuity equation
         F_cont = q * (del_r(u_r) + del_z(u_z) + u_r / (self.R + r)) * (self.R + r) * dx
 
+        # "weak" form of the Integral constraint for G
+        F_G = ((2.0 / (self.W + self.H)) * u_theta * (self.R + r) * g - (1.0 / (self.H * self.W)) * g) * dx
+
         # Total residual
-        F = F_r + F_theta + F_z + F_cont
+        F = F_r + F_theta + F_z + F_cont + F_G
 
         # When you define the problem the boundary conditions must apply to components of W_mixed, not to the stand-alone V,
         # thats why we're using W_mixed.sub(0) = "First component of W_mixed"
@@ -99,8 +100,9 @@ class background_flow:
         nullspace = MixedVectorSpaceBasis(
             W_mixed,
             [
-                W_mixed.sub(0),  # velocity block: no special nullspace (we don't tell the solver anything here)
-                VectorSpaceBasis(constant=True, comm=W_mixed.comm),  # pressure: constants
+                W_mixed.sub(0),
+                VectorSpaceBasis(constant=True, comm=W_mixed.comm),
+                W_mixed.sub(2),
             ],
         )
 
@@ -123,22 +125,44 @@ class background_flow:
                 "snes_atol": 1e-10,
                 # Maximal Newton steps
                 "snes_max_it": 50,
-                # ksp = krylov subspace solver  here: We just want to solve our resulting LSE with LU decomposition
-                "ksp_type": "preonly",
-                # pc = Preconditioner  here: LU decomposition
-                "pc_type": "lu",
-                # MUMPS = MUltifrontal Massively Parallel sparse direct Solver (highly optimized Solver Implementation)
-                "pc_factor_mat_solver_type": "mumps",
-                # Theese two parameters can be used for monitoring the optimization process
-                # "snes_linesearch_monitor": None,
-                # "snes_monitor": None,
-                "snes_linesearch_maxlambda": 1,
-                # "snes_monitor_convergence_criteria": None,
+
+                # Tell firedrake not to assemble the global matrix to avoid the "Monolithic matrix assembly ..." error
+                "mat_type": "matfree",
+
+                # Use FieldSplit to separate (u, p) from (G)
+                "ksp_type": "fgmres",
+                "pc_type": "fieldsplit",
+                "pc_fieldsplit_type": "schur",
+                "pc_fieldsplit_schur_fact_type": "full",
+
+                # Manually group fields:
+                #    Split '0' = Fields 0, 1 (Velocity, Pressure)
+                #    Split '1' = Field 2 (G)
+                "pc_fieldsplit_0_fields": "0,1",
+                "pc_fieldsplit_1_fields": "2",
+
+                # Solver for Split '0' (Navier-Stokes block)
+                #    Since the global operator is matfree, we must use "AssembledPC"
+                #    to force assembly of this block so we can use MUMPS LU.
+                "fieldsplit_0": {
+                    "ksp_type": "preonly",
+                    "pc_type": "python",
+                    "pc_python_type": "firedrake.AssembledPC",
+                    "assembled_pc_type": "lu",
+                    "assembled_pc_factor_mat_solver_type": "mumps"
+                },
+
+                # Solver for Split '1' (The scalar G)
+                #    This is just a 1x1 block, so 'none' or 'jacobi' is fine.
+                "fieldsplit_1": {
+                    "ksp_type": "preonly",
+                    "pc_type": "none"
+                },
             },
         )
 
         solver.solve()
-        u_bar, p_bar = w.subfunctions
+        u_bar, p_bar, G_hat = w.subfunctions
         self.u_bar = u_bar
         self.p_bar = p_bar
 
