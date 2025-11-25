@@ -223,19 +223,17 @@ class F_p_grid:
         ax.contour(R_grid, Z_grid, self.Fr_grid, levels=[0], colors="cyan", linestyles="--", linewidths=1)
         ax.contour(R_grid, Z_grid, self.Fz_grid, levels=[0], colors="magenta", linestyles="-", linewidths=1)
 
-        # plot initial guesses
         if hasattr(self, "initial_guesses") and len(self.initial_guesses) > 0:
             ig = np.asarray(self.initial_guesses)
             ax.scatter(ig[:, 0], ig[:, 1], c="black", s=80, marker="x", label="Initial guesses", zorder=10)
 
-        # plot roots
         if roots is not None:
             roots_arr = np.asarray(roots, dtype=float)
             if roots_arr.ndim == 1:
                 roots_arr = roots_arr.reshape(1, -1)
 
             if stability_info is not None:
-                # color-coded roots
+
                 for k, info in enumerate(stability_info):
                     r, z = info["x_eq"]
                     ax.scatter(r, z,
@@ -257,7 +255,6 @@ class F_p_grid:
         ax.set_title("Initial guesses and exact roots on coarse force grid")
         ax.set_aspect("equal")
 
-        # merge legend
         handles, labels = ax.get_legend_handles_labels()
         by_label = dict(zip(labels, handles))
         ax.legend(by_label.values(), by_label.keys())
@@ -402,28 +399,20 @@ class F_p_roots:
         r, z = float(x[0]), float(x[1])
 
         if not self._check_inside_box(r, z):
-            # Return a penalty or raise error
             raise ValueError(f"Out of bounds: {r}, {z}")
 
-        # Get deformed mesh
         mesh3d, tags = self._get_mesh_at(r, z)
 
-        # Solve Flow
         pf = perturbed_flow(mesh3d, tags, self.a, self.Re_p, self.bg_flow)
         F_cart = pf.F_p()
 
-        # Project force
         cx, cy, cz = tags["particle_center"]
-
-        theta_p = (self.L / self.R) * 0.5
-        curr_cx = (self.R + r) * cos(theta_p)
-        curr_cy = (self.R + r) * sin(theta_p)
-
-        r0 = np.hypot(curr_cx, curr_cy)
+        r0 = np.hypot(cx, cy)
         if r0 < 1e-14:
             ex0 = np.array([1.0, 0.0, 0.0])
         else:
-            ex0 = np.array([curr_cx / r0, curr_cy / r0, 0.0])
+            ex0 = np.array([cx / r0, cy / r0, 0.0])
+
         ez0 = np.array([0.0, 0.0, 1.0])
 
         Fr = float(ex0 @ F_cart)
@@ -479,9 +468,18 @@ class F_p_roots:
         print(f"[Newton iter {iter:02d}] " f"x = ({x[0]:.5f}, {x[1]:.5f}) | " f"|F| = {np.linalg.norm(Fx):.3e} | "
               f"|dx| = {np.linalg.norm(delta):.3e}")
 
-
-    def newton_deflated_2d(self, x0, known_roots, alpha=1e-2, p=2.0, tol_F=1e-3, tol_x=1e-6, max_iter=15, ls_max_steps=8,
-                           ls_reduction=0.5, ls_eta=1e-3, stagnation_rel_drop=1e-2, stagnation_tol_factor=3.0,):
+    def newton_deflated_2d(self, x0, known_roots,
+                           alpha=1e-2, p=2.0,
+                           tol_F=1e-5, tol_x=1e-6, max_iter=15,
+                           ls_max_steps=8, ls_reduction=0.5, ls_eta=1e-3,
+                           defl_r_cut=0.01):
+        """
+        Newton mit Deflation:
+        - Deflation wirkt über F_defl = d(x) * F_orig(x)
+        - Jacobian auf F_defl
+        - Linesearch + Akzeptanzbedingungen NUR auf F_orig
+        - Erfolgskriterium: ||F_orig|| < tol_F
+        """
 
         x = np.asarray(x0, dtype=float)
 
@@ -490,19 +488,152 @@ class F_p_roots:
 
         roots = [np.asarray(rz, dtype=float) for rz in known_roots]
 
-        def defl_factor(x_vec):
+        def defl_factor_local(x_vec):
+            """Lokaler, entschärfter Deflationsfaktor um bekannte Roots."""
             if not roots:
                 return 1.0
             fac = 1.0
             for rstar in roots:
                 dist = np.linalg.norm(x_vec - rstar)
-                if dist < 1e-12:
-                    dist = 1e-12
-                fac *= (1.0 / dist**p + alpha)
+
+                # Singularität entschärfen: dist_eff nie kleiner als defl_r_cut
+                # => Plateau hoher, aber nicht explodierender Deflation
+                if defl_r_cut is not None:
+                    dist_eff = max(dist, defl_r_cut)
+                else:
+                    dist_eff = max(dist, 1e-12)
+
+                fac *= (1.0 / (dist_eff ** p) + alpha)
             return fac
 
         def F_defl(x_vec):
-            return defl_factor(x_vec) * F_orig(x_vec)
+            return defl_factor_local(x_vec) * F_orig(x_vec)
+
+        def compute_alpha_max(x_vec, delta):
+            alpha_max = 1.0
+            r_min, r_max = self.r_min, self.r_max
+            z_min, z_max = self.z_min, self.z_max
+
+            for (xi, di, xmin, xmax) in [
+                (x_vec[0], delta[0], r_min, r_max),
+                (x_vec[1], delta[1], z_min, z_max),
+            ]:
+                if abs(di) < 1e-14:
+                    continue
+                if di > 0:
+                    a_k = (xmax - xi) / di
+                else:
+                    a_k = (xmin - xi) / di
+                alpha_max = min(alpha_max, a_k)
+
+            return max(min(alpha_max, 1.0), 0.0)
+
+        # Startwerte
+        F0 = F_orig(x)
+        F0_norm = np.linalg.norm(F0)
+        F0_defl = defl_factor_local(x) * F0
+
+        self.newton_monitor(0, x, F0, np.zeros_like(x))
+
+        # Einziges sofortiges Erfolgskriterium
+        if F0_norm < tol_F:
+            return x, True
+
+        for k in range(1, max_iter + 1):
+            # Jacobian von F_defl
+            J = self.approx_jacobian(
+                F_defl,
+                x,
+                Fx=F0_defl,
+                r_min=self.r_min,
+                r_max=self.r_max,
+                z_min=self.z_min,
+                z_max=self.z_max,
+            )
+
+            try:
+                delta = np.linalg.solve(J, -F0_defl)
+            except np.linalg.LinAlgError:
+                print(f"[Abort defl] LinAlgError (singular Jacobian) at iter {k}, x={x}")
+                return x, False
+
+            alpha_max = compute_alpha_max(x, delta)
+            if alpha_max <= 0:
+                print(f"[Abort defl] alpha_max <= 0 (boundary hit) at iter {k}, x={x}, delta={delta}")
+                return x, False
+
+            alpha_ls = alpha_max
+            F_trial = None
+            F_trial_norm = None
+
+            # Linesearch NUR auf F_orig
+            for _ in range(ls_max_steps):
+                x_trial = x + alpha_ls * delta
+
+                if not (self.r_min <= x_trial[0] <= self.r_max and
+                        self.z_min <= x_trial[1] <= self.z_max):
+                    alpha_ls *= ls_reduction
+                    continue
+
+                F_trial = F_orig(x_trial)
+                F_trial_norm = np.linalg.norm(F_trial)
+
+                # Erfolg in der Linesearch:
+                # 1) Genauigkeit erreicht
+                if F_trial_norm <= tol_F:
+                    break
+
+                # 2) Sufficient decrease in ||F_orig||
+                if F_trial_norm <= F0_norm * (1.0 - ls_eta):
+                    break
+
+                # sonst Schritt verkleinern
+                alpha_ls *= ls_reduction
+
+            if F_trial is None:
+                print(f"[Abort defl] Linesearch stagnation (no valid step) at iter {k}, x={x}, |F|={F0_norm:.3e}")
+                return x, False
+
+            if F_trial_norm is None or F_trial_norm >= F0_norm:
+                print(f"[Abort defl] No improvement at iter {k}, x={x}, |F|={F0_norm:.3e}")
+                return x, False
+
+            # akzeptierter Schritt
+            step = alpha_ls * delta
+            x = x + step
+
+            F0 = F_trial
+            F0_norm = F_trial_norm
+            F0_defl = defl_factor_local(x) * F0
+
+            self.newton_monitor(k, x, F0, step)
+
+            # EINZIGE Erfolgsbedingung während der Iteration
+            if F0_norm < tol_F:
+                return x, True
+
+            if np.linalg.norm(step) < tol_x:
+                print(f"[Stop defl] Step small at iter {k}, |dx|={np.linalg.norm(step):.3e}, "
+                      f"|F|={F0_norm:.3e}, rejecting")
+                return x, False
+
+        # max_iter erreicht: Erfolg NUR wenn F klein ist
+        if F0_norm < tol_F:
+            print(f"[Stop defl] Max iters reached, but |F|={F0_norm:.3e} < tol_F, accepting")
+            return x, True
+
+        print(f"[Stop defl] Max iters reached, |F|={F0_norm:.3e}, rejecting")
+        return x, False
+
+    def newton_plain_2d(self, x0,
+                        tol_F=1e-5, tol_x=1e-6,
+                        max_iter=15,
+                        ls_max_steps=8, ls_reduction=0.5, ls_eta=1e-3):
+
+        x = np.asarray(x0, dtype=float)
+
+        def F_orig(x_vec):
+            return np.asarray(self.evaluate_F(x_vec), dtype=float)
 
         def compute_alpha_max(x_vec, delta):
             alpha_max = 1.0
@@ -525,10 +656,6 @@ class F_p_roots:
 
         F0 = F_orig(x)
         F0_norm = np.linalg.norm(F0)
-        F0_defl = defl_factor(x) * F0
-        F_init_norm = F0_norm
-        best_F_norm = F0_norm
-
         self.newton_monitor(0, x, F0, np.zeros_like(x))
 
         if F0_norm < tol_F:
@@ -536,9 +663,9 @@ class F_p_roots:
 
         for k in range(1, max_iter + 1):
             J = self.approx_jacobian(
-                F_defl,
+                F_orig,
                 x,
-                Fx=F0_defl,
+                Fx=F0,
                 r_min=self.r_min,
                 r_max=self.r_max,
                 z_min=self.z_min,
@@ -546,14 +673,14 @@ class F_p_roots:
             )
 
             try:
-                delta = np.linalg.solve(J, -F0_defl)
+                delta = np.linalg.solve(J, -F0)
             except np.linalg.LinAlgError:
-                print(f"[Abort] LinAlgError (singular Jacobian) at iter {k}, x={x}")
+                print(f"[Abort plain] LinAlgError at iter {k}, x={x}")
                 return x, False
 
             alpha_max = compute_alpha_max(x, delta)
             if alpha_max <= 0:
-                print(f"[Abort] alpha_max <= 0 (boundary hit) at iter {k}, x={x}, delta={delta}")
+                print(f"[Abort plain] alpha_max <= 0 at iter {k}, x={x}, delta={delta}")
                 return x, False
 
             alpha_ls = alpha_max
@@ -580,30 +707,17 @@ class F_p_roots:
                 alpha_ls *= ls_reduction
 
             if F_trial is None:
-                print(f"[Abort] Linesearch stagnation (no valid step) at iter {k}, x={x}, |F|={F0_norm:.3e}")
-                rel_drop = F0_norm / max(F_init_norm, 1e-16)
-                if F0_norm < stagnation_tol_factor * tol_F or rel_drop < stagnation_rel_drop:
-                    print(f"[Accept] Treating x as equilibrium despite stagnation: |F|={F0_norm:.3e}, "
-                          f"rel_drop={rel_drop:.3e}")
-                    return x, True
+                print(f"[Abort plain] Linesearch stagnation at iter {k}, x={x}, |F|={F0_norm:.3e}")
                 return x, False
 
             if F_trial_norm is None or F_trial_norm >= F0_norm:
-                print(f"[Abort] Linesearch stagnation at iter {k}, x={x}, |F|={F0_norm:.3e}")
-                rel_drop = F0_norm / max(F_init_norm, 1e-16)
-                if F0_norm < stagnation_tol_factor * tol_F or rel_drop < stagnation_rel_drop:
-                    print(f"[Accept] Treating x as equilibrium despite stagnation: |F|={F0_norm:.3e}, "
-                          f"rel_drop={rel_drop:.3e}")
-                    return x, True
+                print(f"[Abort plain] No improvement at iter {k}, x={x}, |F|={F0_norm:.3e}")
                 return x, False
 
             step = alpha_ls * delta
             x = x + step
-
             F0 = F_trial
             F0_norm = F_trial_norm
-            F0_defl = defl_factor(x) * F0
-            best_F_norm = min(best_F_norm, F0_norm)
 
             self.newton_monitor(k, x, F0, step)
 
@@ -611,16 +725,11 @@ class F_p_roots:
                 return x, True
 
             if np.linalg.norm(step) < tol_x:
-                is_good = (F0_norm < stagnation_tol_factor * tol_F)
-                print(f"[Stop] Step small at iter {k}, |dx|={np.linalg.norm(step):.3e}, |F|={F0_norm:.3e}, "
-                      f"{'accepting' if is_good else 'rejecting'}")
-                return x, is_good
+                print(f"[Stop plain] Step small at iter {k}, |dx|={np.linalg.norm(step):.3e}, |F|={F0_norm:.3e}")
+                return x, (F0_norm < tol_F)
 
-        is_good = (F0_norm < stagnation_tol_factor * tol_F)
-        print(f"[Stop] Max iters reached, |F|={F0_norm:.3e}, "
-              f"{'accepting' if is_good else 'rejecting'}")
-        return x, is_good
-
+        print(f"[Stop plain] Max iters reached, |F|={F0_norm:.3e}")
+        return x, (F0_norm < tol_F)
 
     def find_equilibria_with_deflation(self, initial_guesses, max_roots=20, skip_radius=0.02, newton_kwargs=None, verbose=True,
                                         coarse_data=None, max_candidates=None, boundary_tol=5e-3,):
@@ -681,12 +790,12 @@ class F_p_roots:
             if verbose:
                 print(f"[OK] Starting Newton at x0={x0}")
 
-            x_root, ok_newton = self.newton_deflated_2d(
+            x_root, ok_newton = self.newton_plain_2d(
                 x0,
-                known_roots=roots,
-                alpha=newton_kwargs.get("alpha", 1e-2),
-                p=newton_kwargs.get("p", 2.0),
-                tol_F=newton_kwargs.get("tol_F", 1e-3),
+                # known_roots=roots,
+                # alpha=newton_kwargs.get("alpha", 1e-2),
+                # p=newton_kwargs.get("p", 2.0),
+                tol_F=newton_kwargs.get("tol_F", 1e-5),
                 tol_x=newton_kwargs.get("tol_x", 1e-6),
                 max_iter=newton_kwargs.get("max_iter", 20),
                 ls_max_steps=newton_kwargs.get("ls_max_steps", 8),
