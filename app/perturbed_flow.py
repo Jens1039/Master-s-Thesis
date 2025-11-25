@@ -127,7 +127,6 @@ class perturbed_flow:
         u_bar_3d_a = dot(self.u_bar_3d, e_theta) * e_theta
         u_bar_3d_s = self.u_bar_3d - u_bar_3d_a
 
-        # Skalierung
         ell = min(self.H, self.W)
         U_m = float(self.background_flow.U_m)
         scale_bg = ell / (self.a * U_m)
@@ -142,7 +141,6 @@ class perturbed_flow:
             ex0, e_t0 = np.array([x0 / r0, y0 / r0, 0.]), np.array([-y0 / r0, x0 / r0, 0.])
         ez0 = np.array([0., 0., 1.])
 
-        # Stokes löser (Widerstand)
         bcs_Theta = cross(as_vector((0., 0., 1.)), x)
         bcs_Omega = cross(as_vector((0., 0., 1.)), x - x_p)
         bcs_bg = -u_bar_3d_a_scaled
@@ -178,7 +176,6 @@ class perturbed_flow:
         F_0_a_raw = self.compute_F_0_a(v_0_a, u_hat_r, u_hat_z, u_bar_3d_a_scaled, x, Theta)
         F_0_s_raw = self.compute_F_0_s(v_0_s, u_hat_r, u_hat_z, u_bar_3d_s_scaled)
 
-        # ANALYTISCHE TERME
         r_vec = np.array([x0, y0, 0.0])
         R_loc = np.linalg.norm(r_vec)
         e_r = r_vec / R_loc
@@ -198,9 +195,6 @@ class perturbed_flow:
         val_inertia = -(4.0 / 3.0) * np.pi * (u_theta_mag ** 2 / R_loc)
         F_missing_dim = (val_centrifugal + val_inertia) * e_r
 
-        # --- DER FIX ---
-        # Vorher: * self.a  (falsch, ergibt O(1/a))
-        # Jetzt:  * (self.a**2) (korrekt, ergibt O(1))
         F_missing_coeff = F_missing_dim * (self.a ** 2)
 
         F_drag_coeff = np.asarray(F_m1_s_raw, dtype=float) / self.a

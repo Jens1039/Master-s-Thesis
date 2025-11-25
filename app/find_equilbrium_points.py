@@ -1,227 +1,701 @@
 import matplotlib.pyplot as plt
 import multiprocessing as mp
 from tqdm import tqdm
-import numpy as np
 import os
 import matplotlib.patches as patches
+from scipy.interpolate import RectBivariateSpline
+from scipy.optimize import root
+from firedrake import *
 
-from config_paper_parameters import *
+
 from background_flow import background_flow
 from build_3d_geometry import make_curved_channel_section_with_spherical_hole
 from perturbed_flow import perturbed_flow
 
+class F_p_grid:
 
-_BG = None
+    def __init__(self, R, W, H, L, a, Re_nominal, Re_p, particle_maxh, global_maxh, eps, bg_flow=None, Q=1.0):
 
-def _init_bg_worker_defl(R, H, W, Q, Re):
+        self.R = float(R)
+        self.W = float(W)
+        self.H = float(H)
+        self.L = float(L)
+        self.a = float(a)
+        self.Re_nominal = float(Re_nominal)
+        self.Re_p = float(Re_p)
+        self.particle_maxh = float(particle_maxh)
+        self.global_maxh = float(global_maxh)
+        self.eps = eps
 
-    global _BG
-    _BG = background_flow(R, H, W, Q, Re)
-    _BG.solve_2D_background_flow()
+        self.r_min = -W/2 + a + eps
+        self.r_max = W/2 - a - eps
+        self.z_min = -H/2 + a + eps
+        self.z_max = H/2 - a - eps
+
+        self.Q = float(Q)
+
+        if bg_flow is None:
+            self.bg_flow = background_flow(self.R, self.H, self.W, self.Q, self.Re_nominal)
+            self.bg_flow.solve_2D_background_flow()
+        else:
+            self.bg_flow = bg_flow
+
+    _BG_WORKER = None
+
+    @staticmethod
+    def _init_bg_worker(R, H, W, Q, Re_bg_input):
+        global _BG_WORKER
+        _BG_WORKER = background_flow(R, H, W, Q, Re_bg_input)
+        _BG_WORKER.solve_2D_background_flow()
+
+    @staticmethod
+    def _compute_single_F_p(task):
+
+        os.environ["OMP_NUM_THREADS"] = "1"
+        os.environ["NETGEN_NUM_THREADS"] = "1"
+
+        (i, j, r_loc, z_loc,
+         R, H, W, Q, L, a,
+         particle_maxh, global_maxh, Re_p_correct) = task
+
+        mesh3d, tags = make_curved_channel_section_with_spherical_hole(R, W, H, L, a, particle_maxh, global_maxh, r_off=r_loc, z_off=z_loc)
+
+        global _BG_WORKER
+        pf = perturbed_flow(mesh3d, tags, a, Re_p_correct, _BG_WORKER)
+
+        F_vec = pf.F_p()
+
+        cx, cy, cz = tags["particle_center"]
+        r0 = float(np.hypot(cx, cy))
+        if r0 < 1e-14:
+            ex0 = np.array([1., 0., 0.])
+        else:
+            ex0 = np.array([cx / r0, cy / r0, 0.])
+        ez0 = np.array([0., 0., 1.])
+
+        Fr = float(ex0 @ F_vec)
+        Fz = float(ez0 @ F_vec)
+        return (i, j, Fr, Fz)
 
 
-def _compute_single_F_defl(task):
-    os.environ["OMP_NUM_THREADS"] = "1"
-    os.environ["NETGEN_NUM_THREADS"] = "1"
+    def compute_F_p_grid(self, N_r, N_z, nproc=mp.cpu_count()):
 
-    (i, j, r_loc, z_loc,
-     R, H, W, Q, L, a,
-     particle_maxh, global_maxh, Re_p_correct) = task
+        r_vals = np.linspace(self.r_min, self.r_max, N_r)
+        z_vals = np.linspace(self.z_min, self.z_max, N_z)
 
-    mesh3d, tags = make_curved_channel_section_with_spherical_hole(
-        R, W, H, L, a, particle_maxh, global_maxh, r_off=r_loc, z_off=z_loc
-    )
+        Fr_grid = np.zeros((N_r, N_z))
+        Fz_grid = np.zeros((N_r, N_z))
 
-    pf = perturbed_flow(mesh3d, tags, a, Re_p_correct, _BG)
+        tasks = [
+            (i, j, r_vals[i], z_vals[j],
+             self.R, self.H, self.W, self.Q, self.L, self.a,
+             self.particle_maxh, self.global_maxh, self.Re_p)
+            for i in range(N_r) for j in range(N_z)
+        ]
 
-    F_vec = pf.F_p()
+        print(f"Start parallel coarse grid.")
+        with mp.Pool(
+                processes=nproc,
+                initializer=self._init_bg_worker,
+                initargs=(self.R, self.H, self.W, self.Q, self.Re_nominal)
+        ) as pool:
 
+            results = []
+            for res in tqdm(pool.imap_unordered(self._compute_single_F_p, tasks), total=len(tasks)):
+                results.append(res)
+
+        for (i, j, Fr, Fz) in results:
+            Fr_grid[i, j] = Fr
+            Fz_grid[i, j] = Fz
+
+        phi = np.sqrt(Fr_grid ** 2 + Fz_grid ** 2)
+
+        self.r_vals = r_vals
+        self.z_vals = z_vals
+        self.phi = phi
+        self.Fr_grid = Fr_grid
+        self.Fz_grid = Fz_grid
+
+        return r_vals, z_vals, phi, Fr_grid, Fz_grid
+
+
+    def plot_paper_reproduction(self, r_vals, z_vals, phi, Fr_grid, Fz_grid, invert_xaxis=True):
+
+        R_grid, Z_grid = np.meshgrid(r_vals, z_vals, indexing='ij')
+
+        exclusion_dist = self.a + self.eps
+
+        fig, ax = plt.subplots(figsize=(8, 8))
+
+        levels = np.linspace(phi.min(), phi.max(), 40)
+        cs = ax.contourf(R_grid, Z_grid, phi, levels=levels, cmap="viridis", alpha=0.9)
+        cbar = plt.colorbar(cs, ax=ax, fraction=0.046, pad=0.04)
+        cbar.set_label(r"Force Magnitude $\|\mathbf{F}\|$")
+
+        ax.contour(R_grid, Z_grid, Fr_grid, levels=[0], colors="cyan", linestyles="--", linewidths=2)
+        ax.contour(R_grid, Z_grid, Fz_grid, levels=[0], colors="magenta", linestyles="-", linewidths=2)
+
+        wall_rect = patches.Rectangle((-self.W / 2, -self.H / 2), self.W, self.H,
+                                      linewidth=3, edgecolor='black', facecolor='none', zorder=10)
+        ax.add_patch(wall_rect)
+
+        for xy, w, h in [
+            ((-self.W / 2, -self.H / 2), exclusion_dist, self.H),
+            ((self.W / 2 - exclusion_dist, -self.H / 2), exclusion_dist, self.H),
+            ((-self.W / 2, -self.H / 2), self.W, exclusion_dist),
+            ((-self.W / 2, self.H / 2 - exclusion_dist), self.W, exclusion_dist)
+        ]:
+            ax.add_patch(patches.Rectangle(xy, w, h, facecolor='gray', alpha=0.3, hatch='///'))
+
+        margin = 0.1
+        ax.set_xlim(-self.W / 2 - margin, self.W / 2 + margin)
+        ax.set_ylim(-self.H / 2 - margin, self.H / 2 + margin)
+        ax.set_aspect('equal')
+        ax.set_xlabel("r")
+        ax.set_ylabel("z")
+        ax.set_title("Figure 2 Reproduction")
+
+        if invert_xaxis:
+            ax.invert_xaxis()
+
+        plt.tight_layout()
+        plt.show()
+
+    # Uses a hybrid GD Newton method to find the roots on the interpolated force grid
+    def generate_initial_guesses(self, n_grid_search=50, tol_unique=1e-3, tol_residual=1e-5):
+
+        self.interp_Fr = RectBivariateSpline(self.r_vals, self.z_vals, self.Fr_grid)
+        self.interp_Fz = RectBivariateSpline(self.r_vals, self.z_vals, self.Fz_grid)
+
+        def _interpolated_coarse_grid(x):
+            r, z = x
+            return [self.interp_Fr(r, z)[0, 0], self.interp_Fz(r, z)[0, 0]]
+
+        r_starts = np.linspace(self.r_min, self.r_max, n_grid_search)
+        z_starts = np.linspace(self.z_min, self.z_max, n_grid_search)
+
+        initial_guesses = []
+
+        for r0 in r_starts:
+            for z0 in z_starts:
+
+                # finds a root on the interpolated function. It uses a hybrid method between GD and newton and starts with (r0, z0).
+                solution = root(_interpolated_coarse_grid, [r0, z0], method='hybr')
+
+                # returns a boolean expression depending on the success of the root search
+                if solution.success:
+                    # solution.x stores the solution coordinates r and z while "solution" stores all the information
+                    # about the executed solution attempt
+                    r_sol, z_sol = solution.x
+
+                    if not (self.r_min <= r_sol <= self.r_max and self.z_min <= z_sol <= self.z_max):
+                        # The remainder of this iteration is skipped and we go right into the next iteration
+                        continue
+
+                    if np.linalg.norm(_interpolated_coarse_grid((r_sol, z_sol))) > tol_residual:
+                        continue
+
+                    is_new = True
+                    for existing in initial_guesses:
+                        dist = np.linalg.norm(np.array([r_sol, z_sol]) - existing)
+                        if dist < tol_unique:
+                            is_new = False
+                            break
+
+                    if is_new:
+                        initial_guesses.append(np.array([r_sol, z_sol]))
+
+        self.initial_guesses = initial_guesses
+
+        return initial_guesses
+
+    # Uses the interpolated grid from the previous class and projects the initial guesses on it: Optional: project the exact roots on it
+    def plot_guesses_and_roots_on_grid(self, roots=None, invert_xaxis=True):
+
+        R_grid, Z_grid = np.meshgrid(self.r_vals, self.z_vals, indexing='ij')
+
+        fig, ax = plt.subplots(figsize=(7, 6))
+
+        # Hintergrund: |F|
+        levels = np.linspace(self.phi.min(), self.phi.max(), 30)
+        cs = ax.contourf(R_grid, Z_grid, self.phi, levels=levels, cmap="viridis", alpha=0.8)
+        plt.colorbar(cs, ax=ax, label=r"Force Magnitude $\|\mathbf{F}\|$")
+
+        # Null-Linien von Fr und Fz
+        ax.contour(R_grid, Z_grid, self.Fr_grid, levels=[0], colors="cyan",
+                   linestyles="--", linewidths=1, label="Fr=0")
+        ax.contour(R_grid, Z_grid, self.Fz_grid, levels=[0], colors="magenta",
+                   linestyles="-", linewidths=1, label="Fz=0")
+
+        # Initial Guesses (falls vorhanden)
+        if hasattr(self, "initial_guesses") and len(self.initial_guesses) > 0:
+            ig = np.asarray(self.initial_guesses)
+            ax.scatter(ig[:, 0], ig[:, 1],
+                       c='black', s=80, marker='x',
+                       label='Initial guesses', zorder=10)
+
+        # Exakte Roots (falls übergeben)
+        if roots is not None:
+            roots_arr = np.asarray(roots, dtype=float)
+            if roots_arr.ndim == 1:
+                roots_arr = roots_arr.reshape(1, -1)
+            if roots_arr.shape[0] > 0:
+                ax.scatter(roots_arr[:, 0], roots_arr[:, 1],
+                           facecolors='none', edgecolors='red',
+                           s=120, marker='o',
+                           label='Exact roots', zorder=11)
+
+        ax.set_xlabel("r")
+        ax.set_ylabel("z")
+        ax.set_title("Initial guesses and exact roots on coarse force grid")
+        ax.set_aspect('equal')
+
+        # Legend: doppelte Labels vermeiden
+        handles, labels = ax.get_legend_handles_labels()
+        by_label = dict(zip(labels, handles))
+        ax.legend(by_label.values(), by_label.keys())
+
+        if invert_xaxis:
+            ax.invert_xaxis()
+
+        plt.tight_layout()
+        plt.show()
+
+
+class Find_equilibria_with_deflated_newton:
+
+    def __init__(self, R, W, H, L, a, Re_nominal, Re_p, particle_maxh, global_maxh, eps, bg_flow=None, Q=1.0):
+        self.R = R
+        self.H = H
+        self.W = W
+        self.L = L
+        self.a = a
+        self.Re_nominal = Re_nominal
+        self.Re_p = Re_p
+        self.particle_maxh = particle_maxh
+        self.global_maxh = global_maxh
+        self.eps = eps
+        self.bg_flow = bg_flow
+        self.Q = Q
+
+        self.r_min = -W/2 + a + eps
+        self.r_max =  W/2 - a - eps
+        self.z_min = -H/2 + a + eps
+        self.z_max =  H/2 - a - eps
+
+
+    def _F_p_on_mesh(self, mesh3d, tags):
+
+        pf = perturbed_flow(mesh3d, tags, self.a, self.Re_p, self.bg_flow)
+        F_p_r_z = pf.F_p()   # 3D-Kraft
+
+        cx, cy, cz = tags["particle_center"]
+        r0 = np.hypot(cx, cy)
+        if r0 < 1e-14:
+            ex0 = np.array([1.0, 0.0, 0.0], dtype=float)
+        else:
+            ex0 = np.array([cx / r0, cy / r0, 0.0], dtype=float)
+        ez0 = np.array([0.0, 0.0, 1.0], dtype=float)
+
+        Fr = float(ex0 @ F_p_r_z)
+        Fz = float(ez0 @ F_p_r_z)
+
+        return np.array([Fr, Fz], dtype=float)
+
+
+    def F_p_evaluator(self, r, z):
+
+        mesh3d, tags = make_curved_channel_section_with_spherical_hole(
+            self.R, self.H, self.W, self.L, self.a,
+            self.particle_maxh, self.global_maxh,
+            r_off=r, z_off=z
+        )
+        return self._F_p_on_mesh(mesh3d, tags)
+
+
+    def _F_and_J(self, r, z, h=1e-6):
+        r = float(r)
+        z = float(z)
+        h = float(h)
+
+        mesh3d, tags = make_curved_channel_section_with_spherical_hole(
+            self.R, self.H, self.W, self.L, self.a,
+            self.particle_maxh, self.global_maxh,
+            r_off=r, z_off=z
+        )
+        print("mesh created")
+        cx, cy, cz = tags["particle_center"]
+        r0 = np.hypot(cx, cy)
+        if r0 < 1e-14:
+            e_r = np.array([1.0, 0.0, 0.0], dtype=float)
+        else:
+            e_r = np.array([cx / r0, cy / r0, 0.0], dtype=float)
+        e_z = np.array([0.0, 0.0, 1.0], dtype=float)
+
+        X_ref = mesh3d.coordinates.dat.data_ro.copy()
+
+        V_disp = mesh3d.coordinates.function_space()
+        u = TrialFunction(V_disp)
+        v = TestFunction(V_disp)
+
+        a_el = inner(grad(u), grad(v)) * dx
+        L_el = inner(Constant((0.0, 0.0, 0.0)), v) * dx
+
+        elastic_solver_params = {
+            "ksp_type": "preonly",
+            "pc_type": "lu",
+            "pc_factor_mat_solver_type": "mumps",
+            "mat_mumps_icntl_24": 1,
+            "mat_mumps_icntl_25": 0,
+            'ksp_monitor_true_residual': None,
+        }
+
+        F0 = self._F_p_on_mesh(mesh3d, tags)
+
+        def F_after_displacement(delta_vec):
+
+            mesh3d.coordinates.dat.data[:] = X_ref
+
+            delta_vec = np.asarray(delta_vec, dtype=float)
+            delta_const = Constant((float(delta_vec[0]),
+                                    float(delta_vec[1]),
+                                    float(delta_vec[2])))
+
+            bcs = [
+                DirichletBC(V_disp, Constant((0.0, 0.0, 0.0)), tags["walls"])
+            ]
+            inlet_id = tags.get("inlet", None)
+            if inlet_id is not None:
+                bcs.append(DirichletBC(V_disp, Constant((0.0, 0.0, 0.0)), inlet_id))
+            outlet_id = tags.get("outlet", None)
+            if outlet_id is not None:
+                bcs.append(DirichletBC(V_disp, Constant((0.0, 0.0, 0.0)), outlet_id))
+
+            # Partikel verschieben
+            bcs.append(DirichletBC(V_disp, delta_const, tags["particle"]))
+
+            u_sol = Function(V_disp, name="mesh_displacement")
+            print("reached the solver")
+            solve(
+                a_el == L_el,
+                u_sol,
+                bcs=bcs,
+                solver_parameters=elastic_solver_params,
+            )
+
+            # Koordinaten updaten
+            mesh3d.coordinates.dat.data[:] = X_ref + u_sol.dat.data_ro
+
+            # Tag für Partikelzentrum konsistent halten
+            tags_pert = dict(tags)
+            tags_pert["particle_center"] = (
+                cx + delta_vec[0],
+                cy + delta_vec[1],
+                cz + delta_vec[2],
+            )
+
+            return self._F_p_on_mesh(mesh3d, tags_pert)
+
+        Fr_plus  = F_after_displacement(+h * e_r)
+        Fr_minus = F_after_displacement(-h * e_r)
+        dF_dr = (Fr_plus - Fr_minus) / (2.0 * h)
+
+        Fz_plus  = F_after_displacement(+h * e_z)
+        Fz_minus = F_after_displacement(-h * e_z)
+        dF_dz = (Fz_plus - Fz_minus) / (2.0 * h)
+
+        J = np.column_stack((dF_dr, dF_dz))
+
+        mesh3d.coordinates.dat.data[:] = X_ref
+
+        return F0, J
+
+
+    def _numerical_jacobian(self, r, z, h=1e-6):
+        _, J = self._F_and_J(r, z, h)
+        return J
+
+
+    def deflated_newton(self,
+                        initial_guesses,
+                        F_tol=1e-10,
+                        step_tol=1e-10,
+                        max_iter=20,
+                        defl_p=2.0,
+                        defl_alpha=1e-2,
+                        root_tol=1e-4,
+                        verbose=True):
+
+        roots = []
+
+        def defl_factor(x, roots_list):
+
+            x = np.asarray(x, dtype=float)
+
+            if not roots_list:
+                return 1.0, np.zeros(2, dtype=float)
+
+            phi_list = []
+            grad_phi_list = []
+            for r0 in roots_list:
+                r0 = np.asarray(r0, dtype=float)
+                dx = x - r0
+                d = np.linalg.norm(dx)
+                if d < 1e-14:
+                    d = 1e-14
+                phi = 1.0 / (d**defl_p) + defl_alpha
+                grad_phi = -(defl_p / (d**(defl_p + 2.0))) * dx
+                phi_list.append(phi)
+                grad_phi_list.append(grad_phi)
+
+            D = 1.0
+            for phi in phi_list:
+                D *= phi
+
+            gradD = np.zeros(2, dtype=float)
+            for phi, grad_phi in zip(phi_list, grad_phi_list):
+                gradD += (D / phi) * grad_phi
+
+            return D, gradD
+
+        def inside_domain(x):
+            r, z = x
+            if not (self.r_min < r < self.r_max):
+                return False
+            if not (self.z_min < z < self.z_max):
+                return False
+            return True
+
+        for guess in initial_guesses:
+            x = np.array(guess, dtype=float)
+
+            if any(np.linalg.norm(x - r0) < root_tol for r0 in roots):
+                continue
+
+            if verbose:
+                print(f"\nStarting Newton from {x}")
+
+            converged = False
+
+            for it in range(max_iter):
+
+                print(f"ich rechne wirklich für jedes {it}")
+                F, J = self._F_and_J(x[0], x[1])
+
+                normF = np.linalg.norm(F)
+
+                if verbose:
+                    print(f"  iter {it:02d}: x = {x}, ||F|| = {normF:.3e}")
+
+                if normF < F_tol:
+                    converged = True
+                    break
+                print("deflation factor gets computed")
+                D, gradD = defl_factor(x, roots)
+                print("deflation factor got computed")
+                G = D * F
+                J_defl = D * J + np.outer(F, gradD)
+
+                print("J_defl jetzt auch berechnet")
+                try:
+                    delta = np.linalg.solve(J_defl, -G)
+                    print("np.linalg solver hat performt")
+                except np.linalg.LinAlgError:
+                    if verbose:
+                        print("Jacobian singular, aborting this guess.")
+                    break
+
+                delta = np.linalg.solve(J_defl, -G)
+
+
+                alpha = 1.0
+                accepted = False
+
+                for _ in range(20):
+                    candidate = x + alpha * delta
+
+                    if not inside_domain(candidate):
+                        alpha *= 0.5
+                        continue
+
+
+                    F_try = self.F_p_evaluator(candidate[0], candidate[1])
+                    if np.linalg.norm(F_try) < np.linalg.norm(F):
+                        x = candidate
+                        accepted = True
+                        break
+
+                    alpha *= 0.5
+
+                if not accepted:
+                    print("Line-search failed — delta too large, aborting this guess.")
+                    break
+
+
+                print("ich habe 2 vektoren addiert")
+                if np.linalg.norm(delta) < step_tol:
+                    print("jetzt rödelts wieder")
+                    F2, _ = self._F_and_J(x[0], x[1])
+                    print("jetzt hats fertig gerödelt")
+                    if np.linalg.norm(F2) < F_tol:
+                        converged = True
+                    break
+            print("Schleife sollte durch sein")
+            if converged:
+                if not any(np.linalg.norm(x - r0) < root_tol for r0 in roots):
+                    roots.append(x.copy())
+                    if verbose:
+                        print(f"-> Found new root at {x}, ||F|| = {np.linalg.norm(F):.3e}")
+            else:
+                if verbose:
+                    print(f"No convergence from {guess}")
+
+        self.roots = np.array(roots) if roots else np.zeros((0, 2))
+        return self.roots
+
+
+
+
+
+
+
+
+
+
+
+def move_mesh_elasticity(mesh, tags, displacement_vector, verbose=False):
+
+    V_disp = VectorFunctionSpace(mesh, "CG", 1)
+
+    u = TrialFunction(V_disp)
+    v = TestFunction(V_disp)
+
+    # 2. Define Material Properties
+    x = SpatialCoordinate(mesh)
     cx, cy, cz = tags["particle_center"]
-    r0 = float(np.hypot(cx, cy))
+    r_dist = sqrt((x[0] - cx) ** 2 + (x[1] - cy) ** 2 + (x[2] - cz) ** 2)
 
-    if r0 < 1e-14:
-        ex0 = np.array([1.0, 0.0, 0.0], dtype=float)
-    else:
-        ex0 = np.array([cx / r0, cy / r0, 0.0], dtype=float)
+    # Stiffening factor: stiff near particle
+    stiff = 1.0 / (r_dist ** 2 + 0.01)
 
-    ez0 = np.array([0.0, 0.0, 1.0], dtype=float)
+    mu = Constant(1.0) * stiff
+    lmbda = Constant(1.0) * stiff
 
-    Fr = float(ex0 @ F_vec)
-    Fz = float(ez0 @ F_vec)
+    def epsilon(u):
+        return 0.5 * (grad(u) + grad(u).T)
 
-    return (i, j, Fr, Fz)
+    def sigma(u):
+        return lmbda * div(u) * Identity(3) + 2 * mu * epsilon(u)
 
+    # 3. Variational Form
+    a = inner(sigma(u), epsilon(v)) * dx
+    L = inner(Constant((0, 0, 0)), v) * dx
 
-def coarse_candidates_parallel_deflated(fp_eval, n_r=7, n_z=7, verbose=True, nproc=None,
-                                        Re_bg_input=None):
+    # 4. Boundary Conditions
+    bc_walls = DirichletBC(V_disp, Constant((0., 0., 0.)), tags["walls"])
+    bc_in = DirichletBC(V_disp, Constant((0., 0., 0.)), tags["inlet"])
+    bc_out = DirichletBC(V_disp, Constant((0., 0., 0.)), tags["outlet"])
 
-    R = fp_eval.R
-    H = fp_eval.H
-    W = fp_eval.W
-    Q = fp_eval.Q
-    L = fp_eval.L
-    a = fp_eval.a
-    particle_maxh = fp_eval.particle_maxh
-    global_maxh = fp_eval.global_maxh
+    disp_const = Constant(displacement_vector)
+    bc_part = DirichletBC(V_disp, disp_const, tags["particle"])
 
+    bcs = [bc_walls, bc_in, bc_out, bc_part]
 
-    Re_p_correct = fp_eval.Re_p
+    # 5. Solve
+    displacement_sol = Function(V_disp)
+    solve(a == L, displacement_sol, bcs=bcs,
+          solver_parameters={'ksp_type': 'preonly', 'pc_type': 'lu', "pc_factor_mat_solver_type": "mumps"})
 
-    if Re_bg_input is None:
-        raise ValueError("Re_bg_input (Input Reynolds number) must be provided for correct background flow physics!")
+    # 6. Actually move the mesh coordinates
 
-    eps = particle_maxh
-    r_min = -W / 2 + a + eps
-    r_max = W / 2 - a - eps
-    z_min = -H / 2 + a + eps
-    z_max = H / 2 - a - eps
+    # --- FIX START ---
+    # Get the function space of the ACTUAL mesh coordinates (which is Degree 3)
+    V_coords = mesh.coordinates.function_space()
 
-    r_vals = np.linspace(r_min, r_max, n_r)
-    z_vals = np.linspace(z_min, z_max, n_z)
+    # Create a function in that high-order space
+    displacement_high_order = Function(V_coords)
 
-    Fr_grid = np.zeros((n_r, n_z))
-    Fz_grid = np.zeros((n_r, n_z))
+    # Interpolate the linear solution onto the high-order space
+    displacement_high_order.interpolate(displacement_sol)
 
+    # Now we can add them because they are in the same function space
+    mesh.coordinates.assign(mesh.coordinates + displacement_high_order)
+    # --- FIX END ---
 
-    tasks = [
-        (i, j, r_vals[i], z_vals[j],
-         R, H, W, Q, L, a, particle_maxh, global_maxh, Re_p_correct)
-        for i in range(n_r)
-        for j in range(n_z)
-    ]
-
-    if nproc is None:
-        nproc = mp.cpu_count()
-
-    if verbose:
-        print(f"Start parallel coarse grid with {nproc} processes.")
-        print(f"  Background Re (Worker): {Re_bg_input:.2f}")
-        print(f"  Particle Re_p (Worker): {Re_p_correct:.4f}")
-
-    with mp.Pool(
-            processes=nproc,
-            initializer=_init_bg_worker_defl,
-            initargs=(R, H, W, Q, Re_bg_input)
-    ) as pool:
-
-        results = []
-        for res in tqdm(pool.imap_unordered(_compute_single_F_defl, tasks),
-                        total=len(tasks), ncols=80):
-            results.append(res)
-
-    for (i, j, Fr, Fz) in results:
-        Fr_grid[i, j] = Fr
-        Fz_grid[i, j] = Fz
-
-    phi = np.sqrt(Fr_grid ** 2 + Fz_grid ** 2)
-
-    candidates = []
-    for i in range(n_r):
-        for j in range(n_z):
-            val = phi[i, j]
-            neigh = []
-            for di, dj in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
-                ii, jj = i + di, j + dj
-                if 0 <= ii < n_r and 0 <= jj < n_z:
-                    neigh.append(phi[ii, jj])
-            if neigh and all(val <= nb for nb in neigh):
-                candidates.append(np.array([r_vals[i], z_vals[j]]))
-
-    return candidates, r_vals, z_vals, phi, Fr_grid, Fz_grid
-
+    return displacement_sol
 
 def plot_paper_reproduction(fp_eval, r_vals, z_vals, phi, Fr_grid, Fz_grid,
                             title="Figure 2 Reproduction", invert_xaxis=False):
-    # Gitter für den Plot
+
     R_grid, Z_grid = np.meshgrid(r_vals, z_vals, indexing='ij')
 
-    # Physikalische Parameter holen
     W = fp_eval.W
     H = fp_eval.H
     a = fp_eval.a
+    eps = fp_eval.eps
 
-    # Dein Sicherheitsabstand (aus dem Code rekonstruiert)
-    # In deiner Berechnung: eps = particle_maxh = 0.2 * a
-    eps = fp_eval.particle_maxh
-
-    # Berechnete "verbotene Zone" für den Partikel-MITTELPUNKT
-    # Das ist der Bereich: Radius (a) + Sicherheitsabstand (eps)
+    # Bereich, in dem der Partikelmittelpunkt nicht sein darf
     exclusion_dist = a + eps
 
     fig, ax = plt.subplots(figsize=(8, 8))
 
-    # 1. Kontur-Plot der Daten (nur dort, wo wir gerechnet haben)
-    # Mehr Levels (40) für weichere Übergänge
+    # Kontur-Plot von |F|
     levels = np.linspace(phi.min(), phi.max(), 40)
     cs = ax.contourf(R_grid, Z_grid, phi, levels=levels, cmap="viridis", alpha=0.9)
     cbar = plt.colorbar(cs, ax=ax, fraction=0.046, pad=0.04)
     cbar.set_label(r"Force Magnitude $\|\mathbf{F}\|$")
 
-    # 2. Null-Linien (Gleichgewichtslagen)
-    # Fr = 0 (Radiales Gleichgewicht)
-    ax.contour(R_grid, Z_grid, Fr_grid, levels=[0], colors="cyan", linestyles="--", linewidths=2)
-    # Fz = 0 (Axiales Gleichgewicht)
-    ax.contour(R_grid, Z_grid, Fz_grid, levels=[0], colors="magenta", linestyles="-", linewidths=2)
+    # Zero-Level-Sets
+    ax.contour(R_grid, Z_grid, Fr_grid, levels=[0], colors="cyan",
+               linestyles="--", linewidths=2)  # Fr = 0
+    ax.contour(R_grid, Z_grid, Fz_grid, levels=[0], colors="magenta",
+               linestyles="-", linewidths=2)   # Fz = 0
 
-    # 3. VISUALISIERUNG DES ECHTEN KANALS
-
-    # A) Die echte Kanalwand (schwarzer Rahmen)
+    # Physikalische Kanalwände
     wall_rect = patches.Rectangle((-W / 2, -H / 2), W, H,
-                                  linewidth=3, edgecolor='black', facecolor='none', zorder=10)
+                                  linewidth=3, edgecolor='black',
+                                  facecolor='none', zorder=10)
     ax.add_patch(wall_rect)
 
-    # B) Der "verbotene Bereich" (Grau)
-    # Das ist der Bereich, in dem der Partikelmittelpunkt nicht sein darf.
-    # Wir füllen den Bereich zwischen der echten Wand und deinen Daten grau.
-
-    # Links
+    # Verbotene Zone für Partikelmittelpunkt
     ax.add_patch(patches.Rectangle((-W / 2, -H / 2), exclusion_dist, H,
-                                   facecolor='gray', alpha=0.3, hatch='///'))
-    # Rechts
-    ax.add_patch(patches.Rectangle((W / 2 - exclusion_dist, -H / 2), exclusion_dist, H,
-                                   facecolor='gray', alpha=0.3, hatch='///'))
-    # Unten
+                                   facecolor='gray', alpha=0.3, hatch='///'))  # links
+    ax.add_patch(patches.Rectangle((W / 2 - exclusion_dist, -H / 2),
+                                   exclusion_dist, H,
+                                   facecolor='gray', alpha=0.3, hatch='///'))  # rechts
     ax.add_patch(patches.Rectangle((-W / 2, -H / 2), W, exclusion_dist,
-                                   facecolor='gray', alpha=0.3, hatch='///'))
-    # Oben
-    ax.add_patch(patches.Rectangle((-W / 2, H / 2 - exclusion_dist), W, exclusion_dist,
-                                   facecolor='gray', alpha=0.3, hatch='///'))
+                                   facecolor='gray', alpha=0.3, hatch='///'))  # unten
+    ax.add_patch(patches.Rectangle((-W / 2, H / 2 - exclusion_dist),
+                                   W, exclusion_dist,
+                                   facecolor='gray', alpha=0.3, hatch='///'))  # oben
 
-    # 4. Achsen hart auf die physikalischen Maße setzen (+ etwas Rand)
     margin = 0.1
     ax.set_xlim(-W / 2 - margin, W / 2 + margin)
     ax.set_ylim(-H / 2 - margin, H / 2 + margin)
-    ax.set_aspect('equal')  # Wichtig! Sonst verzerrt
+    ax.set_aspect('equal')
 
     ax.set_xlabel("r (Radial coordinate)")
     ax.set_ylabel("z (Axial coordinate)")
 
-    # Spiegelung korrigieren, falls gewünscht
     if invert_xaxis:
         ax.invert_xaxis()
         title += " (Inverted X)"
 
     ax.set_title(title)
 
-    # Manuelle Legende erstellen
     from matplotlib.lines import Line2D
     legend_elements = [
         Line2D([0], [0], color='cyan', lw=2, ls='--', label='$F_r=0$'),
         Line2D([0], [0], color='magenta', lw=2, ls='-', label='$F_z=0$'),
-        patches.Patch(facecolor='gray', alpha=0.3, hatch='///', label='Wall exclusion ($a+\epsilon$)'),
-        patches.Patch(facecolor='none', edgecolor='black', lw=2, label='Physical Wall')
+        patches.Patch(facecolor='gray', alpha=0.3, hatch='///',
+                      label='Wall exclusion ($a+\\epsilon$)'),
+        patches.Patch(facecolor='none', edgecolor='black', lw=2,
+                      label='Physical Wall')
     ]
     ax.legend(handles=legend_elements, loc='upper right')
 
     plt.tight_layout()
-    plt.savefig(f"force_contour_a={a}.png", dpi=300)
-
-
-
-
-
-
-
+    plt.show()
 
 
 def newton_monitor(iter, x, Fx, delta):
@@ -233,29 +707,19 @@ def newton_monitor(iter, x, Fx, delta):
     )
 
 
-class FpEvaluator:
+class FpEvaluatorALE:
 
-    def __init__(self,
-                 R, W, H, L, a,
-                 particle_maxh, global_maxh,
-                 Re, Re_p,
-                 bg_flow=None,
-                 Q=1.0):
-        self.R = float(R)
-        self.W = float(W)
-        self.H = float(H)
-        self.L = float(L)
-        self.a = float(a)
-        self.particle_maxh = float(particle_maxh)
-        self.global_maxh = float(global_maxh)
-        self.Re = float(Re)
-        self.Re_p = float(Re_p)
-        self.Q = float(Q)
+    def __init__(self, R, W, H, L, a, particle_maxh, global_maxh, Re, Re_p, bg_flow=None, Q=1.0, eps=0.025):
+        # ... copy your existing init params ...
+        self.R, self.W, self.H, self.L = R, W, H, L
+        self.a, self.particle_maxh, self.global_maxh = a, particle_maxh, global_maxh
+        self.Re, self.Re_p, self.Q, self.eps = Re, Re_p, Q, eps
 
-        self.r_min = -0.5 * self.W + self.a
-        self.r_max =  0.5 * self.W - self.a
-        self.z_min = -0.5 * self.H + self.a
-        self.z_max =  0.5 * self.H - self.a
+        # Boundaries
+        self.r_min = -0.5 * self.W + self.a + self.eps
+        self.r_max = 0.5 * self.W - self.a - self.eps
+        self.z_min = -0.5 * self.H + self.a + self.eps
+        self.z_max = 0.5 * self.H - self.a - self.eps
 
         if bg_flow is None:
             self.bg_flow = background_flow(self.R, self.H, self.W, self.Q, self.Re)
@@ -263,42 +727,122 @@ class FpEvaluator:
         else:
             self.bg_flow = bg_flow
 
-    def _check_inside_box(self, r, z):
-        return (self.r_min <= r <= self.r_max) and (self.z_min <= z <= self.z_max)
+        # --- ALE STATE VARIABLES ---
+        self._current_mesh = None
+        self._current_tags = None
+        self._current_r = None
+        self._current_z = None
+        self._original_coords = None  # To restore mesh before deforming again
+
+    def _get_mesh_at(self, r, z):
+        """
+        Smart mesh retrieval:
+        1. If no mesh exists, generate one at (r,z).
+        2. If mesh exists, RELOAD original coords, then DEFORM to (r,z).
+        """
+
+        # If we don't have a mesh yet, create the base mesh
+        # It is best to generate the base mesh at the current guess to minimize distortion
+        if self._current_mesh is None:
+            if self._check_inside_box(r, z):
+                print(f"Generating BASE mesh at r={r:.4f}, z={z:.4f}")
+                mesh, tags = make_curved_channel_section_with_spherical_hole(
+                    self.R, self.H, self.W, self.L, self.a,
+                    self.particle_maxh, self.global_maxh,
+                    r_off=r, z_off=z
+                )
+                self._current_mesh = mesh
+                self._current_tags = tags
+                self._current_r = r
+                self._current_z = z
+
+                # Store a COPY of the original coordinates (undeformed state)
+                # We need a deep copy of the coordinate data
+                self._original_coords = Function(mesh.coordinates)
+                return mesh, tags
+            else:
+                raise ValueError("Initial guess outside box")
+
+        # If we already have a mesh, we deform it from the BASE state
+        # 1. Reset mesh to the state where it was generated
+        self._current_mesh.coordinates.assign(self._original_coords)
+
+        # 2. Calculate displacement vector from the BASE (creation) pos to NEW pos
+        dr = r - self._current_r
+        dz = z - self._current_z
+
+        # Check if deformation is too large (e.g., > 2*radius).
+        # If so, REMESH to avoid inverted elements.
+        dist = sqrt(dr ** 2 + dz ** 2)
+        if dist > 2.0 * self.a:
+            print(f"Deformation too large ({dist:.3f} > {2 * self.a:.3f}). Remeshing base...")
+            # Recursively call self (resets _current_mesh)
+            self._current_mesh = None
+            return self._get_mesh_at(r, z)
+
+        # 3. Convert (dr, dz) to Cartesian displacement (dx, dy, dz)
+        # Note: Your geometry creation uses r_off (radial) and z_off (axial)
+        # We need to know the theta position of the particle to project dr correctly.
+        # In 'make_curved...', the particle is at theta = L/R * 0.5
+        theta_p = (self.L / self.R) * 0.5
+
+        dx = dr * cos(theta_p)
+        dy = dr * sin(theta_p)
+        dz_disp = dz
+
+        disp_vec = [dx, dy, dz_disp]
+
+        # 4. Solve Elasticity and Move Mesh
+        move_mesh_elasticity(self._current_mesh, self._current_tags, disp_vec)
+
+        return self._current_mesh, self._current_tags
 
     def evaluate_F(self, x):
-
         r, z = float(x[0]), float(x[1])
 
         if not self._check_inside_box(r, z):
-            raise ValueError(f"(r,z)=({r},{z}) außerhalb des zulässigen Bereichs.")
+            # Return a penalty or raise error
+            raise ValueError(f"Out of bounds: {r}, {z}")
 
-        mesh3d, tags = make_curved_channel_section_with_spherical_hole(
-            self.R, self.H, self.W, self.L, self.a,
-            self.particle_maxh, self.global_maxh,
-            r_off=r, z_off=z
-        )
+        # Get deformed mesh
+        mesh3d, tags = self._get_mesh_at(r, z)
+
+        # Solve Flow (your existing logic)
+        # Note: You must pass the CORRECT Re_p corresponding to the NEW position?
+        # Your original code used a fixed Re_p in __init__, but calculated Re_p_correct in parallel worker.
+        # Assuming self.Re_p is correct for now.
 
         pf = perturbed_flow(mesh3d, tags, self.a, self.Re_p, self.bg_flow)
         F_cart = pf.F_p()
 
+        # Project force (same as your code)
         cx, cy, cz = tags["particle_center"]
-        r0 = np.hypot(cx, cy)
+        # Note: tags["particle_center"] might be the OLD center if you didn't update tags.
+        # But for projection vector calculation, we should use the CURRENT r, z
+
+        # We can calculate the current center analytically based on r, z and theta_p
+        theta_p = (self.L / self.R) * 0.5
+        curr_cx = (self.R + r) * cos(theta_p)
+        curr_cy = (self.R + r) * sin(theta_p)
+
+        r0 = np.hypot(curr_cx, curr_cy)
         if r0 < 1e-14:
-            ex0 = np.array([1.0, 0.0, 0.0], dtype=float)
+            ex0 = np.array([1.0, 0.0, 0.0])
         else:
-            ex0 = np.array([cx / r0, cy / r0, 0.0], dtype=float)
-        ez0 = np.array([0.0, 0.0, 1.0], dtype=float)
+            ex0 = np.array([curr_cx / r0, curr_cy / r0, 0.0])
+        ez0 = np.array([0.0, 0.0, 1.0])
 
         Fr = float(ex0 @ F_cart)
         Fz = float(ez0 @ F_cart)
 
         return np.array([Fr, Fz], dtype=float)
 
+    def _check_inside_box(self, r, z):
+        return (self.r_min <= r <= self.r_max) and (self.z_min <= z <= self.z_max)
+
 
 def approx_jacobian(F, x, Fx=None, eps_rel=1e-3, eps_abs=1e-4,
                     r_min=None, r_max=None, z_min=None, z_max=None):
-
 
     x = np.asarray(x, float)
 
@@ -306,7 +850,6 @@ def approx_jacobian(F, x, Fx=None, eps_rel=1e-3, eps_abs=1e-4,
         Fx = F(x)
 
     clamp = not (r_min is None or r_max is None or z_min is None or z_max is None)
-
     J = np.zeros((2, 2), float)
 
     for i in range(2):
@@ -339,30 +882,8 @@ def approx_jacobian(F, x, Fx=None, eps_rel=1e-3, eps_abs=1e-4,
 
 
 
-def make_deflated_F(F, known_roots, alpha=1e-2, p=2.0):
-
-    roots = [np.asarray(rz, dtype=float) for rz in known_roots]
-
-    def F_defl(x):
-        x = np.asarray(x, dtype=float)
-        val = F(x)
-        if not roots:
-            return val
-        factor = 1.0
-        for rstar in roots:
-            dist = np.linalg.norm(x - rstar)
-            if dist < 1e-12:
-                dist = 1e-12
-            factor *= (1.0 / dist**p + alpha)
-        return factor * val
-
-    return F_defl
-
-
-
-def newton_deflated_2d(fp_eval, x0, known_roots, alpha=1e-2, p=2.0, tol_F=1e-3, tol_x=1e-6, max_iter=15, monitor=None,
-                       ls_max_steps=8, ls_reduction=0.5):
-
+def newton_deflated_2d(fp_eval, x0, known_roots, alpha=1e-2, p=2.0, tol_F=1e-3, tol_x=1e-6, max_iter=15, monitor=newton_monitor,
+                        ls_max_steps=8, ls_reduction=0.5, ls_eta=1e-3, stagnation_rel_drop=1e-2, stagnation_tol_factor=3.0,):
     x = np.asarray(x0, dtype=float)
 
     def F_orig(x_vec):
@@ -381,8 +902,8 @@ def newton_deflated_2d(fp_eval, x0, known_roots, alpha=1e-2, p=2.0, tol_F=1e-3, 
             fac *= (1.0 / dist**p + alpha)
         return fac
 
-    def F_defl(x_vec): return defl_factor(x_vec) * F_orig(x_vec)
-
+    def F_defl(x_vec):
+        return defl_factor(x_vec) * F_orig(x_vec)
 
     def compute_alpha_max(x_vec, delta):
         alpha_max = 1.0
@@ -406,6 +927,8 @@ def newton_deflated_2d(fp_eval, x0, known_roots, alpha=1e-2, p=2.0, tol_F=1e-3, 
     F0 = F_orig(x)
     F0_norm = np.linalg.norm(F0)
     F0_defl = defl_factor(x) * F0
+    F_init_norm = F0_norm
+    best_F_norm = F0_norm
 
     if monitor is not None:
         monitor(0, x, F0, np.zeros_like(x))
@@ -414,26 +937,30 @@ def newton_deflated_2d(fp_eval, x0, known_roots, alpha=1e-2, p=2.0, tol_F=1e-3, 
         return x, True
 
     for k in range(1, max_iter + 1):
-
         J = approx_jacobian(
-                F_defl, x, Fx=F0_defl,
-                r_min=fp_eval.r_min, r_max=fp_eval.r_max,
-                z_min=fp_eval.z_min, z_max=fp_eval.z_max
-            )
+            F_defl,
+            x,
+            Fx=F0_defl,
+            r_min=fp_eval.r_min,
+            r_max=fp_eval.r_max,
+            z_min=fp_eval.z_min,
+            z_max=fp_eval.z_max,
+        )
 
         try:
             delta = np.linalg.solve(J, -F0_defl)
         except np.linalg.LinAlgError:
-            print(f"[Abort] LinAlgError (singuläre Jacobi-Matrix) bei Iteration {k}, x={x}")
+            print(f"[Abort] LinAlgError (singular Jacobian) at iter {k}, x={x}")
             return x, False
 
         alpha_max = compute_alpha_max(x, delta)
         if alpha_max <= 0:
-            print(f"[Abort] alpha_max <= 0 (Randschnitt) bei Iteration {k}, x={x}, delta={delta}")
+            print(f"[Abort] alpha_max <= 0 (boundary hit) at iter {k}, x={x}, delta={delta}")
             return x, False
 
         alpha_ls = alpha_max
         F_trial = None
+        F_trial_norm = None
 
         for _ in range(ls_max_steps):
             x_trial = x + alpha_ls * delta
@@ -446,20 +973,31 @@ def newton_deflated_2d(fp_eval, x0, known_roots, alpha=1e-2, p=2.0, tol_F=1e-3, 
             F_trial = F_orig(x_trial)
             F_trial_norm = np.linalg.norm(F_trial)
 
-            if F0_norm > 1e-1:
-                accept = (F_trial_norm < F0_norm * (1 - 1e-2))
-            else:
-                accept = (F_trial_norm < F0_norm)
+            if F_trial_norm <= tol_F:
+                break
 
-            if accept:
+            if F_trial_norm <= F0_norm * (1.0 - ls_eta):
                 break
 
             alpha_ls *= ls_reduction
 
+        if F_trial is None:
+            print(f"[Abort] Linesearch stagnation (no valid step) at iter {k}, x={x}, |F|={F0_norm:.3e}")
+            rel_drop = F0_norm / max(F_init_norm, 1e-16)
+            if F0_norm < stagnation_tol_factor * tol_F or rel_drop < stagnation_rel_drop:
+                print(f"[Accept] Treating x as equilibrium despite stagnation: |F|={F0_norm:.3e}, "
+                      f"rel_drop={rel_drop:.3e}")
+                return x, True
+            return x, False
 
-        if F_trial is None or F_trial_norm >= F0_norm:
-            print(f"[Abort] Linesearch-Stagnation bei Iteration {k}, x={x}, |F|={F0_norm:.3e}")
-            return x, (F0_norm < tol_F)
+        if F_trial_norm is None or F_trial_norm >= F0_norm:
+            print(f"[Abort] Linesearch stagnation at iter {k}, x={x}, |F|={F0_norm:.3e}")
+            rel_drop = F0_norm / max(F_init_norm, 1e-16)
+            if F0_norm < stagnation_tol_factor * tol_F or rel_drop < stagnation_rel_drop:
+                print(f"[Accept] Treating x as equilibrium despite stagnation: |F|={F0_norm:.3e}, "
+                      f"rel_drop={rel_drop:.3e}")
+                return x, True
+            return x, False
 
         step = alpha_ls * delta
         x = x + step
@@ -467,77 +1005,96 @@ def newton_deflated_2d(fp_eval, x0, known_roots, alpha=1e-2, p=2.0, tol_F=1e-3, 
         F0 = F_trial
         F0_norm = F_trial_norm
         F0_defl = defl_factor(x) * F0
+        best_F_norm = min(best_F_norm, F0_norm)
 
         if monitor is not None:
             monitor(k, x, F0, step)
 
         if F0_norm < tol_F:
             return x, True
+
         if np.linalg.norm(step) < tol_x:
-            return x, (F0_norm < tol_F)
+            is_good = (F0_norm < stagnation_tol_factor * tol_F)
+            print(f"[Stop] Step small at iter {k}, |dx|={np.linalg.norm(step):.3e}, |F|={F0_norm:.3e}, "
+                  f"{'accepting' if is_good else 'rejecting'}")
+            return x, is_good
 
-    return x, (F0_norm < tol_F)
+    is_good = (F0_norm < stagnation_tol_factor * tol_F)
+    print(f"[Stop] Max iters reached, |F|={F0_norm:.3e}, "
+          f"{'accepting' if is_good else 'rejecting'}")
+    return x, is_good
 
 
 
 
-
-def find_equilibria_with_deflation(fp_eval, n_r=10, n_z=10, max_roots=20, skip_radius=0.02, newton_kwargs=None, verbose=True,
-                                   coarse_data=None, max_candidates=None, refine_factor=4, boundary_tol=5e-3):
-
+def find_equilibria_with_deflation(
+    fp_eval,
+    initial_guesses,
+    max_roots=20,
+    skip_radius=0.02,
+    newton_kwargs=None,
+    verbose=True,
+    coarse_data=None,
+    max_candidates=None,
+    refine_factor=4,
+    boundary_tol=5e-3,
+):
     if newton_kwargs is None:
         newton_kwargs = {}
 
     if coarse_data is None:
         if verbose:
-            print("=== Coarse Grid ===")
-        _, r_vals, z_vals, phi, _, _ = coarse_candidates_parallel_deflated(fp_eval, n_r=n_r, n_z=n_z, verbose=verbose)
-    else:
-        _, r_vals, z_vals, phi, _, _ = coarse_data
+            print("=== Coarse grid (zero level sets) ===")
 
-    if verbose:
-        print("\n=== Kandidaten aus interpoliertem coarse grid ===")
-    refined_candidates = refine_candidates_by_interpolation(
-        r_vals, z_vals, phi,
-        refine_factor=refine_factor,
-        max_candidates=max_candidates
-    )
+    candidates = initial_guesses.copy()
+
+    candidates = np.asarray(candidates, dtype=float)
+    if candidates.size == 0:
+        if verbose:
+            print("No zero level set candidates on coarse grid.")
+        return np.empty((0, 2))
+
+    if max_candidates is not None and len(candidates) > max_candidates:
+        candidates = candidates[:max_candidates]
 
     filtered_candidates = []
-    for x0 in refined_candidates:
+    for x0 in candidates:
         r0, z0 = x0
-
-        if (abs(r0 - fp_eval.r_min) < boundary_tol or
-            abs(r0 - fp_eval.r_max) < boundary_tol or
-            abs(z0 - fp_eval.z_min) < boundary_tol or
-            abs(z0 - fp_eval.z_max) < boundary_tol):
-
+        if (
+            abs(r0 - fp_eval.r_min) < boundary_tol
+            or abs(r0 - fp_eval.r_max) < boundary_tol
+            or abs(z0 - fp_eval.z_min) < boundary_tol
+            or abs(z0 - fp_eval.z_max) < boundary_tol
+        ):
             if verbose:
-                print(f"[Skip] x0={x0} liegt zu nahe am Rand → verworfen.")
+                print(f"[Skip] x0={x0} too close to boundary.")
             continue
-
+        if any(np.linalg.norm(x0 - y) < skip_radius for y in filtered_candidates):
+            if verbose:
+                print(f"[Skip] x0={x0} too close to another candidate.")
+            continue
         filtered_candidates.append(x0)
 
     if verbose:
+        print("\n=== Start candidates for Newton (from zero level sets) ===")
         for x in filtered_candidates:
-            print(f"  Startkandidat x = ({x[0]: .4f}, {x[1]: .4f})")
+            print(f"  x0 = ({x[0]:.4f}, {x[1]:.4f})")
 
     roots = []
     if verbose:
-        print("\n=== Newton + Deflation ===")
+        print("\n=== Newton + deflation ===")
 
     for x0 in filtered_candidates:
-
         if len(roots) >= max_roots:
             break
 
         if any(np.linalg.norm(x0 - r) < skip_radius for r in roots):
             if verbose:
-                print(f"[Skip] x0={x0} (zu nah an existierender Wurzel).")
+                print(f"[Skip] x0={x0} already covered by existing root.")
             continue
 
         if verbose:
-            print(f"[OK] Starte Newton bei x0={x0}")
+            print(f"[OK] Starting Newton at x0={x0}")
 
         x_root, ok_newton = newton_deflated_2d(
             fp_eval,
@@ -548,212 +1105,35 @@ def find_equilibria_with_deflation(fp_eval, n_r=10, n_z=10, max_roots=20, skip_r
             tol_F=newton_kwargs.get("tol_F", 1e-3),
             tol_x=newton_kwargs.get("tol_x", 1e-6),
             max_iter=newton_kwargs.get("max_iter", 20),
-            monitor=newton_kwargs.get("monitor", None),
             ls_max_steps=newton_kwargs.get("ls_max_steps", 8),
-            ls_reduction=newton_kwargs.get("ls_reduction", 0.5)
+            ls_reduction=newton_kwargs.get("ls_reduction", 0.5),
         )
 
         if not ok_newton:
             if verbose:
-                print(f"[Fail] Newton konvergiert nicht für x0={x0}")
+                print(f"[Fail] Newton did not converge for x0={x0}")
             continue
 
         if any(np.linalg.norm(x_root - r) < skip_radius for r in roots):
             if verbose:
-                print(f"[Dup] x_root={x_root} ist Duplikat.")
+                print(f"[Dup] x_root={x_root} is a duplicate.")
             continue
 
         roots.append(x_root)
 
         if verbose:
             Fvec = fp_eval.evaluate_F(x_root)
-            print(f"  Neue Gleichgewichtslage #{len(roots)}:")
-            print(f"    r = {x_root[0]:.5f}, z = {x_root[1]:.5f}, "
-                  f"|F| = {np.linalg.norm(Fvec):.3e}")
+            print(f"  New equilibrium #{len(roots)}:")
+            print(f"    r = {x_root[0]:.5f}, z = {x_root[1]:.5f}, |F| = {np.linalg.norm(Fvec):.3e}")
 
     return np.array(roots)
 
 
 
-
-def plot_equilibria_contour_with_zero_sets(fp_eval, r_vals, z_vals, phi,
-                                           equilibria=None,
-                                           stability_info=None,
-                                           title="Force field and equilibrium positions",
-                                           cmap="viridis",
-                                           levels=20,
-                                           figsize=(7, 5)):
-
-    R, Z = np.meshgrid(r_vals, z_vals, indexing="ij")
-
-    F_r = np.zeros_like(R)
-    F_z = np.zeros_like(Z)
-
-    for i in range(len(r_vals)):
-        for j in range(len(z_vals)):
-            Fr, Fz = fp_eval.evaluate_F([r_vals[i], z_vals[j]])
-            F_r[i, j] = Fr
-            F_z[i, j] = Fz
-
-    plt.figure(figsize=figsize)
-
-    cs = plt.contourf(R, Z, phi, levels=levels, cmap=cmap)
-    plt.colorbar(cs, label=r"$\|\mathbf{F}_p(r,z)\|$")
-
-    c1 = plt.contour(
-        R, Z, F_r,
-        levels=[0],
-        colors="cyan",
-        linestyles="--",
-        linewidths=2
-    )
-    c1.collections[0].set_label("F_r = 0")
-
-    c2 = plt.contour(
-        R, Z, F_z,
-        levels=[0],
-        colors="magenta",
-        linestyles="-",
-        linewidths=2
-    )
-    c2.collections[0].set_label("F_z = 0")
-
-    color_map = {
-        "stabil": "green",
-        "Sattel": "yellow",
-        "instabil": "red",
-        "grenzstabil / unklar": "gray",
-        "unklar (NaN in Eigenwerten)": "gray",
-    }
-
-    if equilibria is not None and len(equilibria) > 0:
-        for i, x in enumerate(equilibria):
-            if stability_info is not None:
-                eq_type = stability_info[i]["type"]
-                color = color_map.get(eq_type, "gray")
-                label = f"{eq_type} (EQ {i+1})"
-            else:
-                color = "red"
-                label = f"EQ {i+1}"
-
-            plt.scatter(
-                x[0], x[1],
-                s=120,
-                color=color,
-                edgecolors="black",
-                linewidths=1.0,
-                label=label
-            )
-
-    plt.xlabel("r")
-    plt.ylabel("z")
-    plt.title(title)
-    plt.legend(loc="upper right")
-    plt.tight_layout()
-    plt.show()
-
-
-
-
-def local_patch_test(x0, r_vals, z_vals, phi,
-                     r_patch=3, z_patch=3, factor=1.0):
-
-    r0, z0 = x0
-
-    dr = np.abs(r_vals[1] - r_vals[0])
-    dz = np.abs(z_vals[1] - z_vals[0])
-
-    r_line = r0 + factor * dr * np.linspace(-1, 1, r_patch)
-    z_line = z0 + factor * dz * np.linspace(-1, 1, z_patch)
-
-    from scipy.interpolate import griddata
-    RR, ZZ = np.meshgrid(r_vals, z_vals, indexing='ij')
-    pts = np.stack([RR.flatten(), ZZ.flatten()], axis=1)
-    vals = phi.flatten()
-
-    R_patch, Z_patch = np.meshgrid(r_line, z_line, indexing='ij')
-    patch_vals = griddata(pts, vals, (R_patch, Z_patch), method='cubic')
-
-    if patch_vals is None:
-        return False
-
-    center_val = griddata(pts, vals, np.array([[r0, z0]]), method='cubic')[0]
-
-    if not np.all(center_val <= patch_vals + 1e-12):
-        return False
-
-    edge_vals = np.concatenate([
-        patch_vals[0, :], patch_vals[-1, :],
-        patch_vals[:, 0], patch_vals[:, -1]
-    ])
-    if np.any(np.abs(center_val - edge_vals) < 1e-10):
-        return False
-
-    return True
-
-
-
-def refine_candidates_by_interpolation(r_vals,
-                                       z_vals,
-                                       phi,
-                                       refine_factor=4,
-                                       max_candidates=None,
-                                       min_dist=None):
-
-    n_r, n_z = phi.shape
-
-    n_r_fine = (n_r - 1) * refine_factor + 1
-    n_z_fine = (n_z - 1) * refine_factor + 1
-
-    r_fine = np.linspace(r_vals[0], r_vals[-1], n_r_fine)
-    z_fine = np.linspace(z_vals[0], z_vals[-1], n_z_fine)
-
-    phi_r_interp = np.zeros((n_r_fine, n_z), dtype=float)
-    for j in range(n_z):
-        phi_r_interp[:, j] = np.interp(r_fine, r_vals, phi[:, j])
-
-    phi_fine = np.zeros((n_r_fine, n_z_fine), dtype=float)
-    for i in range(n_r_fine):
-        phi_fine[i, :] = np.interp(z_fine, z_vals, phi_r_interp[i, :])
-
-    minima = []
-    for i in range(n_r_fine):
-        for j in range(n_z_fine):
-            val = phi_fine[i, j]
-            neighbors = []
-            for di, dj in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
-                ii, jj = i + di, j + dj
-                if 0 <= ii < n_r_fine and 0 <= jj < n_z_fine:
-                    neighbors.append(phi_fine[ii, jj])
-            if neighbors and all(val <= nb for nb in neighbors):
-                minima.append((i, j, val))
-
-    minima.sort(key=lambda t: t[2])
-
-    candidates = []
-    if min_dist is None:
-        dr_coarse = abs(r_vals[1] - r_vals[0])
-        dz_coarse = abs(z_vals[1] - z_vals[0])
-        min_dist = 0.5 * np.sqrt(dr_coarse**2 + dz_coarse**2)
-
-    for (i, j, val) in minima:
-        r0 = r_fine[i]
-        z0 = z_fine[j]
-        x0 = np.array([r0, z0], float)
-
-        if any(np.linalg.norm(x0 - c) < min_dist for c in candidates):
-            continue
-
-        candidates.append(x0)
-
-        if max_candidates is not None and len(candidates) >= max_candidates:
-            break
-
-    return candidates
-
-
-
-def classify_single_equilibrium(fp_eval, x_eq, eps_rel=1e-4, ode_sign=-1.0, tol_eig=1e-6):
+def classify_single_equilibrium(fp_eval, x_eq,
+                                eps_rel=1e-4,
+                                ode_sign=-1.0,
+                                tol_eig=1e-6):
 
     x_eq = np.asarray(x_eq, dtype=float)
 
@@ -773,13 +1153,10 @@ def classify_single_equilibrium(fp_eval, x_eq, eps_rel=1e-4, ode_sign=-1.0, tol_
     if np.any(np.isnan(real_parts)):
         eq_type = "unklar (NaN in Eigenwerten)"
     else:
-
         if real_parts[0] * real_parts[1] < -tol_eig**2:
             eq_type = "Sattel"
-
         elif np.all(real_parts < -tol_eig):
             eq_type = "stabil"
-
         elif np.all(real_parts > tol_eig):
             eq_type = "instabil"
         else:
@@ -795,7 +1172,11 @@ def classify_single_equilibrium(fp_eval, x_eq, eps_rel=1e-4, ode_sign=-1.0, tol_
     }
 
 
-def classify_equilibria(fp_eval, equilibria, eps_rel=1e-4, ode_sign=-1.0, tol_eig=1e-6, verbose=True):
+def classify_equilibria(fp_eval, equilibria,
+                        eps_rel=1e-4,
+                        ode_sign=-1.0,
+                        tol_eig=1e-6,
+                        verbose=True):
 
     equilibria = np.asarray(equilibria, dtype=float)
     if equilibria.ndim == 1:
@@ -820,7 +1201,6 @@ def classify_equilibria(fp_eval, equilibria, eps_rel=1e-4, ode_sign=-1.0, tol_ei
             print(f"        Typ: {info['type']}\n")
 
     return results
-
 
 
 
