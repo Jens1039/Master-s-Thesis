@@ -263,78 +263,7 @@ class F_p_grid:
 
 
 
-
-
-
-
-def move_mesh_elasticity(mesh, tags, displacement_vector, verbose=False):
-
-    V_disp = VectorFunctionSpace(mesh, "CG", 1)
-
-    u = TrialFunction(V_disp)
-    v = TestFunction(V_disp)
-
-    # 2. Define Material Properties
-    x = SpatialCoordinate(mesh)
-    cx, cy, cz = tags["particle_center"]
-    r_dist = sqrt((x[0] - cx) ** 2 + (x[1] - cy) ** 2 + (x[2] - cz) ** 2)
-
-    # Stiffening factor: stiff near particle
-    stiff = 1.0 / (r_dist ** 2 + 0.01)
-
-    mu = Constant(1.0) * stiff
-    lmbda = Constant(1.0) * stiff
-
-    def epsilon(u):
-        return 0.5 * (grad(u) + grad(u).T)
-
-    def sigma(u):
-        return lmbda * div(u) * Identity(3) + 2 * mu * epsilon(u)
-
-    # 3. Variational Form
-    a = inner(sigma(u), epsilon(v)) * dx
-    L = inner(Constant((0, 0, 0)), v) * dx
-
-    # 4. Boundary Conditions
-    bc_walls = DirichletBC(V_disp, Constant((0., 0., 0.)), tags["walls"])
-    bc_in = DirichletBC(V_disp, Constant((0., 0., 0.)), tags["inlet"])
-    bc_out = DirichletBC(V_disp, Constant((0., 0., 0.)), tags["outlet"])
-
-    disp_const = Constant(displacement_vector)
-    bc_part = DirichletBC(V_disp, disp_const, tags["particle"])
-
-    bcs = [bc_walls, bc_in, bc_out, bc_part]
-
-    # 5. Solve
-    displacement_sol = Function(V_disp)
-    solve(a == L, displacement_sol, bcs=bcs,
-          solver_parameters={'ksp_type': 'preonly', 'pc_type': 'lu', "pc_factor_mat_solver_type": "mumps"})
-
-    # 6. Actually move the mesh coordinates
-
-    # --- FIX START ---
-    # Get the function space of the ACTUAL mesh coordinates (which is Degree 3)
-    V_coords = mesh.coordinates.function_space()
-
-    # Create a function in that high-order space
-    displacement_high_order = Function(V_coords)
-
-    # Interpolate the linear solution onto the high-order space
-    displacement_high_order.interpolate(displacement_sol)
-
-    # Now we can add them because they are in the same function space
-    mesh.coordinates.assign(mesh.coordinates + displacement_high_order)
-    # --- FIX END ---
-
-    return displacement_sol
-
-
-def newton_monitor(iter, x, Fx, delta):
-    print(f"[Newton iter {iter:02d}] " f"x = ({x[0]:.5f}, {x[1]:.5f}) | " f"|F| = {np.linalg.norm(Fx):.3e} | "
-          f"|dx| = {np.linalg.norm(delta):.3e}")
-
-
-class FpEvaluatorALE:
+class F_p_roots:
 
     def __init__(self, R, W, H, L, a, particle_maxh, global_maxh, Re, Re_p, bg_flow=None, Q=1.0, eps=0.025):
         self.R, self.W, self.H, self.L = R, W, H, L
@@ -357,6 +286,68 @@ class FpEvaluatorALE:
         self._current_r = None
         self._current_z = None
         self._original_coords = None
+
+    @staticmethod
+    def move_mesh_elasticity(mesh, tags, displacement_vector, verbose=False):
+
+        V_disp = VectorFunctionSpace(mesh, "CG", 1)
+
+        u = TrialFunction(V_disp)
+        v = TestFunction(V_disp)
+
+        # 2. Define Material Properties
+        x = SpatialCoordinate(mesh)
+        cx, cy, cz = tags["particle_center"]
+        r_dist = sqrt((x[0] - cx) ** 2 + (x[1] - cy) ** 2 + (x[2] - cz) ** 2)
+
+        # Stiffening factor: stiff near particle
+        stiff = 1.0 / (r_dist ** 2 + 0.01)
+
+        mu = Constant(1.0) * stiff
+        lmbda = Constant(1.0) * stiff
+
+        def epsilon(u):
+            return 0.5 * (grad(u) + grad(u).T)
+
+        def sigma(u):
+            return lmbda * div(u) * Identity(3) + 2 * mu * epsilon(u)
+
+        # 3. Variational Form
+        a = inner(sigma(u), epsilon(v)) * dx
+        L = inner(Constant((0, 0, 0)), v) * dx
+
+        # 4. Boundary Conditions
+        bc_walls = DirichletBC(V_disp, Constant((0., 0., 0.)), tags["walls"])
+        bc_in = DirichletBC(V_disp, Constant((0., 0., 0.)), tags["inlet"])
+        bc_out = DirichletBC(V_disp, Constant((0., 0., 0.)), tags["outlet"])
+
+        disp_const = Constant(displacement_vector)
+        bc_part = DirichletBC(V_disp, disp_const, tags["particle"])
+
+        bcs = [bc_walls, bc_in, bc_out, bc_part]
+
+        # 5. Solve
+        displacement_sol = Function(V_disp)
+        solve(a == L, displacement_sol, bcs=bcs,
+              solver_parameters={'ksp_type': 'preonly', 'pc_type': 'lu', "pc_factor_mat_solver_type": "mumps"})
+
+        # 6. Actually move the mesh coordinates
+
+        # --- FIX START ---
+        # Get the function space of the ACTUAL mesh coordinates (which is Degree 3)
+        V_coords = mesh.coordinates.function_space()
+
+        # Create a function in that high-order space
+        displacement_high_order = Function(V_coords)
+
+        # Interpolate the linear solution onto the high-order space
+        displacement_high_order.interpolate(displacement_sol)
+
+        # Now we can add them because they are in the same function space
+        mesh.coordinates.assign(mesh.coordinates + displacement_high_order)
+        # --- FIX END ---
+
+        return displacement_sol
 
     def _get_mesh_at(self, r, z):
 
@@ -397,7 +388,7 @@ class FpEvaluatorALE:
 
         disp_vec = [dx, dy, dz_disp]
 
-        move_mesh_elasticity(self._current_mesh, self._current_tags, disp_vec)
+        self.move_mesh_elasticity(self._current_mesh, self._current_tags, disp_vec)
 
         return self._current_mesh, self._current_tags
 
@@ -411,20 +402,13 @@ class FpEvaluatorALE:
         # Get deformed mesh
         mesh3d, tags = self._get_mesh_at(r, z)
 
-        # Solve Flow (your existing logic)
-        # Note: You must pass the CORRECT Re_p corresponding to the NEW position?
-        # Your original code used a fixed Re_p in __init__, but calculated Re_p_correct in parallel worker.
-        # Assuming self.Re_p is correct for now.
-
+        # Solve Flow
         pf = perturbed_flow(mesh3d, tags, self.a, self.Re_p, self.bg_flow)
         F_cart = pf.F_p()
 
-        # Project force (same as your code)
+        # Project force
         cx, cy, cz = tags["particle_center"]
-        # Note: tags["particle_center"] might be the OLD center if you didn't update tags.
-        # But for projection vector calculation, we should use the CURRENT r, z
 
-        # We can calculate the current center analytically based on r, z and theta_p
         theta_p = (self.L / self.R) * 0.5
         curr_cx = (self.R + r) * cos(theta_p)
         curr_cy = (self.R + r) * sin(theta_p)
@@ -444,293 +428,290 @@ class FpEvaluatorALE:
     def _check_inside_box(self, r, z):
         return (self.r_min <= r <= self.r_max) and (self.z_min <= z <= self.z_max)
 
+    @staticmethod
+    def approx_jacobian(F, x, Fx=None, eps_rel=1e-3, eps_abs=1e-4,
+                        r_min=None, r_max=None, z_min=None, z_max=None):
 
-def approx_jacobian(F, x, Fx=None, eps_rel=1e-3, eps_abs=1e-4,
-                    r_min=None, r_max=None, z_min=None, z_max=None):
+        x = np.asarray(x, float)
 
-    x = np.asarray(x, float)
+        if Fx is None:
+            Fx = F(x)
 
-    if Fx is None:
-        Fx = F(x)
+        clamp = not (r_min is None or r_max is None or z_min is None or z_max is None)
+        J = np.zeros((2, 2), float)
 
-    clamp = not (r_min is None or r_max is None or z_min is None or z_max is None)
-    J = np.zeros((2, 2), float)
+        for i in range(2):
+            h = max(eps_rel * (1.0 + abs(x[i])), eps_abs)
 
-    for i in range(2):
-        h = max(eps_rel * (1.0 + abs(x[i])), eps_abs)
+            dx = np.zeros(2)
+            dx[i] = h
 
-        dx = np.zeros(2)
-        dx[i] = h
+            xp = x + dx
+            xm = x - dx
 
-        xp = x + dx
-        xm = x - dx
+            if clamp:
+                xp[0] = np.clip(xp[0], r_min, r_max)
+                xp[1] = np.clip(xp[1], z_min, z_max)
+                xm[0] = np.clip(xm[0], r_min, r_max)
+                xm[1] = np.clip(xm[1], z_min, z_max)
 
-        if clamp:
-            xp[0] = np.clip(xp[0], r_min, r_max)
-            xp[1] = np.clip(xp[1], z_min, z_max)
-            xm[0] = np.clip(xm[0], r_min, r_max)
-            xm[1] = np.clip(xm[1], z_min, z_max)
+            fp = F(xp)
+            fm = F(xm)
 
-        fp = F(xp)
-        fm = F(xm)
-
-        denom = xp[i] - xm[i]
-        if abs(denom) < 1e-14:
-            denom = h
-            fp = F(x + dx)
-            J[:, i] = (fp - Fx) / denom
-        else:
-            J[:, i] = (fp - fm) / denom
-
-    return J
-
-
-
-def newton_deflated_2d(fp_eval, x0, known_roots, alpha=1e-2, p=2.0, tol_F=1e-3, tol_x=1e-6, max_iter=15, monitor=newton_monitor,
-                        ls_max_steps=8, ls_reduction=0.5, ls_eta=1e-3, stagnation_rel_drop=1e-2, stagnation_tol_factor=3.0,):
-    x = np.asarray(x0, dtype=float)
-
-    def F_orig(x_vec):
-        return np.asarray(fp_eval.evaluate_F(x_vec), dtype=float)
-
-    roots = [np.asarray(rz, dtype=float) for rz in known_roots]
-
-    def defl_factor(x_vec):
-        if not roots:
-            return 1.0
-        fac = 1.0
-        for rstar in roots:
-            dist = np.linalg.norm(x_vec - rstar)
-            if dist < 1e-12:
-                dist = 1e-12
-            fac *= (1.0 / dist**p + alpha)
-        return fac
-
-    def F_defl(x_vec):
-        return defl_factor(x_vec) * F_orig(x_vec)
-
-    def compute_alpha_max(x_vec, delta):
-        alpha_max = 1.0
-        r_min, r_max = fp_eval.r_min, fp_eval.r_max
-        z_min, z_max = fp_eval.z_min, fp_eval.z_max
-
-        for (xi, di, xmin, xmax) in [
-            (x_vec[0], delta[0], r_min, r_max),
-            (x_vec[1], delta[1], z_min, z_max),
-        ]:
-            if abs(di) < 1e-14:
-                continue
-            if di > 0:
-                a_k = (xmax - xi) / di
+            denom = xp[i] - xm[i]
+            if abs(denom) < 1e-14:
+                denom = h
+                fp = F(x + dx)
+                J[:, i] = (fp - Fx) / denom
             else:
-                a_k = (xmin - xi) / di
-            alpha_max = min(alpha_max, a_k)
+                J[:, i] = (fp - fm) / denom
 
-        return max(min(alpha_max, 1.0), 0.0)
+        return J
 
-    F0 = F_orig(x)
-    F0_norm = np.linalg.norm(F0)
-    F0_defl = defl_factor(x) * F0
-    F_init_norm = F0_norm
-    best_F_norm = F0_norm
+    @staticmethod
+    def newton_monitor(iter, x, Fx, delta):
+        print(f"[Newton iter {iter:02d}] " f"x = ({x[0]:.5f}, {x[1]:.5f}) | " f"|F| = {np.linalg.norm(Fx):.3e} | "
+              f"|dx| = {np.linalg.norm(delta):.3e}")
 
-    if monitor is not None:
-        monitor(0, x, F0, np.zeros_like(x))
 
-    if F0_norm < tol_F:
-        return x, True
+    def newton_deflated_2d(self, x0, known_roots, alpha=1e-2, p=2.0, tol_F=1e-3, tol_x=1e-6, max_iter=15, ls_max_steps=8,
+                           ls_reduction=0.5, ls_eta=1e-3, stagnation_rel_drop=1e-2, stagnation_tol_factor=3.0,):
 
-    for k in range(1, max_iter + 1):
-        J = approx_jacobian(
-            F_defl,
-            x,
-            Fx=F0_defl,
-            r_min=fp_eval.r_min,
-            r_max=fp_eval.r_max,
-            z_min=fp_eval.z_min,
-            z_max=fp_eval.z_max,
-        )
+        x = np.asarray(x0, dtype=float)
 
-        try:
-            delta = np.linalg.solve(J, -F0_defl)
-        except np.linalg.LinAlgError:
-            print(f"[Abort] LinAlgError (singular Jacobian) at iter {k}, x={x}")
-            return x, False
+        def F_orig(x_vec):
+            return np.asarray(self.evaluate_F(x_vec), dtype=float)
 
-        alpha_max = compute_alpha_max(x, delta)
-        if alpha_max <= 0:
-            print(f"[Abort] alpha_max <= 0 (boundary hit) at iter {k}, x={x}, delta={delta}")
-            return x, False
+        roots = [np.asarray(rz, dtype=float) for rz in known_roots]
 
-        alpha_ls = alpha_max
-        F_trial = None
-        F_trial_norm = None
+        def defl_factor(x_vec):
+            if not roots:
+                return 1.0
+            fac = 1.0
+            for rstar in roots:
+                dist = np.linalg.norm(x_vec - rstar)
+                if dist < 1e-12:
+                    dist = 1e-12
+                fac *= (1.0 / dist**p + alpha)
+            return fac
 
-        for _ in range(ls_max_steps):
-            x_trial = x + alpha_ls * delta
+        def F_defl(x_vec):
+            return defl_factor(x_vec) * F_orig(x_vec)
 
-            if not (fp_eval.r_min <= x_trial[0] <= fp_eval.r_max and
-                    fp_eval.z_min <= x_trial[1] <= fp_eval.z_max):
-                alpha_ls *= ls_reduction
-                continue
+        def compute_alpha_max(x_vec, delta):
+            alpha_max = 1.0
+            r_min, r_max = self.r_min, self.r_max
+            z_min, z_max = self.z_min, self.z_max
 
-            F_trial = F_orig(x_trial)
-            F_trial_norm = np.linalg.norm(F_trial)
+            for (xi, di, xmin, xmax) in [
+                (x_vec[0], delta[0], r_min, r_max),
+                (x_vec[1], delta[1], z_min, z_max),
+            ]:
+                if abs(di) < 1e-14:
+                    continue
+                if di > 0:
+                    a_k = (xmax - xi) / di
+                else:
+                    a_k = (xmin - xi) / di
+                alpha_max = min(alpha_max, a_k)
 
-            if F_trial_norm <= tol_F:
-                break
+            return max(min(alpha_max, 1.0), 0.0)
 
-            if F_trial_norm <= F0_norm * (1.0 - ls_eta):
-                break
-
-            alpha_ls *= ls_reduction
-
-        if F_trial is None:
-            print(f"[Abort] Linesearch stagnation (no valid step) at iter {k}, x={x}, |F|={F0_norm:.3e}")
-            rel_drop = F0_norm / max(F_init_norm, 1e-16)
-            if F0_norm < stagnation_tol_factor * tol_F or rel_drop < stagnation_rel_drop:
-                print(f"[Accept] Treating x as equilibrium despite stagnation: |F|={F0_norm:.3e}, "
-                      f"rel_drop={rel_drop:.3e}")
-                return x, True
-            return x, False
-
-        if F_trial_norm is None or F_trial_norm >= F0_norm:
-            print(f"[Abort] Linesearch stagnation at iter {k}, x={x}, |F|={F0_norm:.3e}")
-            rel_drop = F0_norm / max(F_init_norm, 1e-16)
-            if F0_norm < stagnation_tol_factor * tol_F or rel_drop < stagnation_rel_drop:
-                print(f"[Accept] Treating x as equilibrium despite stagnation: |F|={F0_norm:.3e}, "
-                      f"rel_drop={rel_drop:.3e}")
-                return x, True
-            return x, False
-
-        step = alpha_ls * delta
-        x = x + step
-
-        F0 = F_trial
-        F0_norm = F_trial_norm
+        F0 = F_orig(x)
+        F0_norm = np.linalg.norm(F0)
         F0_defl = defl_factor(x) * F0
-        best_F_norm = min(best_F_norm, F0_norm)
+        F_init_norm = F0_norm
+        best_F_norm = F0_norm
 
-        if monitor is not None:
-            monitor(k, x, F0, step)
+        self.newton_monitor(0, x, F0, np.zeros_like(x))
 
         if F0_norm < tol_F:
             return x, True
 
-        if np.linalg.norm(step) < tol_x:
-            is_good = (F0_norm < stagnation_tol_factor * tol_F)
-            print(f"[Stop] Step small at iter {k}, |dx|={np.linalg.norm(step):.3e}, |F|={F0_norm:.3e}, "
-                  f"{'accepting' if is_good else 'rejecting'}")
-            return x, is_good
+        for k in range(1, max_iter + 1):
+            J = self.approx_jacobian(
+                F_defl,
+                x,
+                Fx=F0_defl,
+                r_min=self.r_min,
+                r_max=self.r_max,
+                z_min=self.z_min,
+                z_max=self.z_max,
+            )
 
-    is_good = (F0_norm < stagnation_tol_factor * tol_F)
-    print(f"[Stop] Max iters reached, |F|={F0_norm:.3e}, "
-          f"{'accepting' if is_good else 'rejecting'}")
-    return x, is_good
+            try:
+                delta = np.linalg.solve(J, -F0_defl)
+            except np.linalg.LinAlgError:
+                print(f"[Abort] LinAlgError (singular Jacobian) at iter {k}, x={x}")
+                return x, False
+
+            alpha_max = compute_alpha_max(x, delta)
+            if alpha_max <= 0:
+                print(f"[Abort] alpha_max <= 0 (boundary hit) at iter {k}, x={x}, delta={delta}")
+                return x, False
+
+            alpha_ls = alpha_max
+            F_trial = None
+            F_trial_norm = None
+
+            for _ in range(ls_max_steps):
+                x_trial = x + alpha_ls * delta
+
+                if not (self.r_min <= x_trial[0] <= self.r_max and
+                        self.z_min <= x_trial[1] <= self.z_max):
+                    alpha_ls *= ls_reduction
+                    continue
+
+                F_trial = F_orig(x_trial)
+                F_trial_norm = np.linalg.norm(F_trial)
+
+                if F_trial_norm <= tol_F:
+                    break
+
+                if F_trial_norm <= F0_norm * (1.0 - ls_eta):
+                    break
+
+                alpha_ls *= ls_reduction
+
+            if F_trial is None:
+                print(f"[Abort] Linesearch stagnation (no valid step) at iter {k}, x={x}, |F|={F0_norm:.3e}")
+                rel_drop = F0_norm / max(F_init_norm, 1e-16)
+                if F0_norm < stagnation_tol_factor * tol_F or rel_drop < stagnation_rel_drop:
+                    print(f"[Accept] Treating x as equilibrium despite stagnation: |F|={F0_norm:.3e}, "
+                          f"rel_drop={rel_drop:.3e}")
+                    return x, True
+                return x, False
+
+            if F_trial_norm is None or F_trial_norm >= F0_norm:
+                print(f"[Abort] Linesearch stagnation at iter {k}, x={x}, |F|={F0_norm:.3e}")
+                rel_drop = F0_norm / max(F_init_norm, 1e-16)
+                if F0_norm < stagnation_tol_factor * tol_F or rel_drop < stagnation_rel_drop:
+                    print(f"[Accept] Treating x as equilibrium despite stagnation: |F|={F0_norm:.3e}, "
+                          f"rel_drop={rel_drop:.3e}")
+                    return x, True
+                return x, False
+
+            step = alpha_ls * delta
+            x = x + step
+
+            F0 = F_trial
+            F0_norm = F_trial_norm
+            F0_defl = defl_factor(x) * F0
+            best_F_norm = min(best_F_norm, F0_norm)
+
+            self.newton_monitor(k, x, F0, step)
+
+            if F0_norm < tol_F:
+                return x, True
+
+            if np.linalg.norm(step) < tol_x:
+                is_good = (F0_norm < stagnation_tol_factor * tol_F)
+                print(f"[Stop] Step small at iter {k}, |dx|={np.linalg.norm(step):.3e}, |F|={F0_norm:.3e}, "
+                      f"{'accepting' if is_good else 'rejecting'}")
+                return x, is_good
+
+        is_good = (F0_norm < stagnation_tol_factor * tol_F)
+        print(f"[Stop] Max iters reached, |F|={F0_norm:.3e}, "
+              f"{'accepting' if is_good else 'rejecting'}")
+        return x, is_good
 
 
+    def find_equilibria_with_deflation(self, initial_guesses, max_roots=20, skip_radius=0.02, newton_kwargs=None, verbose=True,
+                                        coarse_data=None, max_candidates=None, boundary_tol=5e-3,):
+        if newton_kwargs is None:
+            newton_kwargs = {}
 
+        if coarse_data is None:
+            if verbose:
+                print("=== Coarse grid (zero level sets) ===")
 
-def find_equilibria_with_deflation(
-    fp_eval,
-    initial_guesses,
-    max_roots=20,
-    skip_radius=0.02,
-    newton_kwargs=None,
-    verbose=True,
-    coarse_data=None,
-    max_candidates=None,
-    refine_factor=4,
-    boundary_tol=5e-3,
-):
-    if newton_kwargs is None:
-        newton_kwargs = {}
+        candidates = initial_guesses.copy()
 
-    if coarse_data is None:
+        candidates = np.asarray(candidates, dtype=float)
+        if candidates.size == 0:
+            if verbose:
+                print("No zero level set candidates on coarse grid.")
+            return np.empty((0, 2))
+
+        if max_candidates is not None and len(candidates) > max_candidates:
+            candidates = candidates[:max_candidates]
+
+        filtered_candidates = []
+        for x0 in candidates:
+            r0, z0 = x0
+            if (
+                abs(r0 - self.r_min) < boundary_tol
+                or abs(r0 - self.r_max) < boundary_tol
+                or abs(z0 - self.z_min) < boundary_tol
+                or abs(z0 - self.z_max) < boundary_tol
+            ):
+                if verbose:
+                    print(f"[Skip] x0={x0} too close to boundary.")
+                continue
+            if any(np.linalg.norm(x0 - y) < skip_radius for y in filtered_candidates):
+                if verbose:
+                    print(f"[Skip] x0={x0} too close to another candidate.")
+                continue
+            filtered_candidates.append(x0)
+
         if verbose:
-            print("=== Coarse grid (zero level sets) ===")
+            print("\n=== Start candidates for Newton (from zero level sets) ===")
+            for x in filtered_candidates:
+                print(f"  x0 = ({x[0]:.4f}, {x[1]:.4f})")
 
-    candidates = initial_guesses.copy()
-
-    candidates = np.asarray(candidates, dtype=float)
-    if candidates.size == 0:
+        roots = []
         if verbose:
-            print("No zero level set candidates on coarse grid.")
-        return np.empty((0, 2))
+            print("\n=== Newton + deflation ===")
 
-    if max_candidates is not None and len(candidates) > max_candidates:
-        candidates = candidates[:max_candidates]
+        for x0 in filtered_candidates:
+            if len(roots) >= max_roots:
+                break
 
-    filtered_candidates = []
-    for x0 in candidates:
-        r0, z0 = x0
-        if (
-            abs(r0 - fp_eval.r_min) < boundary_tol
-            or abs(r0 - fp_eval.r_max) < boundary_tol
-            or abs(z0 - fp_eval.z_min) < boundary_tol
-            or abs(z0 - fp_eval.z_max) < boundary_tol
-        ):
+            if any(np.linalg.norm(x0 - r) < skip_radius for r in roots):
+                if verbose:
+                    print(f"[Skip] x0={x0} already covered by existing root.")
+                continue
+
             if verbose:
-                print(f"[Skip] x0={x0} too close to boundary.")
-            continue
-        if any(np.linalg.norm(x0 - y) < skip_radius for y in filtered_candidates):
+                print(f"[OK] Starting Newton at x0={x0}")
+
+            x_root, ok_newton = self.newton_deflated_2d(
+                x0,
+                known_roots=roots,
+                alpha=newton_kwargs.get("alpha", 1e-2),
+                p=newton_kwargs.get("p", 2.0),
+                tol_F=newton_kwargs.get("tol_F", 1e-3),
+                tol_x=newton_kwargs.get("tol_x", 1e-6),
+                max_iter=newton_kwargs.get("max_iter", 20),
+                ls_max_steps=newton_kwargs.get("ls_max_steps", 8),
+                ls_reduction=newton_kwargs.get("ls_reduction", 0.5),
+            )
+
+            if not ok_newton:
+                if verbose:
+                    print(f"[Fail] Newton did not converge for x0={x0}")
+                continue
+
+            if any(np.linalg.norm(x_root - r) < skip_radius for r in roots):
+                if verbose:
+                    print(f"[Dup] x_root={x_root} is a duplicate.")
+                continue
+
+            roots.append(x_root)
+
             if verbose:
-                print(f"[Skip] x0={x0} too close to another candidate.")
-            continue
-        filtered_candidates.append(x0)
+                Fvec = self.evaluate_F(x_root)
+                print(f"  New equilibrium #{len(roots)}:")
+                print(f"    r = {x_root[0]:.5f}, z = {x_root[1]:.5f}, |F| = {np.linalg.norm(Fvec):.3e}")
 
-    if verbose:
-        print("\n=== Start candidates for Newton (from zero level sets) ===")
-        for x in filtered_candidates:
-            print(f"  x0 = ({x[0]:.4f}, {x[1]:.4f})")
+        return np.array(roots)
 
-    roots = []
-    if verbose:
-        print("\n=== Newton + deflation ===")
 
-    for x0 in filtered_candidates:
-        if len(roots) >= max_roots:
-            break
 
-        if any(np.linalg.norm(x0 - r) < skip_radius for r in roots):
-            if verbose:
-                print(f"[Skip] x0={x0} already covered by existing root.")
-            continue
 
-        if verbose:
-            print(f"[OK] Starting Newton at x0={x0}")
 
-        x_root, ok_newton = newton_deflated_2d(
-            fp_eval,
-            x0,
-            known_roots=roots,
-            alpha=newton_kwargs.get("alpha", 1e-2),
-            p=newton_kwargs.get("p", 2.0),
-            tol_F=newton_kwargs.get("tol_F", 1e-3),
-            tol_x=newton_kwargs.get("tol_x", 1e-6),
-            max_iter=newton_kwargs.get("max_iter", 20),
-            ls_max_steps=newton_kwargs.get("ls_max_steps", 8),
-            ls_reduction=newton_kwargs.get("ls_reduction", 0.5),
-        )
 
-        if not ok_newton:
-            if verbose:
-                print(f"[Fail] Newton did not converge for x0={x0}")
-            continue
 
-        if any(np.linalg.norm(x_root - r) < skip_radius for r in roots):
-            if verbose:
-                print(f"[Dup] x_root={x_root} is a duplicate.")
-            continue
-
-        roots.append(x_root)
-
-        if verbose:
-            Fvec = fp_eval.evaluate_F(x_root)
-            print(f"  New equilibrium #{len(roots)}:")
-            print(f"    r = {x_root[0]:.5f}, z = {x_root[1]:.5f}, |F| = {np.linalg.norm(Fvec):.3e}")
-
-    return np.array(roots)
 
 
 

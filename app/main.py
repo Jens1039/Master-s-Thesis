@@ -30,17 +30,6 @@ if __name__ == "__main__":
     initial_guesses = force_grid.generate_initial_guesses()
     force_grid.plot_guesses_and_roots_on_grid()
 
-    fp_eval = FpEvaluatorALE(R, W, H, L, a, particle_maxh, global_maxh, Re, Re_p)
-
-    roots = find_equilibria_with_deflation(fp_eval, initial_guesses)
-
+    fp_eval = F_p_roots(R, W, H, L, a, particle_maxh, global_maxh, Re, Re_p)
+    roots = F_p_roots.find_equilibria_with_deflation(fp_eval, initial_guesses)
     force_grid.plot_guesses_and_roots_on_grid(roots)
-
-
-
-    '''
-    root_finder = Find_equilibria_with_deflated_newton(R, W, H, L, a, Re, Re_p, particle_maxh, global_maxh, eps,
-                                                       bg_flow=bg, Q=Q)
-
-    roots = root_finder.deflated_newton(initial_guesses, verbose=True)
-    '''
