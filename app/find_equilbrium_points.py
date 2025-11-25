@@ -12,6 +12,7 @@ from background_flow import background_flow
 from build_3d_geometry import make_curved_channel_section_with_spherical_hole
 from perturbed_flow import perturbed_flow
 
+
 class F_p_grid:
 
     def __init__(self, R, W, H, L, a, Re_nominal, Re_p, particle_maxh, global_maxh, eps, bg_flow=None, Q=1.0):
@@ -209,39 +210,35 @@ class F_p_grid:
 
         return initial_guesses
 
-    # Uses the interpolated grid from the previous class and projects the initial guesses on it: Optional: project the exact roots on it
+
     def plot_guesses_and_roots_on_grid(self, roots=None, invert_xaxis=True):
 
         R_grid, Z_grid = np.meshgrid(self.r_vals, self.z_vals, indexing='ij')
 
         fig, ax = plt.subplots(figsize=(7, 6))
 
-        # Hintergrund: |F|
         levels = np.linspace(self.phi.min(), self.phi.max(), 30)
         cs = ax.contourf(R_grid, Z_grid, self.phi, levels=levels, cmap="viridis", alpha=0.8)
         plt.colorbar(cs, ax=ax, label=r"Force Magnitude $\|\mathbf{F}\|$")
 
-        # Null-Linien von Fr und Fz
         ax.contour(R_grid, Z_grid, self.Fr_grid, levels=[0], colors="cyan",
                    linestyles="--", linewidths=1, label="Fr=0")
         ax.contour(R_grid, Z_grid, self.Fz_grid, levels=[0], colors="magenta",
                    linestyles="-", linewidths=1, label="Fz=0")
 
-        # Initial Guesses (falls vorhanden)
         if hasattr(self, "initial_guesses") and len(self.initial_guesses) > 0:
             ig = np.asarray(self.initial_guesses)
             ax.scatter(ig[:, 0], ig[:, 1],
                        c='black', s=80, marker='x',
                        label='Initial guesses', zorder=10)
 
-        # Exakte Roots (falls übergeben)
         if roots is not None:
             roots_arr = np.asarray(roots, dtype=float)
             if roots_arr.ndim == 1:
                 roots_arr = roots_arr.reshape(1, -1)
             if roots_arr.shape[0] > 0:
                 ax.scatter(roots_arr[:, 0], roots_arr[:, 1],
-                           facecolors='none', edgecolors='red',
+                           edgecolors='red',
                            s=120, marker='o',
                            label='Exact roots', zorder=11)
 
@@ -250,7 +247,6 @@ class F_p_grid:
         ax.set_title("Initial guesses and exact roots on coarse force grid")
         ax.set_aspect('equal')
 
-        # Legend: doppelte Labels vermeiden
         handles, labels = ax.get_legend_handles_labels()
         by_label = dict(zip(labels, handles))
         ax.legend(by_label.values(), by_label.keys())
@@ -260,7 +256,6 @@ class F_p_grid:
 
         plt.tight_layout()
         plt.show()
-
 
 
 class F_p_roots:
@@ -707,101 +702,78 @@ class F_p_roots:
         return np.array(roots)
 
 
+    def classify_single_equilibrium(fp_eval, x_eq, eps_rel=1e-4, ode_sign=-1.0, tol_eig=1e-6):
 
+        x_eq = np.asarray(x_eq, dtype=float)
 
+        def G(x):
+            F = np.asarray(fp_eval.evaluate_F(x), dtype=float)
+            return ode_sign * F
 
+        Gx = G(x_eq)
+        J = fp_eval.approx_jacobian(G, x_eq, Fx=Gx, eps_rel=eps_rel)
 
+        eigvals, eigvecs = np.linalg.eig(J)
+        real_parts = eigvals.real
 
+        tr = np.trace(J)
+        det = np.linalg.det(J)
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-def classify_single_equilibrium(fp_eval, x_eq,
-                                eps_rel=1e-4,
-                                ode_sign=-1.0,
-                                tol_eig=1e-6):
-
-    x_eq = np.asarray(x_eq, dtype=float)
-
-    def G(x):
-        F = np.asarray(fp_eval.evaluate_F(x), dtype=float)
-        return ode_sign * F
-
-    Gx = G(x_eq)
-    J = approx_jacobian(G, x_eq, Fx=Gx, eps_rel=eps_rel)
-
-    eigvals, eigvecs = np.linalg.eig(J)
-    real_parts = eigvals.real
-
-    tr = np.trace(J)
-    det = np.linalg.det(J)
-
-    if np.any(np.isnan(real_parts)):
-        eq_type = "unklar (NaN in Eigenwerten)"
-    else:
-        if real_parts[0] * real_parts[1] < -tol_eig**2:
-            eq_type = "Sattel"
-        elif np.all(real_parts < -tol_eig):
-            eq_type = "stabil"
-        elif np.all(real_parts > tol_eig):
-            eq_type = "instabil"
+        if np.any(np.isnan(real_parts)):
+            eq_type = "unklar (NaN in Eigenwerten)"
         else:
-            eq_type = "grenzstabil / unklar"
+            if real_parts[0] * real_parts[1] < -tol_eig ** 2:
+                eq_type = "Sattel"
+            elif np.all(real_parts < -tol_eig):
+                eq_type = "stabil"
+            elif np.all(real_parts > tol_eig):
+                eq_type = "instabil"
+            else:
+                eq_type = "grenzstabil / unklar"
 
-    return {
-        "x_eq": x_eq,
-        "J": J,
-        "eigvals": eigvals,
-        "trace": tr,
-        "det": det,
-        "type": eq_type,
-    }
+        return {
+            "x_eq": x_eq,
+            "J": J,
+            "eigvals": eigvals,
+            "trace": tr,
+            "det": det,
+            "type": eq_type,
+        }
 
 
-def classify_equilibria(fp_eval, equilibria,
-                        eps_rel=1e-4,
-                        ode_sign=-1.0,
-                        tol_eig=1e-6,
-                        verbose=True):
+    def classify_equilibria(self, equilibria, ode_sign=-1.0, tol_eig=1e-6, verbose=True):
 
-    equilibria = np.asarray(equilibria, dtype=float)
-    if equilibria.ndim == 1:
-        equilibria = equilibria[None, :]
+        equilibria = np.asarray(equilibria, dtype=float)
+        if equilibria.ndim == 1:
+            equilibria = equilibria[None, :]
 
-    results = []
+        results = []
 
-    for k, x_eq in enumerate(equilibria, start=1):
-        info = classify_single_equilibrium(fp_eval,
-                                           x_eq,
-                                           eps_rel=eps_rel,
-                                           ode_sign=ode_sign,
-                                           tol_eig=tol_eig)
-        results.append(info)
+        for k, x_eq in enumerate(equilibria, start=1):
+            info = self.classify_single_equilibrium(x_eq, ode_sign=ode_sign, tol_eig=tol_eig)
+            results.append(info)
 
-        if verbose:
-            ev = info["eigvals"]
-            print(f"EQ #{k}: x_eq = ({x_eq[0]:.6f}, {x_eq[1]:.6f})")
-            print(f"        Eigenwerte(J_dyn): "
-                  f"{ev[0].real:+.3e}{ev[0].imag:+.3e}i, "
-                  f"{ev[1].real:+.3e}{ev[1].imag:+.3e}i")
-            print(f"        Typ: {info['type']}\n")
+            if verbose:
+                ev = info["eigvals"]
+                print(f"EQ #{k}: x_eq = ({x_eq[0]:.6f}, {x_eq[1]:.6f})")
+                print(f"        Eigenwerte(J_dyn): "
+                      f"{ev[0].real:+.3e}{ev[0].imag:+.3e}i, "
+                      f"{ev[1].real:+.3e}{ev[1].imag:+.3e}i")
+                print(f"        Typ: {info['type']}\n")
 
-    return results
+        return results
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
