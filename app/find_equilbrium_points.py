@@ -211,42 +211,53 @@ class F_p_grid:
         return initial_guesses
 
 
-    def plot_guesses_and_roots_on_grid(self, roots=None, invert_xaxis=True):
+    def plot_guesses_and_roots_on_grid(self, roots=None, stability_info=None, invert_xaxis=True):
 
         R_grid, Z_grid = np.meshgrid(self.r_vals, self.z_vals, indexing='ij')
-
         fig, ax = plt.subplots(figsize=(7, 6))
 
         levels = np.linspace(self.phi.min(), self.phi.max(), 30)
         cs = ax.contourf(R_grid, Z_grid, self.phi, levels=levels, cmap="viridis", alpha=0.8)
         plt.colorbar(cs, ax=ax, label=r"Force Magnitude $\|\mathbf{F}\|$")
 
-        ax.contour(R_grid, Z_grid, self.Fr_grid, levels=[0], colors="cyan",
-                   linestyles="--", linewidths=1, label="Fr=0")
-        ax.contour(R_grid, Z_grid, self.Fz_grid, levels=[0], colors="magenta",
-                   linestyles="-", linewidths=1, label="Fz=0")
+        ax.contour(R_grid, Z_grid, self.Fr_grid, levels=[0], colors="cyan", linestyles="--", linewidths=1)
+        ax.contour(R_grid, Z_grid, self.Fz_grid, levels=[0], colors="magenta", linestyles="-", linewidths=1)
 
+        # plot initial guesses
         if hasattr(self, "initial_guesses") and len(self.initial_guesses) > 0:
             ig = np.asarray(self.initial_guesses)
-            ax.scatter(ig[:, 0], ig[:, 1],
-                       c='black', s=80, marker='x',
-                       label='Initial guesses', zorder=10)
+            ax.scatter(ig[:, 0], ig[:, 1], c="black", s=80, marker="x", label="Initial guesses", zorder=10)
 
+        # plot roots
         if roots is not None:
             roots_arr = np.asarray(roots, dtype=float)
             if roots_arr.ndim == 1:
                 roots_arr = roots_arr.reshape(1, -1)
-            if roots_arr.shape[0] > 0:
+
+            if stability_info is not None:
+                # color-coded roots
+                for k, info in enumerate(stability_info):
+                    r, z = info["x_eq"]
+                    ax.scatter(r, z,
+                               s=140, marker="o",
+                               facecolors=info["color"],
+                               edgecolors="black",
+                               linewidths=1.5,
+                               label=f"{info['type']}" if k == 0 else None,
+                               zorder=11)
+            else:
+                # fallback: all red
                 ax.scatter(roots_arr[:, 0], roots_arr[:, 1],
-                           edgecolors='red',
-                           s=120, marker='o',
-                           label='Exact roots', zorder=11)
+                           s=120, marker="o",
+                           facecolors="red", edgecolors="black",
+                           label="Exact roots", zorder=11)
 
         ax.set_xlabel("r")
         ax.set_ylabel("z")
         ax.set_title("Initial guesses and exact roots on coarse force grid")
-        ax.set_aspect('equal')
+        ax.set_aspect("equal")
 
+        # merge legend
         handles, labels = ax.get_legend_handles_labels()
         by_label = dict(zip(labels, handles))
         ax.legend(by_label.values(), by_label.keys())
@@ -720,16 +731,16 @@ class F_p_roots:
         det = np.linalg.det(J)
 
         if np.any(np.isnan(real_parts)):
-            eq_type = "unklar (NaN in Eigenwerten)"
+            eq_type = "unclear (NaN in eigenvalues)"
         else:
             if real_parts[0] * real_parts[1] < -tol_eig ** 2:
-                eq_type = "Sattel"
+                eq_type = "saddle"
             elif np.all(real_parts < -tol_eig):
-                eq_type = "stabil"
+                eq_type = "stable"
             elif np.all(real_parts > tol_eig):
-                eq_type = "instabil"
+                eq_type = "unstable"
             else:
-                eq_type = "grenzstabil / unklar"
+                eq_type = "unclear"
 
         return {
             "x_eq": x_eq,
@@ -751,398 +762,28 @@ class F_p_roots:
 
         for k, x_eq in enumerate(equilibria, start=1):
             info = self.classify_single_equilibrium(x_eq, ode_sign=ode_sign, tol_eig=tol_eig)
+
+            # assign colors
+            if info["type"] == "stable":
+                info["color"] = "green"
+            elif info["type"] == "unstable":
+                info["color"] = "red"
+            elif info["type"] == "saddle":
+                info["color"] = "yellow"
+            else:
+                info["color"] = "gray"
+
             results.append(info)
 
             if verbose:
                 ev = info["eigvals"]
                 print(f"EQ #{k}: x_eq = ({x_eq[0]:.6f}, {x_eq[1]:.6f})")
-                print(f"        Eigenwerte(J_dyn): "
+                print(f"        eigenvalues(J_dyn): "
                       f"{ev[0].real:+.3e}{ev[0].imag:+.3e}i, "
                       f"{ev[1].real:+.3e}{ev[1].imag:+.3e}i")
                 print(f"        Typ: {info['type']}\n")
 
         return results
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-'''
-def plot_paper_reproduction(fp_eval, r_vals, z_vals, phi, Fr_grid, Fz_grid,
-                            title="Figure 2 Reproduction", invert_xaxis=False):
-
-    R_grid, Z_grid = np.meshgrid(r_vals, z_vals, indexing='ij')
-
-    W = fp_eval.W
-    H = fp_eval.H
-    a = fp_eval.a
-    eps = fp_eval.eps
-
-    # Bereich, in dem der Partikelmittelpunkt nicht sein darf
-    exclusion_dist = a + eps
-
-    fig, ax = plt.subplots(figsize=(8, 8))
-
-    # Kontur-Plot von |F|
-    levels = np.linspace(phi.min(), phi.max(), 40)
-    cs = ax.contourf(R_grid, Z_grid, phi, levels=levels, cmap="viridis", alpha=0.9)
-    cbar = plt.colorbar(cs, ax=ax, fraction=0.046, pad=0.04)
-    cbar.set_label(r"Force Magnitude $\|\mathbf{F}\|$")
-
-    # Zero-Level-Sets
-    ax.contour(R_grid, Z_grid, Fr_grid, levels=[0], colors="cyan",
-               linestyles="--", linewidths=2)  # Fr = 0
-    ax.contour(R_grid, Z_grid, Fz_grid, levels=[0], colors="magenta",
-               linestyles="-", linewidths=2)   # Fz = 0
-
-    # Physikalische Kanalwände
-    wall_rect = patches.Rectangle((-W / 2, -H / 2), W, H,
-                                  linewidth=3, edgecolor='black',
-                                  facecolor='none', zorder=10)
-    ax.add_patch(wall_rect)
-
-    # Verbotene Zone für Partikelmittelpunkt
-    ax.add_patch(patches.Rectangle((-W / 2, -H / 2), exclusion_dist, H,
-                                   facecolor='gray', alpha=0.3, hatch='///'))  # links
-    ax.add_patch(patches.Rectangle((W / 2 - exclusion_dist, -H / 2),
-                                   exclusion_dist, H,
-                                   facecolor='gray', alpha=0.3, hatch='///'))  # rechts
-    ax.add_patch(patches.Rectangle((-W / 2, -H / 2), W, exclusion_dist,
-                                   facecolor='gray', alpha=0.3, hatch='///'))  # unten
-    ax.add_patch(patches.Rectangle((-W / 2, H / 2 - exclusion_dist),
-                                   W, exclusion_dist,
-                                   facecolor='gray', alpha=0.3, hatch='///'))  # oben
-
-    margin = 0.1
-    ax.set_xlim(-W / 2 - margin, W / 2 + margin)
-    ax.set_ylim(-H / 2 - margin, H / 2 + margin)
-    ax.set_aspect('equal')
-
-    ax.set_xlabel("r (Radial coordinate)")
-    ax.set_ylabel("z (Axial coordinate)")
-
-    if invert_xaxis:
-        ax.invert_xaxis()
-        title += " (Inverted X)"
-
-    ax.set_title(title)
-
-    from matplotlib.lines import Line2D
-    legend_elements = [
-        Line2D([0], [0], color='cyan', lw=2, ls='--', label='$F_r=0$'),
-        Line2D([0], [0], color='magenta', lw=2, ls='-', label='$F_z=0$'),
-        patches.Patch(facecolor='gray', alpha=0.3, hatch='///',
-                      label='Wall exclusion ($a+\\epsilon$)'),
-        patches.Patch(facecolor='none', edgecolor='black', lw=2,
-                      label='Physical Wall')
-    ]
-    ax.legend(handles=legend_elements, loc='upper right')
-
-    plt.tight_layout()
-    plt.show()
-'''
-
-'''
-class Find_equilibria_with_deflated_newton:
-
-    def __init__(self, R, W, H, L, a, Re_nominal, Re_p, particle_maxh, global_maxh, eps, bg_flow=None, Q=1.0):
-        self.R = R
-        self.H = H
-        self.W = W
-        self.L = L
-        self.a = a
-        self.Re_nominal = Re_nominal
-        self.Re_p = Re_p
-        self.particle_maxh = particle_maxh
-        self.global_maxh = global_maxh
-        self.eps = eps
-        self.bg_flow = bg_flow
-        self.Q = Q
-
-        self.r_min = -W/2 + a + eps
-        self.r_max =  W/2 - a - eps
-        self.z_min = -H/2 + a + eps
-        self.z_max =  H/2 - a - eps
-
-
-    def _F_p_on_mesh(self, mesh3d, tags):
-
-        pf = perturbed_flow(mesh3d, tags, self.a, self.Re_p, self.bg_flow)
-        F_p_r_z = pf.F_p()   # 3D-Kraft
-
-        cx, cy, cz = tags["particle_center"]
-        r0 = np.hypot(cx, cy)
-        if r0 < 1e-14:
-            ex0 = np.array([1.0, 0.0, 0.0], dtype=float)
-        else:
-            ex0 = np.array([cx / r0, cy / r0, 0.0], dtype=float)
-        ez0 = np.array([0.0, 0.0, 1.0], dtype=float)
-
-        Fr = float(ex0 @ F_p_r_z)
-        Fz = float(ez0 @ F_p_r_z)
-
-        return np.array([Fr, Fz], dtype=float)
-
-
-    def F_p_evaluator(self, r, z):
-
-        mesh3d, tags = make_curved_channel_section_with_spherical_hole(
-            self.R, self.H, self.W, self.L, self.a,
-            self.particle_maxh, self.global_maxh,
-            r_off=r, z_off=z
-        )
-        return self._F_p_on_mesh(mesh3d, tags)
-
-
-    def _F_and_J(self, r, z, h=1e-6):
-        r = float(r)
-        z = float(z)
-        h = float(h)
-
-        mesh3d, tags = make_curved_channel_section_with_spherical_hole(
-            self.R, self.H, self.W, self.L, self.a,
-            self.particle_maxh, self.global_maxh,
-            r_off=r, z_off=z
-        )
-        print("mesh created")
-        cx, cy, cz = tags["particle_center"]
-        r0 = np.hypot(cx, cy)
-        if r0 < 1e-14:
-            e_r = np.array([1.0, 0.0, 0.0], dtype=float)
-        else:
-            e_r = np.array([cx / r0, cy / r0, 0.0], dtype=float)
-        e_z = np.array([0.0, 0.0, 1.0], dtype=float)
-
-        X_ref = mesh3d.coordinates.dat.data_ro.copy()
-
-        V_disp = mesh3d.coordinates.function_space()
-        u = TrialFunction(V_disp)
-        v = TestFunction(V_disp)
-
-        a_el = inner(grad(u), grad(v)) * dx
-        L_el = inner(Constant((0.0, 0.0, 0.0)), v) * dx
-
-        elastic_solver_params = {
-            "ksp_type": "preonly",
-            "pc_type": "lu",
-            "pc_factor_mat_solver_type": "mumps",
-            "mat_mumps_icntl_24": 1,
-            "mat_mumps_icntl_25": 0,
-            'ksp_monitor_true_residual': None,
-        }
-
-        F0 = self._F_p_on_mesh(mesh3d, tags)
-
-        def F_after_displacement(delta_vec):
-
-            mesh3d.coordinates.dat.data[:] = X_ref
-
-            delta_vec = np.asarray(delta_vec, dtype=float)
-            delta_const = Constant((float(delta_vec[0]),
-                                    float(delta_vec[1]),
-                                    float(delta_vec[2])))
-
-            bcs = [
-                DirichletBC(V_disp, Constant((0.0, 0.0, 0.0)), tags["walls"])
-            ]
-            inlet_id = tags.get("inlet", None)
-            if inlet_id is not None:
-                bcs.append(DirichletBC(V_disp, Constant((0.0, 0.0, 0.0)), inlet_id))
-            outlet_id = tags.get("outlet", None)
-            if outlet_id is not None:
-                bcs.append(DirichletBC(V_disp, Constant((0.0, 0.0, 0.0)), outlet_id))
-
-            # Partikel verschieben
-            bcs.append(DirichletBC(V_disp, delta_const, tags["particle"]))
-
-            u_sol = Function(V_disp, name="mesh_displacement")
-            print("reached the solver")
-            solve(
-                a_el == L_el,
-                u_sol,
-                bcs=bcs,
-                solver_parameters=elastic_solver_params,
-            )
-
-            # Koordinaten updaten
-            mesh3d.coordinates.dat.data[:] = X_ref + u_sol.dat.data_ro
-
-            # Tag für Partikelzentrum konsistent halten
-            tags_pert = dict(tags)
-            tags_pert["particle_center"] = (
-                cx + delta_vec[0],
-                cy + delta_vec[1],
-                cz + delta_vec[2],
-            )
-
-            return self._F_p_on_mesh(mesh3d, tags_pert)
-
-        Fr_plus  = F_after_displacement(+h * e_r)
-        Fr_minus = F_after_displacement(-h * e_r)
-        dF_dr = (Fr_plus - Fr_minus) / (2.0 * h)
-
-        Fz_plus  = F_after_displacement(+h * e_z)
-        Fz_minus = F_after_displacement(-h * e_z)
-        dF_dz = (Fz_plus - Fz_minus) / (2.0 * h)
-
-        J = np.column_stack((dF_dr, dF_dz))
-
-        mesh3d.coordinates.dat.data[:] = X_ref
-
-        return F0, J
-
-
-    def _numerical_jacobian(self, r, z, h=1e-6):
-        _, J = self._F_and_J(r, z, h)
-        return J
-
-
-    def deflated_newton(self,
-                        initial_guesses,
-                        F_tol=1e-10,
-                        step_tol=1e-10,
-                        max_iter=20,
-                        defl_p=2.0,
-                        defl_alpha=1e-2,
-                        root_tol=1e-4,
-                        verbose=True):
-
-        roots = []
-
-        def defl_factor(x, roots_list):
-
-            x = np.asarray(x, dtype=float)
-
-            if not roots_list:
-                return 1.0, np.zeros(2, dtype=float)
-
-            phi_list = []
-            grad_phi_list = []
-            for r0 in roots_list:
-                r0 = np.asarray(r0, dtype=float)
-                dx = x - r0
-                d = np.linalg.norm(dx)
-                if d < 1e-14:
-                    d = 1e-14
-                phi = 1.0 / (d**defl_p) + defl_alpha
-                grad_phi = -(defl_p / (d**(defl_p + 2.0))) * dx
-                phi_list.append(phi)
-                grad_phi_list.append(grad_phi)
-
-            D = 1.0
-            for phi in phi_list:
-                D *= phi
-
-            gradD = np.zeros(2, dtype=float)
-            for phi, grad_phi in zip(phi_list, grad_phi_list):
-                gradD += (D / phi) * grad_phi
-
-            return D, gradD
-
-        def inside_domain(x):
-            r, z = x
-            if not (self.r_min < r < self.r_max):
-                return False
-            if not (self.z_min < z < self.z_max):
-                return False
-            return True
-
-        for guess in initial_guesses:
-            x = np.array(guess, dtype=float)
-
-            if any(np.linalg.norm(x - r0) < root_tol for r0 in roots):
-                continue
-
-            if verbose:
-                print(f"\nStarting Newton from {x}")
-
-            converged = False
-
-            for it in range(max_iter):
-
-                print(f"ich rechne wirklich für jedes {it}")
-                F, J = self._F_and_J(x[0], x[1])
-
-                normF = np.linalg.norm(F)
-
-                if verbose:
-                    print(f"  iter {it:02d}: x = {x}, ||F|| = {normF:.3e}")
-
-                if normF < F_tol:
-                    converged = True
-                    break
-                print("deflation factor gets computed")
-                D, gradD = defl_factor(x, roots)
-                print("deflation factor got computed")
-                G = D * F
-                J_defl = D * J + np.outer(F, gradD)
-
-                print("J_defl jetzt auch berechnet")
-                try:
-                    delta = np.linalg.solve(J_defl, -G)
-                    print("np.linalg solver hat performt")
-                except np.linalg.LinAlgError:
-                    if verbose:
-                        print("Jacobian singular, aborting this guess.")
-                    break
-
-                delta = np.linalg.solve(J_defl, -G)
-
-
-                alpha = 1.0
-                accepted = False
-
-                for _ in range(20):
-                    candidate = x + alpha * delta
-
-                    if not inside_domain(candidate):
-                        alpha *= 0.5
-                        continue
-
-
-                    F_try = self.F_p_evaluator(candidate[0], candidate[1])
-                    if np.linalg.norm(F_try) < np.linalg.norm(F):
-                        x = candidate
-                        accepted = True
-                        break
-
-                    alpha *= 0.5
-
-                if not accepted:
-                    print("Line-search failed — delta too large, aborting this guess.")
-                    break
-
-
-                print("ich habe 2 vektoren addiert")
-                if np.linalg.norm(delta) < step_tol:
-                    print("jetzt rödelts wieder")
-                    F2, _ = self._F_and_J(x[0], x[1])
-                    print("jetzt hats fertig gerödelt")
-                    if np.linalg.norm(F2) < F_tol:
-                        converged = True
-                    break
-            print("Schleife sollte durch sein")
-            if converged:
-                if not any(np.linalg.norm(x - r0) < root_tol for r0 in roots):
-                    roots.append(x.copy())
-                    if verbose:
-                        print(f"-> Found new root at {x}, ||F|| = {np.linalg.norm(F):.3e}")
-            else:
-                if verbose:
-                    print(f"No convergence from {guess}")
-
-        self.roots = np.array(roots) if roots else np.zeros((0, 2))
-        return self.roots
-'''
 
 
