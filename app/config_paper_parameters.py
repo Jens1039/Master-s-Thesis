@@ -1,14 +1,14 @@
 import numpy as np
 
 # ---DIMENSIONLESS CELL SIZE---------------------------
-a = 0.15
+a = 0.05
 # -----------------------------------------------------
 
 # ---DIMENSIONLESS ENGINEERING SETUP-------------------
 R = 160
 W = 2.0
 H = 2.0
-Q = 10 # We are setting this, so that our flow Reynolds number = 5 (consistent with the statement in the paper "results hold up to O(10)"
+Q = 10
 # -----------------------------------------------------
 
 # ---DERIVED QUANTITIES--------------------------------

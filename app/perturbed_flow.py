@@ -58,6 +58,7 @@ class perturbed_flow:
         self.v_bc = Function(self.V)
         self.u_bar_3d, self.p_bar_3d = self.background_flow.build_3d_background_flow(self.mesh3d)
 
+
     def Stokes_solver_3d(self, particle_bcs):
         v_test, q_test = TestFunctions(self.W_mixed)
         self.v_bc.assign(0.0)
@@ -79,11 +80,13 @@ class perturbed_flow:
         u_total += self.v_bc
         return u_total, p
 
+
     def F_minus_1(self, v_0, q_0, mesh3d):
         n = FacetNormal(mesh3d)
         traction = -dot(n, -q_0 * Identity(3) + grad(v_0) + grad(v_0).T)
         components = [assemble(traction[i] * ds(self.tags["particle"])) for i in range(3)]
         return np.array([float(c) for c in components])
+
 
     def T_minus_1(self, v_0_a, q_0_a, mesh3d, x, x_p):
         n = FacetNormal(mesh3d)
@@ -91,6 +94,7 @@ class perturbed_flow:
         moment_density = cross(x - x_p, traction)
         components = [assemble(moment_density[i] * ds(self.tags["particle"])) for i in range(3)]
         return np.array([float(c) for c in components])
+
 
     def compute_F_0_a(self, v_0_a, u_hat_x, u_hat_z, u_bar_3d_a, x, Theta):
 
@@ -105,6 +109,7 @@ class perturbed_flow:
         F0_x = assemble(dot(u_hat_x, integrand) * dx(degree=6))
         F0_z = assemble(dot(u_hat_z, integrand) * dx(degree=6))
         return np.array([float(F0_x), 0.0, float(F0_z)])
+
 
     def compute_F_0_s(self, v0s, u_hat_x, u_hat_z, u_bar_3d_s):
         termA = dot(grad(u_bar_3d_s), v0s)
