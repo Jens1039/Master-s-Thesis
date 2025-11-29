@@ -4,32 +4,24 @@ os.environ["OMP_NUM_THREADS"] = "1"
 from firedrake import *
 import numpy as np
 from math import atan2, hypot, cos, sin
+import matplotlib.pyplot as plt
 
 
 
 class background_flow:
 
-    def __init__(self, R, H, W, Q, Re):
+    def __init__(self, R, H, W, Re):
         self.R = R
         self.H = H
         self.W = W
-        self.Q = Q
         self.Re = Re
 
         self.mesh2d = RectangleMesh(120, 120, self.W, self.H, quadrilateral=False)
 
 
-    def solve_2D_background_flow(self, H_1_seminorm=False):
+    def solve_2D_background_flow(self):
 
-        # "P": "Polynomial" Complete Lagrange-polynoms e.g. P(dim=2) = span{1, x, y, xy, x^2, y^2} => triangle in 2d, tetraeder in 3d
-        # "Q": "Quadrilateral" Tensor-product polynoms e.g. Q(dim=2) = span{1, x, y, x^2, xy, y^2, x^2y, y^2x, x^2y^2} => squares in 2d, hexaeder in 3d
-        # "CG": "Continuous Galerkin" = "P" different names just for historical reasons (FENICS/Firedrake) (continuity on nodes is internally ensured)
-        # "DG": "Discontinuous Galerkin" the basis functions are the same, but when assembling the matrix continuity on the nodes is not ensured
-        # Taylor - Hood: ("CG" k, "CG" k-1) => LBB - stable, approximatively divergence free, not local mass preservance
-        # Scott - Vogelius ("CG" k, "DG" k-1) => LBB - stable on special meshes (e.g. barycentrically refined)
-        # but divergence free, local mass preservance
-
-        # Velocity space (3 components: u_r, u_z, u_theta), pressure space, and scalar space for \hat{G}
+        # Velocity space (3 components: u_r, u_z, u_theta), pressure space, and scalar space for G
         V = VectorFunctionSpace(self.mesh2d, "CG", 2, dim=3)
         Q = FunctionSpace(self.mesh2d, "CG", 1)
         G_space = FunctionSpace(self.mesh2d, "R", 0)
@@ -83,8 +75,8 @@ class background_flow:
         # weak form of the continuity equation
         F_cont = q * (del_r(u_r) + del_z(u_z) + u_r / (self.R + r)) * (self.R + r) * dx
 
-        # "weak" form of the Integral constraint for G
-        F_G = ((2.0 / (self.W + self.H)) * u_theta * (self.R + r) * g - (1.0 / (self.H * self.W)) * g) * dx
+        # weak form of the flow rate constraint
+        F_G = (u_theta  - 1.0) * g * dx
 
         # Total residual
         F = F_r + F_theta + F_z + F_cont + F_G
@@ -125,22 +117,18 @@ class background_flow:
                 "snes_atol": 1e-10,
                 # Maximal Newton steps
                 "snes_max_it": 50,
-
                 # Tell firedrake not to assemble the global matrix to avoid the "Monolithic matrix assembly ..." error
                 "mat_type": "matfree",
-
                 # Use FieldSplit to separate (u, p) from (G)
                 "ksp_type": "fgmres",
                 "pc_type": "fieldsplit",
                 "pc_fieldsplit_type": "schur",
                 "pc_fieldsplit_schur_fact_type": "full",
-
                 # Manually group fields:
                 #    Split '0' = Fields 0, 1 (Velocity, Pressure)
                 #    Split '1' = Field 2 (G)
                 "pc_fieldsplit_0_fields": "0,1",
                 "pc_fieldsplit_1_fields": "2",
-
                 # Solver for Split '0' (Navier-Stokes block)
                 #    Since the global operator is matfree, we must use "AssembledPC"
                 #    to force assembly of this block so we can use MUMPS LU.
@@ -151,7 +139,6 @@ class background_flow:
                     "assembled_pc_type": "lu",
                     "assembled_pc_factor_mat_solver_type": "mumps"
                 },
-
                 # Solver for Split '1' (The scalar G)
                 #    This is just a 1x1 block, so 'none' or 'jacobi' is fine.
                 "fieldsplit_1": {
@@ -166,15 +153,69 @@ class background_flow:
         self.u_bar = u_bar
         self.p_bar = p_bar
 
-        # necessary for rescale Re as in the paper
+        # necessary for rescale Re in the same way as in the paper
         u_data = self.u_bar.dat.data_ro
-        U_m = np.max(np.abs(u_data[:, 2]))
-        self.U_m = float(U_m)
-
-        if H_1_seminorm:
-            print(sqrt(assemble(inner(grad(self.u_bar), grad(self.u_bar)) * dx)))
+        U_max = np.max(np.abs(u_data[:, 2]))
+        self.U_m = U_max
 
         return u_bar, p_bar
+
+
+    def plot_2D_background_flow(self):
+        coords = self.mesh2d.coordinates.dat.data_ro
+        xmin, xmax = float(coords[:, 0].min()), float(coords[:, 0].max())
+        zmin, zmax = float(coords[:, 1].min()), float(coords[:, 1].max())
+
+        nxp, nzp = 160, 160
+        xi = np.linspace(xmin, xmax, nxp)
+        zi = np.linspace(zmin, zmax, nzp)
+        Xi, Zi = np.meshgrid(xi, zi)
+
+        pts = np.column_stack([Xi.ravel(), Zi.ravel()])
+        U_at_list = self.u_bar.at(pts)
+
+        try:
+            U_at = np.asarray(U_at_list, dtype=float)
+            if U_at.ndim != 2 or U_at.shape[1] != 3:
+                raise ValueError
+        except Exception:
+            U_at = np.vstack([np.asarray(v, dtype=float).ravel() for v in U_at_list])
+
+        Ur = U_at[:, 0].reshape(nzp, nxp)
+        Uz = U_at[:, 1].reshape(nzp, nxp)
+        Uth = U_at[:, 2].reshape(nzp, nxp)
+
+        Speed = np.sqrt(Ur ** 2 + Uz ** 2)
+        Speed[~np.isfinite(Speed)] = 0.0
+        Ur[~np.isfinite(Ur)] = 0.0
+        Uz[~np.isfinite(Uz)] = 0.0
+
+        eps = 1e-14
+        lw = 0.8 + 2.0 * (Speed / (Speed.max() + eps))
+
+        fig, ax = plt.subplots(figsize=(7.5, 5.5))
+        ax.set_aspect("equal", adjustable="box")
+        ax.set_xlabel("r")
+        ax.set_ylabel("z")
+
+        cf = ax.contourf(Xi, Zi, Uth, levels=40, cmap="coolwarm")
+        cbar1 = fig.colorbar(cf, ax=ax, shrink=0.9, pad=0.02)
+        cbar1.set_label(r"$u_\theta$")
+
+        strm = ax.streamplot(
+            xi, zi, Ur, Uz,
+            density=1.4,
+            color=Speed,
+            linewidth=lw,
+            cmap="viridis",
+            arrowsize=1.2,
+            minlength=0.1
+        )
+        cbar2 = fig.colorbar(strm.lines, ax=ax, shrink=0.9, pad=0.02)
+        cbar2.set_label(r"$|u_{\mathrm{sec}}| = \sqrt{u_r^2 + u_z^2}$")
+
+        plt.tight_layout()
+        plt.show()
 
 
     def build_3d_background_flow(self, mesh3d):

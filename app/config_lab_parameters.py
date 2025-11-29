@@ -9,8 +9,8 @@ d_2 = 12e-6         # diameter of the bigger cell [m]
 # ---VARIABLE ASSUMPTION--------------------------------
 R = 2800e-6         # bend radius [m]
 H = 240e-6 # 120e-6          # duct height [m]
-W = 240e-6 # 500e-6         # duct width  [m]
-Q = 2e-8   # 3e-8         # volumetric flow rate [m^3/s]
+W = 500e-6                   # duct width  [m]
+Q = 2e-8   # 3e-8            # volumetric flow rate [m^3/s]
 # ------------------------------------------------------
 
 # ---FIXED ASSUMPTIONS----------------------------------
@@ -76,7 +76,7 @@ De =  17.18277016526121
 '''
 
 # ---LENGTH OF THE DUCT SECTION WE'RE LOOKING AT--------
-L = 3
+L = 4*max(W, H)
 # ------------------------------------------------------
 
 # ---RESOLUTION OF THE GRID OF PARTICLE FORCES----------

@@ -11,6 +11,7 @@ from firedrake import *
 from background_flow import background_flow
 from build_3d_geometry import make_curved_channel_section_with_spherical_hole
 from perturbed_flow import perturbed_flow
+from config_paper_parameters import *
 
 
 class F_p_grid:
@@ -120,7 +121,7 @@ class F_p_grid:
         return r_vals, z_vals, phi, Fr_grid, Fz_grid
 
 
-    def plot_paper_reproduction(self, r_vals, z_vals, phi, Fr_grid, Fz_grid, invert_xaxis=True):
+    def plot_paper_reproduction(self, r_vals, z_vals, phi, Fr_grid, Fz_grid, invert_xaxis=False):
 
         R_grid, Z_grid = np.meshgrid(r_vals, z_vals, indexing='ij')
 
@@ -160,9 +161,9 @@ class F_p_grid:
             ax.invert_xaxis()
 
         plt.tight_layout()
-        plt.show()
+        plt.savefig(f"a_{a}_R_{R}.png")
 
-    # Uses a hybrid GD Newton method to find the roots on the interpolated force grid
+
     def generate_initial_guesses(self, n_grid_search=50, tol_unique=1e-3, tol_residual=1e-5):
 
         self.interp_Fr = RectBivariateSpline(self.r_vals, self.z_vals, self.Fr_grid)
@@ -211,7 +212,7 @@ class F_p_grid:
         return initial_guesses
 
 
-    def plot_guesses_and_roots_on_grid(self, roots=None, stability_info=None, invert_xaxis=True):
+    def plot_guesses_and_roots_on_grid(self, roots=None, stability_info=None, invert_xaxis=False):
 
         R_grid, Z_grid = np.meshgrid(self.r_vals, self.z_vals, indexing='ij')
         fig, ax = plt.subplots(figsize=(7, 6))
@@ -263,7 +264,7 @@ class F_p_grid:
             ax.invert_xaxis()
 
         plt.tight_layout()
-        plt.show()
+        plt.savefig(f"a_{a}_R_{R}_with_roots.png")
 
 
 
@@ -299,12 +300,10 @@ class F_p_roots:
         u = TrialFunction(V_disp)
         v = TestFunction(V_disp)
 
-        # 2. Define Material Properties
         x = SpatialCoordinate(mesh)
         cx, cy, cz = tags["particle_center"]
         r_dist = sqrt((x[0] - cx) ** 2 + (x[1] - cy) ** 2 + (x[2] - cz) ** 2)
 
-        # Stiffening factor: stiff near particle
         stiff = 1.0 / (r_dist ** 2 + 0.01)
 
         mu = Constant(1.0) * stiff
@@ -316,11 +315,9 @@ class F_p_roots:
         def sigma(u):
             return lmbda * div(u) * Identity(3) + 2 * mu * epsilon(u)
 
-        # 3. Variational Form
         a = inner(sigma(u), epsilon(v)) * dx
         L = inner(Constant((0, 0, 0)), v) * dx
 
-        # 4. Boundary Conditions
         bc_walls = DirichletBC(V_disp, Constant((0., 0., 0.)), tags["walls"])
         bc_in = DirichletBC(V_disp, Constant((0., 0., 0.)), tags["inlet"])
         bc_out = DirichletBC(V_disp, Constant((0., 0., 0.)), tags["outlet"])
@@ -330,26 +327,18 @@ class F_p_roots:
 
         bcs = [bc_walls, bc_in, bc_out, bc_part]
 
-        # 5. Solve
         displacement_sol = Function(V_disp)
         solve(a == L, displacement_sol, bcs=bcs,
               solver_parameters={'ksp_type': 'preonly', 'pc_type': 'lu', "pc_factor_mat_solver_type": "mumps"})
 
-        # 6. Actually move the mesh coordinates
-
-        # --- FIX START ---
-        # Get the function space of the ACTUAL mesh coordinates (which is Degree 3)
         V_coords = mesh.coordinates.function_space()
 
-        # Create a function in that high-order space
         displacement_high_order = Function(V_coords)
 
-        # Interpolate the linear solution onto the high-order space
         displacement_high_order.interpolate(displacement_sol)
 
-        # Now we can add them because they are in the same function space
         mesh.coordinates.assign(mesh.coordinates + displacement_high_order)
-        # --- FIX END ---
+
 
         return displacement_sol
 
