@@ -10,10 +10,11 @@ import matplotlib.pyplot as plt
 
 class background_flow:
 
-    def __init__(self, R, H, W, Re):
+    def __init__(self, R, H, W, L_c, Re):
         self.R = R
         self.H = H
         self.W = W
+        self.L_c = L_c
         self.Re = Re
 
         self.mesh2d = RectangleMesh(120, 120, self.W, self.H, quadrilateral=False)
@@ -217,8 +218,9 @@ class background_flow:
         plt.tight_layout()
         plt.show()
 
-
-    def build_3d_background_flow(self, mesh3d):
+# Diese Klasse aus der Instanziierung herausziehen um sie mit verschiedenen Löchern aber der gleichen Hintegrundinfo ausführen zu können
+# Wahrscheinlich sollte als Argument ein 2dfluss übergeben werden.
+def build_3d_background_flow(self, mesh3d):
 
         u_2d = self.u_bar
         p_2d = self.p_bar

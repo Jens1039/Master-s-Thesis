@@ -7,16 +7,21 @@ import os
 os.environ["OMP_NUM_THREADS"] = "1"
 
 from config_paper_parameters import *
+from nondimensionalization import *
 from find_equilbrium_points import *
 
 if __name__ == "__main__":
-    bg = background_flow(R, H, W, Re)
+
+    R_nd, H_nd, W_nd, L_c, U_c, Re = first_nondimensionalisation(R, H, W, Q, rho, mu, print_values=True)
+
+    bg = background_flow(R, H, W, L_c, Re)
     bg.solve_2D_background_flow()
     bg.plot_2D_background_flow()
 
-    exit()
-    force_grid = F_p_grid(R, W, H, L, a, Re, Re_p, particle_maxh, global_maxh, eps, bg)
-    r_vals, z_vals, phi, Fr_grid, Fz_grid = force_grid.compute_F_p_grid(N_r, N_z)
+    R, H, W, a, u_bar, p_bar, Re_p = second_nondimensionalisation(R, H, W, a, L_c, U_c, Re, bg, print_values=True)
+
+    force_grid = F_p_grid(a, Re_p, bg, particle_maxh=0.01, global_maxh=0.3*max(W,H), eps=0.5*a)
+    r_vals, z_vals, phi, Fr_grid, Fz_grid = force_grid.compute_F_p_grid(N_r=10, N_z=10)
     force_grid.plot_paper_reproduction(r_vals, z_vals, phi, Fr_grid, Fz_grid)
 
     initial_guesses = force_grid.generate_initial_guesses()

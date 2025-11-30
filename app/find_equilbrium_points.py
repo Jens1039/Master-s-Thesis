@@ -16,38 +16,33 @@ from config_paper_parameters import *
 
 class F_p_grid:
 
-    def __init__(self, R, W, H, L, a, Re_nominal, Re_p, particle_maxh, global_maxh, eps, bg_flow=None, Q=1.0):
+    def __init__(self, R, H, W, a, Re_p, bg_flow, particle_maxh, global_maxh, eps):
 
-        self.R = float(R)
-        self.W = float(W)
-        self.H = float(H)
-        self.L = float(L)
-        self.a = float(a)
-        self.Re_nominal = float(Re_nominal)
-        self.Re_p = float(Re_p)
-        self.particle_maxh = float(particle_maxh)
-        self.global_maxh = float(global_maxh)
+        self.R = getattr(bg_flow, "R")
+        self.W = getattr(bg_flow, "W")
+        self.H = getattr(bg_flow, "H")
+        self.L = getattr(bg_flow, "L")
+        self.D_h = getattr(bg_flow, "D_h")
+        self.Re = getattr(bg_flow, "Re")
+        self.Re_p = Re_p
+        self.particle_maxh = particle_maxh
+        self.global_maxh = global_maxh
         self.eps = eps
+        self.bg_flow = bg_flow
 
-        self.r_min = -W/2 + a + eps
-        self.r_max = W/2 - a - eps
-        self.z_min = -H/2 + a + eps
-        self.z_max = H/2 - a - eps
 
-        self.Q = float(Q)
+        self.r_min = -W/2 + 1 + eps
+        self.r_max = W/2 - 1 - eps
+        self.z_min = -H/2 + 1 + eps
+        self.z_max = H/2 - 1 - eps
 
-        if bg_flow is None:
-            self.bg_flow = background_flow(self.R, self.H, self.W, self.Q, self.Re_nominal)
-            self.bg_flow.solve_2D_background_flow()
-        else:
-            self.bg_flow = bg_flow
 
     _BG_WORKER = None
 
     @staticmethod
-    def _init_bg_worker(R, H, W, Q, Re_bg_input):
+    def _init_bg_worker(R, H, W, Q, Re):
         global _BG_WORKER
-        _BG_WORKER = background_flow(R, H, W, Q, Re_bg_input)
+        _BG_WORKER = background_flow(R, H, W, Q, Re)
         _BG_WORKER.solve_2D_background_flow()
 
     @staticmethod
@@ -58,12 +53,12 @@ class F_p_grid:
 
         (i, j, r_loc, z_loc,
          R, H, W, Q, L, a,
-         particle_maxh, global_maxh, Re_p_correct) = task
+         particle_maxh, global_maxh, Re_p) = task
 
         mesh3d, tags = make_curved_channel_section_with_spherical_hole(R, W, H, L, a, particle_maxh, global_maxh, r_off=r_loc, z_off=z_loc)
 
         global _BG_WORKER
-        pf = perturbed_flow(mesh3d, tags, a, Re_p_correct, _BG_WORKER)
+        pf = perturbed_flow(mesh3d, tags, a, Re_p, _BG_WORKER)
 
         F_vec = pf.F_p()
 
@@ -162,6 +157,11 @@ class F_p_grid:
 
         plt.tight_layout()
         plt.savefig(f"a_{a}_R_{R}.png")
+
+
+
+
+
 
 
     def generate_initial_guesses(self, n_grid_search=50, tol_unique=1e-3, tol_residual=1e-5):
@@ -265,6 +265,12 @@ class F_p_grid:
 
         plt.tight_layout()
         plt.savefig(f"a_{a}_R_{R}_with_roots.png")
+
+
+
+
+
+
 
 
 
