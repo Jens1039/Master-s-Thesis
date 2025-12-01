@@ -1,5 +1,6 @@
 import matplotlib.pyplot as plt
 import multiprocessing as mp
+
 from tqdm import tqdm
 import os
 import matplotlib.patches as patches
@@ -8,58 +9,76 @@ from scipy.optimize import root
 from firedrake import *
 
 
-from background_flow import background_flow
-from build_3d_geometry import make_curved_channel_section_with_spherical_hole
-from perturbed_flow import perturbed_flow
-from config_paper_parameters import *
+from background_flow import *
+from build_3d_geometry import *
+from perturbed_flow import *
 
-
+'''
 class F_p_grid:
 
-    def __init__(self, R, H, W, a, Re_p, bg_flow, particle_maxh, global_maxh, eps):
+    def __init__(self, R, H, W, a, Re_p, u_bar_2d, L, particle_maxh, global_maxh, eps):
 
-        self.R = getattr(bg_flow, "R")
-        self.W = getattr(bg_flow, "W")
-        self.H = getattr(bg_flow, "H")
-        self.L = getattr(bg_flow, "L")
-        self.D_h = getattr(bg_flow, "D_h")
-        self.Re = getattr(bg_flow, "Re")
+        self.R = R
+        self.H = H
+        self.W = W
+        self.a = a
         self.Re_p = Re_p
+        self.L = L
+
         self.particle_maxh = particle_maxh
         self.global_maxh = global_maxh
         self.eps = eps
-        self.bg_flow = bg_flow
-
 
         self.r_min = -W/2 + 1 + eps
         self.r_max = W/2 - 1 - eps
         self.z_min = -H/2 + 1 + eps
         self.z_max = H/2 - 1 - eps
 
+    # Global variables for the worker processes
+    _U_2D_GLOBAL = None
+    _P_2D_GLOBAL = None
+    _MESH_PARAMS = None
 
-    _BG_WORKER = None
 
+    # Called once per process, to reconstruct the firedrake function from the numpy-data
     @staticmethod
-    def _init_bg_worker(R, H, W, Q, Re):
-        global _BG_WORKER
-        _BG_WORKER = background_flow(R, H, W, Q, Re)
-        _BG_WORKER.solve_2D_background_flow()
+    def _init_bg_worker(u_data_np, p_data_np, H, W):
 
+        global _U_2D_GLOBAL, _P_2D_GLOBAL, _MESH_PARAMS
+
+        mesh2d = RectangleMesh(120, 120, W, H, quadrilateral=False)
+
+        V = VectorFunctionSpace(mesh2d, "CG", 2, dim=3)
+        Q = FunctionSpace(mesh2d, "CG", 1)
+
+        _U_2D_GLOBAL = Function(V)
+        _P_2D_GLOBAL = Function(Q)
+
+        # Copy data (Firedrake order is deterministic for similar mesh construction)
+        _U_2D_GLOBAL.dat.data[:] = u_data_np
+        _P_2D_GLOBAL.dat.data[:] = p_data_np
+        _MESH_PARAMS = (H, W)
+
+    # Computes the force F_p for one single point
     @staticmethod
     def _compute_single_F_p(task):
 
-        os.environ["OMP_NUM_THREADS"] = "1"
-        os.environ["NETGEN_NUM_THREADS"] = "1"
+        global _U_2D_GLOBAL, _P_2D_GLOBAL, _MESH_PARAMS
+        R_bg, W_bg, H_bg, Re_bg = _MESH_PARAMS
 
-        (i, j, r_loc, z_loc,
-         R, H, W, Q, L, a,
-         particle_maxh, global_maxh, Re_p) = task
+        (R, H, W, a, Re_p, i, j, r_loc, z_loc,
+         L, a, particle_maxh, global_maxh, Re_p) = task
 
-        mesh3d, tags = make_curved_channel_section_with_spherical_hole(R, W, H, L, a, particle_maxh, global_maxh, r_off=r_loc, z_off=z_loc)
+        mesh3d, tags = make_curved_channel_section_with_spherical_hole(
+            R_bg, W_bg, H_bg, L, a, particle_maxh, global_maxh,
+            r_off=r_loc, z_off=z_loc
+        )
 
-        global _BG_WORKER
-        pf = perturbed_flow(mesh3d, tags, a, Re_p, _BG_WORKER)
+        u_3d, p_3d = build_3d_background_flow(mesh3d, _U_2D_GLOBAL, _P_2D_GLOBAL, R_bg, W_bg, H_bg)
 
+        bg_flow_dummy = MockBackgroundObject(u_3d, p_3d, Re_bg)
+
+        pf = perturbed_flow(R, H, W, a, Re_p, mesh3d, tags, u_bar, p_bar)
         F_vec = pf.F_p()
 
         cx, cy, cz = tags["particle_center"]
@@ -72,6 +91,7 @@ class F_p_grid:
 
         Fr = float(ex0 @ F_vec)
         Fz = float(ez0 @ F_vec)
+
         return (i, j, Fr, Fz)
 
 
@@ -265,10 +285,463 @@ class F_p_grid:
 
         plt.tight_layout()
         plt.savefig(f"a_{a}_R_{R}_with_roots.png")
+'''
+
+
+class F_p_grid:
+
+    def __init__(self, R, H, W, a, Re_p, L, particle_maxh, global_maxh, eps):
+
+        self.R = R
+        self.H = H
+        self.W = W
+        self.a = a
+        self.Re_p = Re_p
+        self.L = L
+
+        self.particle_maxh = particle_maxh
+        self.global_maxh = global_maxh
+        self.eps = eps
+
+        self.r_min = -W / 2 + 1.0 + eps
+        self.r_max = W / 2 - 1.0 - eps
+        self.z_min = -H / 2 + 1.0 + eps
+        self.z_max = H / 2 - 1.0 - eps
+
+        # Mesh Parameter hardcoded oder übergeben, müssen zu u_bg_data_np passen
+        self.mesh_nx = 120
+        self.mesh_ny = 120
+
+    def compute_F_p_grid_ensemble(self, N_r, N_z, u_bg_data_np, p_bg_data_np):
+        from mpi4py import MPI
+
+        # 1. Ensemble erstellen
+        ensemble = Ensemble(COMM_WORLD, 1)
+        my_comm = ensemble.comm
+
+        global_rank = COMM_WORLD.rank
+        global_size = COMM_WORLD.size
+
+        # 2. Lokalen Background Flow "rehydrieren"
+        # Mesh erstellen auf dem Sub-Communicator
+        mesh2d_local = RectangleMesh(self.mesh_nx, self.mesh_ny, self.W, self.H, quadrilateral=False, comm=my_comm)
+
+        V_local = VectorFunctionSpace(mesh2d_local, "CG", 2, dim=3)
+        Q_local = FunctionSpace(mesh2d_local, "CG", 1)
+
+        u_bg_local = Function(V_local)
+        p_bg_local = Function(Q_local)
+
+        # Daten einfüllen
+        u_bg_local.dat.data[:] = u_bg_data_np
+        p_bg_local.dat.data[:] = p_bg_data_np
+
+        # Grid definieren
+        r_vals = np.linspace(self.r_min, self.r_max, N_r)
+        z_vals = np.linspace(self.z_min, self.z_max, N_z)
+
+        # Aufgaben erstellen
+        all_tasks = []
+        for i in range(N_r):
+            for j in range(N_z):
+                all_tasks.append((i, j, r_vals[i], z_vals[j]))
+
+        # Aufgaben verteilen
+        my_tasks = all_tasks[global_rank::global_size]
+        local_results = []
+
+        if global_rank == 0:
+            print(f"Start Ensemble Grid: {len(all_tasks)} points on {global_size} cores.")
+
+        for task in tqdm(my_tasks, disable=(global_rank != 0)):
+            (i, j, r_loc, z_loc) = task
+
+            try:
+                mesh3d, tags = make_curved_channel_section_with_spherical_hole(
+                    self.R, self.H, self.W, self.L, self.a,
+                    self.particle_maxh, self.global_maxh,
+                    r_off=r_loc, z_off=z_loc,
+                    comm=my_comm
+                )
+
+                u_3d, p_3d = build_3d_background_flow(self.R, self.H, self.W, mesh3d, u_bg_local, p_bg_local)
+
+                # Solver
+                pf = perturbed_flow(self.R, self.H, self.W, self.a, self.Re_p, mesh3d, tags, u_3d, p_3d)
+                F_vec = pf.F_p()
+
+                cx, cy, cz = tags["particle_center"]
+                r0 = float(np.hypot(cx, cy))
+                ex0 = np.array([1., 0., 0.]) if r0 < 1e-14 else np.array([cx / r0, cy / r0, 0.])
+                ez0 = np.array([0., 0., 1.])
+
+                Fr = float(np.dot(ex0, F_vec))
+                Fz = float(np.dot(ez0, F_vec))
+
+                local_results.append((i, j, Fr, Fz))
+
+            except Exception as e:
+                print(f"[Rank {global_rank}] Error at {i},{j}: {e}")
+                local_results.append((i, j, 0.0, 0.0))
+
+
+        all_data = COMM_WORLD.gather(local_results, root=0)
+
+
+        if global_rank == 0:
+            Fr_grid = np.zeros((N_r, N_z))
+            Fz_grid = np.zeros((N_r, N_z))
+
+            for rank_result_list in all_data:
+                for (i, j, Fr, Fz) in rank_result_list:
+                    Fr_grid[i, j] = Fr
+                    Fz_grid[i, j] = Fz
+
+            phi = np.sqrt(Fr_grid ** 2 + Fz_grid ** 2)
+            self.r_vals = r_vals;
+            self.z_vals = z_vals;
+            self.phi = phi
+            self.Fr_grid = Fr_grid;
+            self.Fz_grid = Fz_grid
+
+            return r_vals, z_vals, phi, Fr_grid, Fz_grid
+        else:
+            return None, None, None, None, None
+
+    def plot_paper_reproduction(self, r_vals, z_vals, phi, Fr_grid, Fz_grid):
+
+        # Meshgrid für Matplotlib (indexing='ij' passt zu unserer Matrixstruktur [i, j])
+        R_grid, Z_grid = np.meshgrid(r_vals, z_vals, indexing='ij')
+
+        # Bereich, in dem das Partikel die Wand berühren würde (physikalisch verboten)
+        # Da wir in Skalierung 2 sind, ist der Partikelradius = 1.0
+        # self.a ist im Konstruktor bereits der skalierte Wert (also 1.0),
+        # aber wir nutzen hier sicherheitshalber 1.0 + eps
+        exclusion_dist = 1.0 + self.eps
+
+        fig, ax = plt.subplots(figsize=(8, 6))
+
+        # Plot Magnitude
+        levels = np.linspace(np.nanmin(phi), np.nanmax(phi), 40)
+        cs = ax.contourf(R_grid, Z_grid, phi, levels=levels, cmap="viridis", alpha=0.9)
+        cbar = plt.colorbar(cs, ax=ax, fraction=0.046, pad=0.04)
+        cbar.set_label(r"Force Magnitude $\|\mathbf{F}\|$")
+
+        # Null-Isolinien (Gleichgewichtspunkte sind Schnittpunkte)
+        # Fr = 0 (cyan, gestrichelt)
+        ax.contour(R_grid, Z_grid, Fr_grid, levels=[0], colors="cyan", linestyles="--", linewidths=2)
+        # Fz = 0 (magenta, durchgezogen)
+        ax.contour(R_grid, Z_grid, Fz_grid, levels=[0], colors="magenta", linestyles="-", linewidths=2)
+
+        # Wände zeichnen
+        wall_rect = patches.Rectangle((-self.W / 2, -self.H / 2), self.W, self.H,
+                                      linewidth=3, edgecolor='black', facecolor='none', zorder=10)
+        ax.add_patch(wall_rect)
+
+        # Verbotene Zonen schraffieren
+        # Links
+        ax.add_patch(patches.Rectangle((-self.W / 2, -self.H / 2), exclusion_dist, self.H,
+                                       facecolor='gray', alpha=0.3, hatch='///'))
+        # Rechts
+        ax.add_patch(patches.Rectangle((self.W / 2 - exclusion_dist, -self.H / 2), exclusion_dist, self.H,
+                                       facecolor='gray', alpha=0.3, hatch='///'))
+        # Unten
+        ax.add_patch(patches.Rectangle((-self.W / 2, -self.H / 2), self.W, exclusion_dist,
+                                       facecolor='gray', alpha=0.3, hatch='///'))
+        # Oben
+        ax.add_patch(patches.Rectangle((-self.W / 2, self.H / 2 - exclusion_dist), self.W, exclusion_dist,
+                                       facecolor='gray', alpha=0.3, hatch='///'))
+
+        margin = self.eps
+        ax.set_xlim(-self.W / 2 - margin, self.W / 2 + margin)
+        ax.set_ylim(-self.H / 2 - margin, self.H / 2 + margin)
+        ax.set_aspect('equal')
+        ax.set_xlabel("r (local)")
+        ax.set_ylabel("z (local)")
+        ax.set_title(f"Force Map (a={self.a:.2f}, R={self.R:.1f})")
+
+        plt.tight_layout()
+        filename = f"Force Map (a={self.a:.2f}, R={self.R:.1f}).png"
+        plt.savefig(filename)
+        print(f"Plot saved to {filename}")
+        plt.show()
 
 
 
+'''
+class F_p_grid:
 
+    def __init__(self, R, H, W, a, Re_p, u_bar_2d, p_bar_2d, L, particle_maxh, global_maxh, eps):
+
+        # Geometrie- und Physikparameter (bereits entdimensionalisiert nach Skalierung 2)
+        self.R = R
+        self.H = H
+        self.W = W
+        self.a = a
+        self.Re_p = Re_p
+        self.L = L
+
+        self.particle_maxh = particle_maxh
+        self.global_maxh = global_maxh
+        self.eps = eps
+
+        self.r_min = -W / 2 + 1.0 + eps
+        self.r_max = W / 2 - 1.0 - eps
+        self.z_min = -H / 2 + 1.0 + eps
+        self.z_max = H / 2 - 1.0 - eps
+
+        self.u_data_np = u_bar_2d
+        self.p_data_np = p_bar_2d
+
+        self.mesh_params = (120, 120, W, H)
+
+
+    _U_2D_GLOBAL = None
+    _P_2D_GLOBAL = None
+    _MESH_PARAMS_GLOBAL = None
+
+    @staticmethod
+    def _init_bg_worker(u_data_np, p_data_np, mesh_dims):
+        global _U_2D_GLOBAL, _P_2D_GLOBAL, _MESH_PARAMS_GLOBAL
+
+        nx, ny, W, H = mesh_dims
+
+        # Rekonstruktion des 2D Meshes (muss exakt übereinstimmen mit background_flow)
+        mesh2d = RectangleMesh(nx, ny, W, H, quadrilateral=False)
+
+        V = VectorFunctionSpace(mesh2d, "CG", 2, dim=3)
+        Q = FunctionSpace(mesh2d, "CG", 1)
+
+        _U_2D_GLOBAL = Function(V)
+        _P_2D_GLOBAL = Function(Q)
+
+        # Daten kopieren
+        _U_2D_GLOBAL.dat.data[:] = u_data_np
+        _P_2D_GLOBAL.dat.data[:] = p_data_np
+
+        # Speichern von H und W für spätere Nutzung im Worker
+        _MESH_PARAMS_GLOBAL = (W, H)
+
+    @staticmethod
+    def _compute_single_F_p(task):
+        global _U_2D_GLOBAL, _P_2D_GLOBAL, _MESH_PARAMS_GLOBAL
+
+        # Entpacken der Task-Parameter
+        (i, j, r_loc, z_loc,
+         R, H, W, L, a, Re_p,
+         particle_maxh, global_maxh) = task
+
+        # Parameter des globalen Meshes
+        W_bg, H_bg = _MESH_PARAMS_GLOBAL
+
+        # ACHTUNG: R ist hier der Radius der Kanalmitte aus Skalierung 2.
+        # r_loc ist die radiale Verschiebung von der Kanalmitte.
+
+        # 1. Erstelle das lokale 3D Mesh um das Partikel
+        try:
+            mesh3d, tags = make_curved_channel_section_with_spherical_hole(
+                R, H, W, L, a, particle_maxh, global_maxh,
+                r_off=r_loc, z_off=z_loc
+            )
+        except Exception as e:
+            print(f"Mesh generation failed at {r_loc}, {z_loc}: {e}")
+            return (i, j, np.nan, np.nan)
+
+        # 2. Interpoliere den Hintergrundfluss auf das 3D Mesh
+        # Hier nutzen wir die globalen 2D Funktionen und projizieren sie auf das gekrümmte Segment
+        u_3d, p_3d = build_3d_background_flow(R, H, W, mesh3d, _U_2D_GLOBAL, _P_2D_GLOBAL)
+
+        # 3. Löse das gestörte Flussproblem (Perturbed Flow)
+        # Die Klasse perturbed_flow erwartet u_bar und p_bar als Funktionen auf mesh3d
+        pf = perturbed_flow(R, H, W, a, Re_p, mesh3d, tags, u_3d, p_3d)
+
+        # 4. Berechne die Kraft
+        # F_vec ist ein Numpy Array [Fx, Fy, Fz] (in lokalen kartesischen Koordinaten des Partikels)
+        F_vec = pf.F_p()
+
+        # Projektion auf lokales Koordinatensystem (r, z)
+        # r-Richtung: Vektor vom Krümmungsmittelpunkt zum Partikelzentrum (in xy Ebene)
+        cx, cy, cz = tags["particle_center"]
+        r0 = float(np.hypot(cx, cy))
+
+        if r0 < 1e-14:
+            ex0 = np.array([1., 0., 0.])
+        else:
+            ex0 = np.array([cx / r0, cy / r0, 0.])
+
+        ez0 = np.array([0., 0., 1.])
+
+        Fr = float(np.dot(ex0, F_vec))
+        Fz = float(np.dot(ez0, F_vec))
+
+        return (i, j, Fr, Fz)
+
+    def compute_F_p_grid(self, N_r, N_z, nproc=mp.cpu_count()):
+
+        r_vals = np.linspace(self.r_min, self.r_max, N_r)
+        z_vals = np.linspace(self.z_min, self.z_max, N_z)
+
+        Fr_grid = np.zeros((N_r, N_z))
+        Fz_grid = np.zeros((N_r, N_z))
+
+        # Erstellen der Aufgabenliste
+        tasks = [
+            (i, j, r_vals[i], z_vals[j],
+             self.R, self.H, self.W, self.L, self.a, self.Re_p,
+             self.particle_maxh, self.global_maxh)
+            for i in range(N_r) for j in range(N_z)
+        ]
+
+        if nproc == 1:
+            print(f"DEBUG MODE: Running sequentially to find errors...")
+            self._init_bg_worker(self.u_data_np, self.p_data_np, self.mesh_params)
+
+            results = []
+            for task in tqdm(tasks):
+                res = self._compute_single_F_p(task)
+                results.append(res)
+
+        print(f"Start parallel grid computation with {nproc} processes.")
+
+        with mp.Pool(
+                processes=nproc,
+                initializer=self._init_bg_worker,
+                initargs=(self.u_data_np, self.p_data_np, self.mesh_params)
+        ) as pool:
+
+            results = []
+            # imap_unordered ist oft speichereffizienter und schneller bei ungleichmäßiger Last
+            for res in tqdm(pool.imap_unordered(self._compute_single_F_p, tasks), total=len(tasks)):
+                results.append(res)
+
+        # Ergebnisse einsortieren
+        for (i, j, Fr, Fz) in results:
+            Fr_grid[i, j] = Fr
+            Fz_grid[i, j] = Fz
+
+        # Kraftbetrag für Konturplot
+        phi = np.sqrt(Fr_grid ** 2 + Fz_grid ** 2)
+
+        # Daten speichern
+        self.r_vals = r_vals
+        self.z_vals = z_vals
+        self.phi = phi
+        self.Fr_grid = Fr_grid
+        self.Fz_grid = Fz_grid
+
+        return r_vals, z_vals, phi, Fr_grid, Fz_grid
+
+    def plot_paper_reproduction(self, r_vals, z_vals, phi, Fr_grid, Fz_grid, invert_xaxis=False):
+
+        # Meshgrid für Matplotlib (indexing='ij' passt zu unserer Matrixstruktur [i, j])
+        R_grid, Z_grid = np.meshgrid(r_vals, z_vals, indexing='ij')
+
+        # Bereich, in dem das Partikel die Wand berühren würde (physikalisch verboten)
+        # Da wir in Skalierung 2 sind, ist der Partikelradius = 1.0
+        # self.a ist im Konstruktor bereits der skalierte Wert (also 1.0),
+        # aber wir nutzen hier sicherheitshalber 1.0 + eps
+        exclusion_dist = 1.0 + self.eps
+
+        fig, ax = plt.subplots(figsize=(8, 6))
+
+        # Plot Magnitude
+        levels = np.linspace(np.nanmin(phi), np.nanmax(phi), 40)
+        cs = ax.contourf(R_grid, Z_grid, phi, levels=levels, cmap="viridis", alpha=0.9)
+        cbar = plt.colorbar(cs, ax=ax, fraction=0.046, pad=0.04)
+        cbar.set_label(r"Force Magnitude $\|\mathbf{F}\|$")
+
+        # Null-Isolinien (Gleichgewichtspunkte sind Schnittpunkte)
+        # Fr = 0 (cyan, gestrichelt)
+        ax.contour(R_grid, Z_grid, Fr_grid, levels=[0], colors="cyan", linestyles="--", linewidths=2)
+        # Fz = 0 (magenta, durchgezogen)
+        ax.contour(R_grid, Z_grid, Fz_grid, levels=[0], colors="magenta", linestyles="-", linewidths=2)
+
+        # Wände zeichnen
+        wall_rect = patches.Rectangle((-self.W / 2, -self.H / 2), self.W, self.H,
+                                      linewidth=3, edgecolor='black', facecolor='none', zorder=10)
+        ax.add_patch(wall_rect)
+
+        # Verbotene Zonen schraffieren
+        # Links
+        ax.add_patch(patches.Rectangle((-self.W / 2, -self.H / 2), exclusion_dist, self.H,
+                                       facecolor='gray', alpha=0.3, hatch='///'))
+        # Rechts
+        ax.add_patch(patches.Rectangle((self.W / 2 - exclusion_dist, -self.H / 2), exclusion_dist, self.H,
+                                       facecolor='gray', alpha=0.3, hatch='///'))
+        # Unten
+        ax.add_patch(patches.Rectangle((-self.W / 2, -self.H / 2), self.W, exclusion_dist,
+                                       facecolor='gray', alpha=0.3, hatch='///'))
+        # Oben
+        ax.add_patch(patches.Rectangle((-self.W / 2, self.H / 2 - exclusion_dist), self.W, exclusion_dist,
+                                       facecolor='gray', alpha=0.3, hatch='///'))
+
+        margin = 0.5
+        ax.set_xlim(-self.W / 2 - margin, self.W / 2 + margin)
+        ax.set_ylim(-self.H / 2 - margin, self.H / 2 + margin)
+        ax.set_aspect('equal')
+        ax.set_xlabel("r (local)")
+        ax.set_ylabel("z (local)")
+        ax.set_title(f"Force Map (Re_p={self.Re_p:.2f}, R={self.R:.1f})")
+
+        if invert_xaxis:
+            ax.invert_xaxis()  # Innenwand (Links im Paper) ist oft links, aber manchmal wird r invertiert
+
+        plt.tight_layout()
+        filename = f"ForceMap_R_{self.R:.1f}_Rep_{self.Re_p:.2f}.png"
+        plt.savefig(filename)
+        print(f"Plot saved to {filename}")
+        plt.show()
+
+    def generate_initial_guesses(self, n_grid_search=50, tol_unique=1e-3, tol_residual=1e-5):
+        # Überprüfen ob Grid berechnet wurde
+        if not hasattr(self, 'Fr_grid'):
+            print("Error: Compute Grid first.")
+            return []
+
+        self.interp_Fr = RectBivariateSpline(self.r_vals, self.z_vals, self.Fr_grid)
+        self.interp_Fz = RectBivariateSpline(self.r_vals, self.z_vals, self.Fz_grid)
+
+        def _interpolated_force(x):
+            r, z = x
+            # RectBivariateSpline gibt arrays zurück, wir brauchen scalars
+            return [self.interp_Fr(r, z)[0, 0], self.interp_Fz(r, z)[0, 0]]
+
+        r_starts = np.linspace(self.r_min, self.r_max, n_grid_search)
+        z_starts = np.linspace(self.z_min, self.z_max, n_grid_search)
+
+        initial_guesses = []
+
+        for r0 in r_starts:
+            for z0 in z_starts:
+
+                # Hybrid-Solver sucht Nullstelle der interpolierten Kraftfelder
+                solution = root(_interpolated_force, [r0, z0], method='hybr')
+
+                if solution.success:
+                    r_sol, z_sol = solution.x
+
+                    # Check ob innerhalb der Domain
+                    if not (self.r_min <= r_sol <= self.r_max and self.z_min <= z_sol <= self.z_max):
+                        continue
+
+                    # Check Residuum (manchmal konvergiert hybr fälschlicherweise)
+                    if np.linalg.norm(_interpolated_force((r_sol, z_sol))) > tol_residual:
+                        continue
+
+                    # Duplikat-Check
+                    is_new = True
+                    for existing in initial_guesses:
+                        dist = np.linalg.norm(np.array([r_sol, z_sol]) - existing)
+                        if dist < tol_unique:
+                            is_new = False
+                            break
+
+                    if is_new:
+                        initial_guesses.append(np.array([r_sol, z_sol]))
+
+        self.initial_guesses = initial_guesses
+        print(f"Found {len(initial_guesses)} candidate equilibrium points.")
+        return initial_guesses
 
 
 
@@ -869,3 +1342,4 @@ class F_p_roots:
                 print(f"        Typ: {info['type']}\n")
 
         return results
+'''

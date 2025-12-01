@@ -29,7 +29,7 @@ class perturbed_flow:
         u, p = TrialFunctions(self.W_mixed)
         v, q = TestFunctions(self.W_mixed)
 
-        a_form = inner(grad(u), grad(v)) * dx - p * div(v) * dx + a * q * div(u) * dx
+        a_form = 2 * inner(sym(grad(u)), sym(grad(v))) * dx - p * div(v) * dx + q * div(u) * dx # NEU
         # grad -> 2 * (sym(grad(u)), sym(grad(v))), => implicit no stress
 
         self._bcs_hom = [
@@ -37,8 +37,8 @@ class perturbed_flow:
             DirichletBC(self.W_mixed.sub(0), Constant((0.0, 0.0, 0.0)), self.tags["particle"]),
         ]
 
-        self._bcs_hom.append(DirichletBC(self.W_mixed.sub(0), Constant((0.0, 0.0, 0.0)), self.tags["inlet"]))
-        self._bcs_hom.append(DirichletBC(self.W_mixed.sub(0), Constant((0.0, 0.0, 0.0)), self.tags["outlet"]))
+        # self._bcs_hom.append(DirichletBC(self.W_mixed.sub(0), Constant((0.0, 0.0, 0.0)), self.tags["inlet"]))
+        # self._bcs_hom.append(DirichletBC(self.W_mixed.sub(0), Constant((0.0, 0.0, 0.0)), self.tags["outlet"]))
 
         A = assemble(a_form, bcs=self._bcs_hom)
 
@@ -66,11 +66,11 @@ class perturbed_flow:
         self.v_bc.interpolate(particle_bcs)
 
         DirichletBC(self.V, Constant((0.0, 0.0, 0.0)), self.tags["walls"]).apply(self.v_bc)
-        DirichletBC(self.V, Constant((0.0, 0.0, 0.0)), self.tags["inlet"]).apply(self.v_bc)
-        DirichletBC(self.V, Constant((0.0, 0.0, 0.0)), self.tags["outlet"]).apply(self.v_bc)
+        # DirichletBC(self.V, Constant((0.0, 0.0, 0.0)), self.tags["inlet"]).apply(self.v_bc)
+        # DirichletBC(self.V, Constant((0.0, 0.0, 0.0)), self.tags["outlet"]).apply(self.v_bc)
         DirichletBC(self.V, particle_bcs, self.tags["particle"]).apply(self.v_bc)
 
-        L_bcs = - inner(grad(self.v_bc), grad(v_test)) * dx + q_test * div(self.v_bc) * dx
+        L_bcs = - 2 * inner(sym(grad(self.v_bc)), sym(grad(v_test))) * dx - q_test * div(self.v_bc) * dx
 
         b = assemble(L_bcs, tensor=Cofunction(self.W_mixed.dual()), bcs=self._bcs_hom)
 
@@ -213,8 +213,7 @@ class perturbed_flow:
         R_loc = np.linalg.norm(r_vec)
 
         e_r = r_vec / R_loc
-        R_loc_hat = R_loc / self.a
-        val_centrifugal_magnitude = -(4.0 / 3.0) * np.pi * (Theta_val ** 2) * R_loc_hat
+        val_centrifugal_magnitude = (4.0 / 3.0) * np.pi * (Theta_val ** 2) * R_loc  # NEU
         F_centrifugal_vec = val_centrifugal_magnitude * e_r
 
         u_bar_3d_scaled = self.u_bar
@@ -227,7 +226,8 @@ class perturbed_flow:
 
         F_0_body = F_centrifugal_vec + F_inertial_vec
 
-        F_lift_total = F_0_a_lift + F_0_s_lift + F_0_body
+        F_lift_total = F_0_a_lift + F_0_s_lift # + F_0_body
         Ftot = (1.0 / float(self.Re_p)) * F_m1_s_dimless + F_lift_total
         self.F_p = (ex0 @ Ftot) * ex0 + (ez0 @ Ftot) * ez0
+
         return self.F_p

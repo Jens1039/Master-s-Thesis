@@ -7,11 +7,11 @@ mu  = 10.02e-4              # dyn. viscosity [Pa·s]
 # ------------------------------------------------------
 
 # ---LENGTH RATIOS FROM THE PAPER-----------------------
-a = 0.05*H / 2               # diameter of the smaller cell [m]
+a = 0.15*H / 2               # diameter of the smaller cell [m]
 W = H                        # duct width  [m]
 R = 160*H / 2                # bend radius [m]
 # ------------------------------------------------------
 
 # ---VOLUMETRIC FLOW RATE (CHOSEN TO MATCH ASSUMPTIONS FROM THE PAPER)
-Q = 1e-9   # 3e-8            # volumetric flow rate [m^3/s]
+Q = 5e-10                    # volumetric flow rate [m^3/s]
 # ------------------------------------------------------

@@ -7,17 +7,19 @@ from math import atan2, hypot, cos, sin
 import matplotlib.pyplot as plt
 
 
-
 class background_flow:
 
-    def __init__(self, R, H, W, L_c, Re):
+    def __init__(self, R, H, W, L_c, Re, comm=None):
         self.R = R
         self.H = H
         self.W = W
         self.L_c = L_c
         self.Re = Re
 
-        self.mesh2d = RectangleMesh(120, 120, self.W, self.H, quadrilateral=False)
+        from firedrake import COMM_WORLD
+        actual_comm = comm if comm is not None else COMM_WORLD
+
+        self.mesh2d = RectangleMesh(120, 120, self.W, self.H, quadrilateral=False, comm=actual_comm)
 
 
     def solve_2D_background_flow(self):
@@ -54,7 +56,7 @@ class background_flow:
         # Shortcuts for readability
         def del_r(f):  return Dx(f, 0)
         def del_z(f):  return Dx(f, 1)
-
+        '''
         # weak form of the radial-component
         F_r = ((u_r * del_r(u_r) + u_z * del_z(u_r) - (u_theta**2) / (self.R + r)) * v_r
                 + del_r(p) * v_r
@@ -72,6 +74,42 @@ class background_flow:
             + del_z(p) * v_z
             + 1/self.Re * dot(grad(u_z), grad(v_z))
             + 1/self.Re * ( (1.0/(self.R + r)) * del_r(u_z) ) * v_z) * (self.R + r) * dx
+        '''
+        F_r = ((u_r * del_r(u_r) + u_z * del_z(u_r) - (u_theta ** 2) / (self.R + r)) * v_r
+               + del_r(p) * v_r
+               + 1 / self.Re * dot(grad(u_r), grad(v_r))
+               # Korrektur des viskosen Terms (Vorzeichen und Ableitung korrigiert):
+               + 1 / self.Re * (u_r / (self.R + r) ** 2) * v_r
+               ) * (self.R + r) * dx
+
+        # weak form of the azimuthal component
+        # ALT (Falsch):
+        # F_theta = (...
+        #         + 1/self.Re * dot(grad(u_theta), grad(v_theta))
+        #         + 1/self.Re * ((1.0/(self.R + r)) * del_r(u_theta) - (u_theta / (self.R + r)**2)) * v_theta) * (self.R + r) * dx
+
+        # NEU (Korrekt):
+        F_theta = ((u_r * del_r(u_theta) + u_z * del_z(u_theta) + (u_theta * u_r) / (self.R + r)) * v_theta
+                   - ((G * self.R) / (self.R + r)) * v_theta
+                   + 1 / self.Re * dot(grad(u_theta), grad(v_theta))
+                   # Korrektur des viskosen Terms:
+                   + 1 / self.Re * (u_theta / (self.R + r) ** 2) * v_theta
+                   ) * (self.R + r) * dx
+
+        # weak form of the z-component
+        # ALT (Falsch):
+        # F_z = (...
+        #         + 1/self.Re * dot(grad(u_z), grad(v_z))
+        #         + 1/self.Re * ( (1.0/(self.R + r)) * del_r(u_z) ) * v_z) * (self.R + r) * dx
+
+        # NEU (Korrekt):
+        F_z = ((u_r * del_r(u_z) + u_z * del_z(u_z)) * v_z
+               + del_z(p) * v_z
+               # Zusätzlicher Term entfernt:
+               + 1 / self.Re * dot(grad(u_z), grad(v_z))
+               ) * (self.R + r) * dx
+
+        # ... Rest des Solvers ...
 
         # weak form of the continuity equation
         F_cont = q * (del_r(u_r) + del_z(u_z) + u_r / (self.R + r)) * (self.R + r) * dx
@@ -159,7 +197,7 @@ class background_flow:
         U_max = np.max(np.abs(u_data[:, 2]))
         self.U_m = U_max
 
-        return u_bar, p_bar
+        return u_bar, p_bar, U_max
 
 
     def plot_2D_background_flow(self):
@@ -218,17 +256,14 @@ class background_flow:
         plt.tight_layout()
         plt.show()
 
-# Diese Klasse aus der Instanziierung herausziehen um sie mit verschiedenen Löchern aber der gleichen Hintegrundinfo ausführen zu können
-# Wahrscheinlich sollte als Argument ein 2dfluss übergeben werden.
-def build_3d_background_flow(self, mesh3d):
 
-        u_2d = self.u_bar
-        p_2d = self.p_bar
+def build_3d_background_flow(R, H, W, mesh3d, u_bar_2d, p_bar_2d):
 
         # ufl_element() gets the information for the family (e.g. "Lagrange"), the cell-type (e.g. "quadrilateral") and
         # the polynomial degree out of a function space like VectorFunctionSpace(mesh, "CG", 2)
-        u_el = u_2d.function_space().ufl_element()
-        p_el = p_2d.function_space().ufl_element()
+        u_el = u_bar_2d.function_space().ufl_element()
+        p_el = p_bar_2d.function_space().ufl_element()
+
         # We now create 3d function spaces with the same family and degree as our 2d function spaces
         V = VectorFunctionSpace(mesh3d, u_el.family(), u_el.degree())
         u_bar_3d = Function(V)
@@ -257,14 +292,14 @@ def build_3d_background_flow(self, mesh3d):
             theta = atan2(Y, X)
             z = Z
             # numerical correction to ensure the functionality of PointEvaluator
-            r_2d = min(max(self.W / 2 + (r_glob - self.R), 0.0 + eps), self.W - eps)
-            z_2d = min(max(self.H / 2 + z, 0.0 + eps), self.H - eps)
+            r_2d = min(max(W / 2 + (r_glob - R), 0.0 + eps), W - eps)
+            z_2d = min(max(H / 2 + z, 0.0 + eps), H - eps)
 
             u_points.append((r_2d, z_2d))
             u_angles.append(theta)
 
-        ur_uz_utheta_all = PointEvaluator(mesh=u_2d.function_space().mesh(), points=u_points,
-                                          tolerance=1e-10).evaluate(u_2d)
+        ur_uz_utheta_all = PointEvaluator(mesh=u_bar_2d.function_space().mesh(), points=u_points,
+                                          tolerance=1e-10).evaluate(u_bar_2d)
 
         for j, vals in enumerate(ur_uz_utheta_all):
             u_r_val, u_z_val, u_theta_val = [float(x) for x in np.asarray(vals).reshape(-1)[:3]]
@@ -286,18 +321,14 @@ def build_3d_background_flow(self, mesh3d):
         for j in range(coords_p.shape[0]):
             X, Y, Z = coords_p[j, :]
             R_glob = hypot(X, Y)
-            x2d = min(max(self.W / 2.0 + (R_glob - self.R), 0.0 + eps), self.W - eps)
-            z2d = min(max(self.H / 2.0 + Z, 0.0 + eps), self.H - eps)
+            x2d = min(max(W / 2.0 + (R_glob - R), 0.0 + eps), W - eps)
+            z2d = min(max(H / 2.0 + Z, 0.0 + eps), H - eps)
             p_points.append((x2d, z2d))
 
-        p_vals_raw = PointEvaluator(mesh=p_2d.function_space().mesh(), points=p_points, tolerance=1e-10).evaluate(
-            p_2d)
+        p_vals_raw = PointEvaluator(mesh=p_bar_2d.function_space().mesh(), points=p_points, tolerance=1e-10).evaluate(p_bar_2d)
 
         p_data = p_bar_3d.dat.data
         for j, v in enumerate(p_vals_raw):
             p_data[j] = float(np.asarray(v).reshape(-1)[0])
-
-        self.u_bar_3d = u_bar_3d
-        self.p_bar_3d = p_bar_3d
 
         return u_bar_3d, p_bar_3d
