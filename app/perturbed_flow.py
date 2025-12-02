@@ -21,6 +21,20 @@ class perturbed_flow:
         self.mesh3d = mesh3d
         self.tags = tags
 
+        x = SpatialCoordinate(self.mesh3d)
+        x_p = Constant(self.tags["particle_center"])
+        self.x_p_prime = Constant([sqrt(x_p[0]**2 + x_p[1]**2), 0, x_p[2]])
+        p_center = self.tags["particle_center"]
+        theta_p = atan2(p_center[1], p_center[0])
+        theta_local = atan2(x[1], x[0])
+        self.x_prime = as_vector([x[0] * cos(theta_p) + x[1] * sin(theta_p), -x[0] * sin(theta_p) + x[1] * cos(theta_p), x[2]])
+        self.e_x_prime = Constant((cos(theta_p), sin(theta_p), 0.0))
+        self.e_theta_hat_prime = as_vector((-sin(theta_local), cos(theta_local), 0.0))
+        self.e_r_hat_prime = as_vector((cos(theta_local), sin(theta_local), 0.0))
+        self.e_z = Constant([0, 0, 1])
+        self.e_x_hat_prime_particle = Constant((cos(theta_p), sin(theta_p), 0.0))
+        self.e_theta_hat_prime_particle = Constant((-sin(theta_p), cos(theta_p), 0.0))
+
         # Stokes Solver setup in the constructor to enable LU-caching
         self.V = VectorFunctionSpace(self.mesh3d, "CG", 2)
         self.Q = FunctionSpace(self.mesh3d, "CG", 1)
@@ -29,8 +43,7 @@ class perturbed_flow:
         u, p = TrialFunctions(self.W_mixed)
         v, q = TestFunctions(self.W_mixed)
 
-        a_form = 2 * inner(sym(grad(u)), sym(grad(v))) * dx - p * div(v) * dx + q * div(u) * dx # NEU
-        # grad -> 2 * (sym(grad(u)), sym(grad(v))), => implicit no stress
+        a_form = 2 * inner(sym(grad(u)), sym(grad(v))) * dx - p * div(v) * dx + q * div(u) * dx
 
         self._bcs_hom = [
             DirichletBC(self.W_mixed.sub(0), Constant((0.0, 0.0, 0.0)), self.tags["walls"]),
@@ -87,74 +100,89 @@ class perturbed_flow:
 
         n = FacetNormal(mesh3d)
         sigma_hat = -q_0 * Identity(3) + (grad(v_0) + grad(v_0).T)
-        traction_hat = -dot(n, sigma_hat)
+        traction_hat = dot(-n, sigma_hat)
         components = [assemble(traction_hat[i] * ds(self.tags["particle"])) for i in range(3)]
-        F_m1 = np.array([float(c) for c in components])
-        return F_m1
+        F_minus_1 = np.array([float(c) for c in components])
+        return F_minus_1
 
 
     def T_minus_1(self, v_0_a, q_0_a, mesh3d, x, x_p):
 
         n = FacetNormal(mesh3d)
         sigma_hat = -q_0_a * Identity(3) + (grad(v_0_a) + grad(v_0_a).T)
-        traction_hat = -dot(n, sigma_hat)
+        traction_hat = dot(-n, sigma_hat)
         moment_density_hat = cross((x - x_p), traction_hat)
         components = [assemble(moment_density_hat[i] * ds(self.tags["particle"])) for i in range(3)]
-        T_m1 = np.array([float(c) for c in components])
-        return T_m1
+        T_minus_1 = np.array([float(c) for c in components])
+        return T_minus_1
 
 
-    def compute_F_0_a(self, v_0_a, u_hat_x, u_hat_z, u_bar_3d_a_scaled, x, Theta):
+    def compute_F_0(self, v_0_a, v_0_s, u_hat_x, u_hat_z, u_bar_a, u_bar_s, Theta_np):
 
-        e_z = as_vector((0.0, 0.0, 1.0))
-        ThetaC = Constant(float(Theta))
-        term1 = ThetaC * cross(e_z, v_0_a)
-        term2 = dot(grad(u_bar_3d_a_scaled), v_0_a)
-        adv_vec = v_0_a + u_bar_3d_a_scaled - ThetaC * cross(e_z, x)
-        term3 = dot(grad(v_0_a), adv_vec)
-        integrand = term1 + term2 + term3
-        sign = -1.0
-        F0_x = sign * assemble(dot(u_hat_x, integrand) * dx(degree=6))
-        F0_z = sign * assemble(dot(u_hat_z, integrand) * dx(degree=6))
-        return np.array([float(F0_x), 0.0, float(F0_z)])
+        x_p_np = np.array(self.x_p_prime.values())
+        e_x_prime_np = np.array(self.e_x_prime.values())
+        e_z = Constant([0, 0, 1])
+        e_z_np = np.array([0, 0, 1])
+        Theta = Constant(Theta_np)
+        n = FacetNormal(self.mesh3d)
 
+        centrifugal_term = - (4*np.pi)/3 * (Theta_np**2) * np.cross(e_z_np, np.cross(e_z_np, x_p_np))
 
-    def compute_F_0_s(self, v0s, u_hat_x, u_hat_z, u_bar_3d_s_scaled):
+        inertial_integrand = dot(u_bar_a, -n) * u_bar_a + (dot(u_bar_s, -n) * u_bar_a + dot(u_bar_a, -n) * u_bar_s) + dot(u_bar_s, -n) * u_bar_s
+        inertial_integral_x = assemble(inertial_integrand[0] * ds(self.tags["particle"], degree=6))
+        inertial_integral_y = assemble(inertial_integrand[1] * ds(self.tags["particle"], degree=6))
+        inertial_integral_z = assemble(inertial_integrand[2] * ds(self.tags["particle"], degree=6))
+        inertial_term = np.array([inertial_integral_x, inertial_integral_y, inertial_integral_z])
 
-        termA = dot(grad(u_bar_3d_s_scaled), v0s)
-        adv_s = v0s + u_bar_3d_s_scaled
-        termB = dot(grad(v0s), adv_s)
-        integrand = termA + termB
-        sign = -1.0
-        F_0_s_x = sign * assemble(dot(u_hat_x, integrand) * dx(degree=6))
-        F_0_s_z = sign * assemble(dot(u_hat_z, integrand) * dx(degree=6))
-        return np.array([float(F_0_s_x), 0.0, float(F_0_s_z)])
+        fluid_stress_term_x = (
+                inner(u_hat_x, cross(Theta * e_z, v_0_a)
+                      + dot(grad(u_bar_a), v_0_a)
+                      + dot(grad(v_0_a), v_0_a + u_bar_a - cross(Theta * e_z, self.x_prime)))
+                + inner(u_hat_x, dot(grad(u_bar_s), v_0_s) + dot(grad(v_0_s),
+                                                                 v_0_s + u_bar_s))
+                + inner(u_hat_x, cross(Theta * e_z, v_0_s)
+                        - dot(grad(v_0_s), cross(Theta * e_z, self.x_prime))
+                        + dot(grad(u_bar_s), v_0_a)
+                        + dot(grad(u_bar_a), v_0_s)
+                        + dot(grad(v_0_s), v_0_a + u_bar_a)
+                        + dot(grad(v_0_a), v_0_s + u_bar_s))
+        )
+        fluid_stress_integral_x = assemble(fluid_stress_term_x * dx(degree=6))
+
+        fluid_stress_term_z = (
+                inner(u_hat_z, cross(Theta * e_z, v_0_a)
+                      + dot(grad(u_bar_a), v_0_a)
+                      + dot(grad(v_0_a), v_0_a + u_bar_a - cross(Theta * e_z, self.x_prime)))
+                + inner(u_hat_z, dot(grad(u_bar_s), v_0_s) + dot(grad(v_0_s), v_0_s + u_bar_s))
+                + inner(u_hat_z, cross(Theta * e_z, v_0_s)
+                        - dot(grad(v_0_s), cross(Theta * e_z, self.x_prime))
+                        + dot(grad(u_bar_s), v_0_a)
+                        + dot(grad(u_bar_a), v_0_s)
+                        + dot(grad(v_0_s), v_0_a + u_bar_a)
+                        + dot(grad(v_0_a), v_0_s + u_bar_s))
+        )
+        fluid_stress_integral_z = assemble(fluid_stress_term_z * dx(degree=6))
+
+        fluid_stress_term = fluid_stress_integral_x * e_x_prime_np + fluid_stress_integral_z * e_z_np
+
+        F_0 = - fluid_stress_term + centrifugal_term + inertial_term
+
+        return F_0
 
 
     def F_p(self):
 
-        x = as_vector(SpatialCoordinate(self.mesh3d))
-        x_p = Constant(self.tags["particle_center"])
+        u_bar_a = dot(self.u_bar, self.e_theta_hat_prime) * self.e_theta_hat_prime
+        u_bar_s = dot(self.u_bar, self.e_r_hat_prime) * self.e_r_hat_prime + dot(self.u_bar, self.e_z) * self.e_z
+        ex0 = np.array(self.e_x_hat_prime_particle.values())
+        et0 = np.array(self.e_theta_hat_prime_particle.values())
+        ez0 = np.array([0, 0, 1])
 
-        rmag = sqrt(x[0] ** 2 + x[1] ** 2)
-        rmag_eps = conditional(rmag > 1e-14, rmag, 1.0)
-        e_theta = as_vector((-x[1] / rmag_eps, x[0] / rmag_eps, 0.0))
-
-        u_bar_3d_a = dot(self.u_bar, e_theta) * e_theta
-        u_bar_3d_s = self.u_bar - u_bar_3d_a
-
-        x0, y0, z0 = self.tags["particle_center"]
-        r0 = float(np.hypot(x0, y0))
-
-        ex0 = np.array([x0 / r0, y0 / r0, 0.])
-        et0 = np.array([-y0 / r0, x0 / r0, 0.])
-        ez0 = np.array([0., 0., 1.])
-
-        bcs_Theta = cross(as_vector((0., 0., 1.)), x)
-        bcs_Omega_Z = cross(as_vector((0., 0., 1.)), x - x_p)
-        bcs_Omega_R = cross(as_vector((float(ex0[0]), float(ex0[1]), 0.0)), x - x_p)
-        bcs_Omega_T = cross(as_vector((float(et0[0]), float(et0[1]), 0.0)), x - x_p)
-        bcs_bg = -u_bar_3d_a
+        bcs_Theta = cross(as_vector((0., 0., 1.)), self.x_prime)
+        bcs_Omega_Z = cross(as_vector((0., 0., 1.)), self.x_prime - self.x_p_prime)
+        bcs_Omega_R = cross(as_vector((float(ex0[0]), float(ex0[1]), 0.0)), self.x_prime - self.x_p_prime)
+        bcs_Omega_T = cross(as_vector((float(et0[0]), float(et0[1]), 0.0)), self.x_prime - self.x_p_prime)
+        bcs_bg = -u_bar_a
 
         v_0_a_Theta, q_0_a_Theta = self.Stokes_solver_3d(bcs_Theta)
         v_0_a_Omega_Z, q_0_a_Omega_Z = self.Stokes_solver_3d(bcs_Omega_Z)
@@ -163,15 +191,15 @@ class perturbed_flow:
         v_0_a_bg, q_0_a_bg = self.Stokes_solver_3d(bcs_bg)
 
         F_m1_Theta = self.F_minus_1(v_0_a_Theta, q_0_a_Theta, self.mesh3d)
-        T_Theta = self.T_minus_1(v_0_a_Theta, q_0_a_Theta, self.mesh3d, x, x_p)
+        T_Theta = self.T_minus_1(v_0_a_Theta, q_0_a_Theta, self.mesh3d, self.x_prime, self.x_p_prime)
         F_m1_Omega_Z = self.F_minus_1(v_0_a_Omega_Z, q_0_a_Omega_Z, self.mesh3d)
-        T_Omega_Z = self.T_minus_1(v_0_a_Omega_Z, q_0_a_Omega_Z, self.mesh3d, x, x_p)
+        T_Omega_Z = self.T_minus_1(v_0_a_Omega_Z, q_0_a_Omega_Z, self.mesh3d, self.x_prime, self.x_p_prime)
         F_m1_Omega_R = self.F_minus_1(v_0_a_Omega_R, q_0_a_Omega_R, self.mesh3d)
-        T_Omega_R = self.T_minus_1(v_0_a_Omega_R, q_0_a_Omega_R, self.mesh3d, x, x_p)
+        T_Omega_R = self.T_minus_1(v_0_a_Omega_R, q_0_a_Omega_R, self.mesh3d, self.x_prime, self.x_p_prime)
         F_m1_Omega_T = self.F_minus_1(v_0_a_Omega_T, q_0_a_Omega_T, self.mesh3d)
-        T_Omega_T = self.T_minus_1(v_0_a_Omega_T, q_0_a_Omega_T, self.mesh3d, x, x_p)
+        T_Omega_T = self.T_minus_1(v_0_a_Omega_T, q_0_a_Omega_T, self.mesh3d, self.x_prime, self.x_p_prime)
         F_m1_bg = self.F_minus_1(v_0_a_bg, q_0_a_bg, self.mesh3d)
-        T_bg = self.T_minus_1(v_0_a_bg, q_0_a_bg, self.mesh3d, x, x_p)
+        T_bg = self.T_minus_1(v_0_a_bg, q_0_a_bg, self.mesh3d, self.x_prime, self.x_p_prime)
 
         A_mat = np.array([
             [np.dot(et0, F_m1_Theta), np.dot(et0, F_m1_Omega_Z), np.dot(et0, F_m1_Omega_R), np.dot(et0, F_m1_Omega_T)],
@@ -191,43 +219,27 @@ class perturbed_flow:
         Theta_val = float(solution[0])
         Omega_Z_val = float(solution[1])
         Omega_R_val = float(solution[2])
-        Omega_T_val = float(solution[3]) # NEW
+        Omega_T_val = float(solution[3])
 
         v_0_a = Function(v_0_a_Theta.function_space())
+
         v_0_a.interpolate(Constant(Theta_val) * v_0_a_Theta +
                           Constant(Omega_Z_val) * v_0_a_Omega_Z +
                           Constant(Omega_R_val) * v_0_a_Omega_R +
-                          Constant(Omega_T_val) * v_0_a_Omega_T + # NEW
+                          Constant(Omega_T_val) * v_0_a_Omega_T +
                           v_0_a_bg)
 
-        v_0_s, q_0_s = self.Stokes_solver_3d(-u_bar_3d_s)
-        F_m1_s_dimless = self.F_minus_1(v_0_s, q_0_s, self.mesh3d)
+        v_0_s, q_0_s = self.Stokes_solver_3d(-u_bar_s)
 
-        u_hat_r, _ = self.Stokes_solver_3d(Constant((float(ex0[0]), float(ex0[1]), float(ex0[2]))))
+        F_minus_1_s = self.F_minus_1(v_0_s, q_0_s, self.mesh3d)
+
+        u_hat_x, _ = self.Stokes_solver_3d(Constant((float(ex0[0]), float(ex0[1]), float(ex0[2]))))
         u_hat_z, _ = self.Stokes_solver_3d(Constant((0., 0., 1.)))
 
-        F_0_a_lift = self.compute_F_0_a(v_0_a, u_hat_r, u_hat_z, u_bar_3d_a, x, Theta_val)
-        F_0_s_lift = self.compute_F_0_s(v_0_s, u_hat_r, u_hat_z, u_bar_3d_s)
+        F_0 = self.compute_F_0(v_0_a, v_0_s, u_hat_x, u_hat_z, u_bar_a, u_bar_s, Theta_val)
 
-        r_vec = np.array([x0, y0, 0.0])
-        R_loc = np.linalg.norm(r_vec)
+        F_p = (np.dot(ex0, 1/self.Re_p * F_minus_1_s + F_0)) * ex0 + (np.dot(ez0, 1/self.Re_p * F_minus_1_s + F_0)) * ez0
 
-        e_r = r_vec / R_loc
-        val_centrifugal_magnitude = (4.0 / 3.0) * np.pi * (Theta_val ** 2) * R_loc  # NEU
-        F_centrifugal_vec = val_centrifugal_magnitude * e_r
+        self.F_p = F_p
 
-        u_bar_3d_scaled = self.u_bar
-        n = FacetNormal(self.mesh3d)
-
-        integrand = dot(u_bar_3d_scaled, -n) * u_bar_3d_scaled
-
-        F_inertial_sym = [assemble(integrand[i] * ds(self.tags["particle"])) for i in range(3)]
-        F_inertial_vec = np.array([float(x) for x in F_inertial_sym])
-
-        F_0_body = F_centrifugal_vec + F_inertial_vec
-
-        F_lift_total = F_0_a_lift + F_0_s_lift # + F_0_body
-        Ftot = (1.0 / float(self.Re_p)) * F_m1_s_dimless + F_lift_total
-        self.F_p = (ex0 @ Ftot) * ex0 + (ez0 @ Ftot) * ez0
-
-        return self.F_p
+        return F_p

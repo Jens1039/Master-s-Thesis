@@ -56,7 +56,7 @@ class background_flow:
         # Shortcuts for readability
         def del_r(f):  return Dx(f, 0)
         def del_z(f):  return Dx(f, 1)
-        '''
+
         # weak form of the radial-component
         F_r = ((u_r * del_r(u_r) + u_z * del_z(u_r) - (u_theta**2) / (self.R + r)) * v_r
                 + del_r(p) * v_r
@@ -74,42 +74,6 @@ class background_flow:
             + del_z(p) * v_z
             + 1/self.Re * dot(grad(u_z), grad(v_z))
             + 1/self.Re * ( (1.0/(self.R + r)) * del_r(u_z) ) * v_z) * (self.R + r) * dx
-        '''
-        F_r = ((u_r * del_r(u_r) + u_z * del_z(u_r) - (u_theta ** 2) / (self.R + r)) * v_r
-               + del_r(p) * v_r
-               + 1 / self.Re * dot(grad(u_r), grad(v_r))
-               # Korrektur des viskosen Terms (Vorzeichen und Ableitung korrigiert):
-               + 1 / self.Re * (u_r / (self.R + r) ** 2) * v_r
-               ) * (self.R + r) * dx
-
-        # weak form of the azimuthal component
-        # ALT (Falsch):
-        # F_theta = (...
-        #         + 1/self.Re * dot(grad(u_theta), grad(v_theta))
-        #         + 1/self.Re * ((1.0/(self.R + r)) * del_r(u_theta) - (u_theta / (self.R + r)**2)) * v_theta) * (self.R + r) * dx
-
-        # NEU (Korrekt):
-        F_theta = ((u_r * del_r(u_theta) + u_z * del_z(u_theta) + (u_theta * u_r) / (self.R + r)) * v_theta
-                   - ((G * self.R) / (self.R + r)) * v_theta
-                   + 1 / self.Re * dot(grad(u_theta), grad(v_theta))
-                   # Korrektur des viskosen Terms:
-                   + 1 / self.Re * (u_theta / (self.R + r) ** 2) * v_theta
-                   ) * (self.R + r) * dx
-
-        # weak form of the z-component
-        # ALT (Falsch):
-        # F_z = (...
-        #         + 1/self.Re * dot(grad(u_z), grad(v_z))
-        #         + 1/self.Re * ( (1.0/(self.R + r)) * del_r(u_z) ) * v_z) * (self.R + r) * dx
-
-        # NEU (Korrekt):
-        F_z = ((u_r * del_r(u_z) + u_z * del_z(u_z)) * v_z
-               + del_z(p) * v_z
-               # Zusätzlicher Term entfernt:
-               + 1 / self.Re * dot(grad(u_z), grad(v_z))
-               ) * (self.R + r) * dx
-
-        # ... Rest des Solvers ...
 
         # weak form of the continuity equation
         F_cont = q * (del_r(u_r) + del_z(u_z) + u_r / (self.R + r)) * (self.R + r) * dx
@@ -256,79 +220,188 @@ class background_flow:
         plt.tight_layout()
         plt.show()
 
-
+'''
 def build_3d_background_flow(R, H, W, mesh3d, u_bar_2d, p_bar_2d):
+    # ufl_element() gets the information for the family (e.g. "Lagrange"), the cell-type (e.g. "quadrilateral") and
+    # the polynomial degree out of a function space like VectorFunctionSpace(mesh, "CG", 2)
+    u_el = u_bar_2d.function_space().ufl_element()
+    p_el = p_bar_2d.function_space().ufl_element()
 
-        # ufl_element() gets the information for the family (e.g. "Lagrange"), the cell-type (e.g. "quadrilateral") and
-        # the polynomial degree out of a function space like VectorFunctionSpace(mesh, "CG", 2)
-        u_el = u_bar_2d.function_space().ufl_element()
-        p_el = p_bar_2d.function_space().ufl_element()
+    # We now create 3d function spaces with the same family and degree as our 2d function spaces
+    V = VectorFunctionSpace(mesh3d, u_el.family(), u_el.degree())
+    u_bar_3d = Function(V)
+    Q = FunctionSpace(mesh3d, p_el.family(), p_el.degree())
+    p_bar_3d = Function(Q)
 
-        # We now create 3d function spaces with the same family and degree as our 2d function spaces
-        V = VectorFunctionSpace(mesh3d, u_el.family(), u_el.degree())
-        u_bar_3d = Function(V)
-        Q = FunctionSpace(mesh3d, p_el.family(), p_el.degree())
-        p_bar_3d = Function(Q)
+    x = SpatialCoordinate(mesh3d)
 
-        x = SpatialCoordinate(mesh3d)
+    # creates an empty function in the V Vector Space
+    coord_vec = Function(V)
+    # fills coord_vec with the true mesh coordinates meaning coord_vec = id_x
+    coord_vec.interpolate(as_vector((x[0], x[1], x[2])))
+    # .dat grants access to the container, which holds the PETCs-vectors containing the actual data
+    # .data_ro grants acces to theese data with ro = read_only
+    coords_u = coord_vec.dat.data_ro
 
-        # creates an empty function in the V Vector Space
-        coord_vec = Function(V)
-        # fills coord_vec with the true mesh coordinates meaning coord_vec = id_x
-        coord_vec.interpolate(as_vector((x[0], x[1], x[2])))
-        # .dat grants access to the container, which holds the PETCs-vectors containing the actual data
-        # .data_ro grants acces to theese data with ro = read_only
-        coords_u = coord_vec.dat.data_ro
+    eps = 1e-10
+    u_points = []
+    u_angles = []
+    # iterates over all N grid points of our mesh3d and assigns the associated 2d-coordinate
+    for j in range(coords_u.shape[0]):
+        # Reads out the spatial coordinates of the current grid point
+        X, Y, Z = coords_u[j, :]
+        # We transform from global cartesian coordinates to global cylindric coordinates
+        r_glob = hypot(X, Y)
+        theta = atan2(Y, X)
+        z = Z
+        # numerical correction to ensure the functionality of PointEvaluator
+        r_2d = min(max(W / 2 + (r_glob - R), 0.0 + eps), W - eps)
+        z_2d = min(max(H / 2 + z, 0.0 + eps), H - eps)
 
-        eps = 1e-10
-        u_points = []
-        u_angles = []
-        # iterates over all N grid points of our mesh3d and assigns the associated 2d-coordinate
-        for j in range(coords_u.shape[0]):
-            # Reads out the spatial coordinates of the current grid point
-            X, Y, Z = coords_u[j, :]
-            # We transform from global cartesian coordinates to global cylindric coordinates
-            r_glob = hypot(X, Y)
-            theta = atan2(Y, X)
-            z = Z
-            # numerical correction to ensure the functionality of PointEvaluator
-            r_2d = min(max(W / 2 + (r_glob - R), 0.0 + eps), W - eps)
-            z_2d = min(max(H / 2 + z, 0.0 + eps), H - eps)
+        u_points.append((r_2d, z_2d))
+        u_angles.append(theta)
 
-            u_points.append((r_2d, z_2d))
-            u_angles.append(theta)
+    ur_uz_utheta_all = PointEvaluator(mesh=u_bar_2d.function_space().mesh(), points=u_points,
+                                      tolerance=1e-10).evaluate(u_bar_2d)
 
-        ur_uz_utheta_all = PointEvaluator(mesh=u_bar_2d.function_space().mesh(), points=u_points,
-                                          tolerance=1e-10).evaluate(u_bar_2d)
+    for j, vals in enumerate(ur_uz_utheta_all):
+        u_r_val, u_z_val, u_theta_val = [float(x) for x in np.asarray(vals).reshape(-1)[:3]]
+        phi = u_angles[j]
+        Ux = u_r_val * cos(phi) - u_theta_val * sin(phi)
+        Uy = u_r_val * sin(phi) + u_theta_val * cos(phi)
+        Uz = u_z_val
 
-        for j, vals in enumerate(ur_uz_utheta_all):
-            u_r_val, u_z_val, u_theta_val = [float(x) for x in np.asarray(vals).reshape(-1)[:3]]
-            phi = u_angles[j]
-            Ux = u_r_val * cos(phi) - u_theta_val * sin(phi)
-            Uy = u_r_val * sin(phi) + u_theta_val * cos(phi)
-            Uz = u_z_val
+        u_bar_3d.dat.data[j, 0] = Ux
+        u_bar_3d.dat.data[j, 1] = Uy
+        u_bar_3d.dat.data[j, 2] = Uz
 
-            u_bar_3d.dat.data[j, 0] = Ux
-            u_bar_3d.dat.data[j, 1] = Uy
-            u_bar_3d.dat.data[j, 2] = Uz
+    VQ = VectorFunctionSpace(mesh3d, p_el.family(), p_el.degree(), dim=3)
+    coord_sca = Function(VQ)
+    coord_sca.interpolate(as_vector((x[0], x[1], x[2])))
+    coords_p = coord_sca.dat.data_ro
 
-        VQ = VectorFunctionSpace(mesh3d, p_el.family(), p_el.degree(), dim=3)
-        coord_sca = Function(VQ)
-        coord_sca.interpolate(as_vector((x[0], x[1], x[2])))
-        coords_p = coord_sca.dat.data_ro
+    p_points = []
+    for j in range(coords_p.shape[0]):
+        X, Y, Z = coords_p[j, :]
+        R_glob = hypot(X, Y)
+        x2d = min(max(W / 2.0 + (R_glob - R), 0.0 + eps), W - eps)
+        z2d = min(max(H / 2.0 + Z, 0.0 + eps), H - eps)
+        p_points.append((x2d, z2d))
 
-        p_points = []
-        for j in range(coords_p.shape[0]):
-            X, Y, Z = coords_p[j, :]
-            R_glob = hypot(X, Y)
-            x2d = min(max(W / 2.0 + (R_glob - R), 0.0 + eps), W - eps)
-            z2d = min(max(H / 2.0 + Z, 0.0 + eps), H - eps)
-            p_points.append((x2d, z2d))
+    p_vals_raw = PointEvaluator(mesh=p_bar_2d.function_space().mesh(), points=p_points, tolerance=1e-10).evaluate(
+        p_bar_2d)
 
-        p_vals_raw = PointEvaluator(mesh=p_bar_2d.function_space().mesh(), points=p_points, tolerance=1e-10).evaluate(p_bar_2d)
+    p_data = p_bar_3d.dat.data
+    for j, v in enumerate(p_vals_raw):
+        p_data[j] = float(np.asarray(v).reshape(-1)[0])
 
-        p_data = p_bar_3d.dat.data
-        for j, v in enumerate(p_vals_raw):
-            p_data[j] = float(np.asarray(v).reshape(-1)[0])
+    return u_bar_3d, p_bar_3d
+'''
 
-        return u_bar_3d, p_bar_3d
+def build_3d_background_flow(R_s2, H_s2, W_s2, mesh3d, u_bar_2d, p_bar_2d):
+    """
+    Extrudiert die 2D Background-Flow Lösung auf das 3D Mesh.
+    Transformiert dabei die zylindrischen Geschwindigkeitskomponenten (u_r, u_z, u_theta)
+    in kartesische Komponenten (u_x, u_y, u_z).
+
+    Args:
+        R_s2, H_s2, W_s2: Geometrie-Parameter auf der Skala des 3D Meshes (Scale 2).
+        mesh3d: Das 3D Mesh (Firedrake Mesh).
+        u_bar_2d: Die 2D Geschwindigkeitslösung (auf dem 2D Mesh Scale 2).
+                  Erwartete Komponenten: [0]=u_r, [1]=u_z, [2]=u_theta.
+        p_bar_2d: Die 2D Drucklösung (auf dem 2D Mesh Scale 2).
+
+    Returns:
+        u_3d, p_3d: Firedrake Funktionen auf dem 3D Mesh.
+    """
+
+    # 1. Funktionsräume auf dem 3D Mesh erstellen
+    # Geschwindigkeit ist CG2, Druck ist CG1 (Taylor-Hood)
+    V_3d = VectorFunctionSpace(mesh3d, "CG", 2)
+    Q_3d = FunctionSpace(mesh3d, "CG", 1)
+
+    u_3d = Function(V_3d)
+    p_3d = Function(Q_3d)
+
+    # --- GESCHWINDIGKEIT (Vektoriell, CG2) ---
+
+    # Wir benötigen die Koordinaten aller Freiheitsgrade (DoFs) von V_3d.
+    # Dazu interpolieren wir die Mesh-Koordinaten auf einen Vector-CG2 Raum.
+    V_coords = VectorFunctionSpace(mesh3d, "CG", 2)
+    coords_func_u = Function(V_coords).interpolate(SpatialCoordinate(mesh3d))
+
+    # Zugriff auf die Koordinaten-Daten (N_nodes x 3)
+    xyz_nodes_u = coords_func_u.dat.data_ro
+
+    # Berechnung der lokalen Koordinaten für jeden Knoten im 3D Mesh
+    # r_3d: Abstand vom Krümmungsmittelpunkt (0,0,0)
+    # theta_3d: Winkel in der x-y Ebene
+    r_3d = np.sqrt(xyz_nodes_u[:, 0] ** 2 + xyz_nodes_u[:, 1] ** 2)
+    theta_3d = np.arctan2(xyz_nodes_u[:, 1], xyz_nodes_u[:, 0])
+    z_3d = xyz_nodes_u[:, 2]
+
+    # Mapping auf das 2D Mesh Koordinatensystem:
+    # Das 2D Mesh in background_flow wird als [0, W] x [0, H] erzeugt.
+    # In der 2D-Rechnung wurde definiert: r_sim = x_mesh - 0.5*W, z_sim = y_mesh - 0.5*H.
+    # Wir haben r_local = r_3d - R.
+    # Also: x_query = r_local + 0.5*W = (r_3d - R) + 0.5*W
+    #       y_query = z_local + 0.5*H = z_3d + 0.5*H
+
+    x_query_u = (r_3d - R_s2) + 0.5 * W_s2
+    y_query_u = z_3d + 0.5 * H_s2
+
+    # Um numerische Rundungsfehler am Rand abzufangen (damit .at() nicht fehlschlägt),
+    # clippen wir die Koordinaten leicht auf die Domain des 2D Meshes.
+    epsilon = 1e-12
+    x_query_u = np.clip(x_query_u, 0.0, W_s2)
+    y_query_u = np.clip(y_query_u, 0.0, H_s2)
+
+    query_points_u = np.column_stack((x_query_u, y_query_u))
+
+    # Auswertung der 2D-Lösung an den entsprechenden Punkten
+    # u_vals Shape: (N_nodes, 3) -> [u_r, u_z, u_theta]
+    u_vals = np.array(u_bar_2d.at(query_points_u))
+
+    u_r = u_vals[:, 0]
+    u_z = u_vals[:, 1]
+    u_th = u_vals[:, 2]
+
+    # Rücktransformation in kartesische 3D Vektoren (x, y, z)
+    # Rotation um die z-Achse basierend auf theta_3d
+    cos_th = np.cos(theta_3d)
+    sin_th = np.sin(theta_3d)
+
+    # u_x = u_r * cos(theta) - u_theta * sin(theta)
+    # u_y = u_r * sin(theta) + u_theta * cos(theta)
+    u_x_3d = u_r * cos_th - u_th * sin_th
+    u_y_3d = u_r * sin_th + u_th * cos_th
+    u_z_3d = u_z
+
+    # Zuweisung in die 3D Funktion
+    u_3d.dat.data[:] = np.column_stack((u_x_3d, u_y_3d, u_z_3d))
+
+    # --- DRUCK (Skalar, CG1) ---
+
+    # Gleiches Verfahren für den Druck, aber auf CG1 Knoten (weniger Punkte)
+    Q_coords = VectorFunctionSpace(mesh3d, "CG", 1)
+    coords_func_p = Function(Q_coords).interpolate(SpatialCoordinate(mesh3d))
+    xyz_nodes_p = coords_func_p.dat.data_ro
+
+    r_3d_p = np.sqrt(xyz_nodes_p[:, 0] ** 2 + xyz_nodes_p[:, 1] ** 2)
+    z_3d_p = xyz_nodes_p[:, 2]
+
+    x_query_p = (r_3d_p - R_s2) + 0.5 * W_s2
+    y_query_p = z_3d_p + 0.5 * H_s2
+
+    x_query_p = np.clip(x_query_p, 0.0, W_s2)
+    y_query_p = np.clip(y_query_p, 0.0, H_s2)
+
+    query_points_p = np.column_stack((x_query_p, y_query_p))
+
+    # Auswertung des Drucks
+    p_vals = np.array(p_bar_2d.at(query_points_p))
+
+    # Zuweisung in die 3D Funktion
+    p_3d.dat.data[:] = p_vals
+
+    return u_3d, p_3d

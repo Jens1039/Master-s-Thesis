@@ -7,7 +7,7 @@ mu  = 10.02e-4              # dyn. viscosity [Pa·s]
 # ------------------------------------------------------
 
 # ---LENGTH RATIOS FROM THE PAPER-----------------------
-a = 0.15*H / 2               # diameter of the smaller cell [m]
+a = 0.05*H / 2               # diameter of the smaller cell [m]
 W = H                        # duct width  [m]
 R = 160*H / 2                # bend radius [m]
 # ------------------------------------------------------

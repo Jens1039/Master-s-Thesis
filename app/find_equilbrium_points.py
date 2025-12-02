@@ -1,6 +1,3 @@
-import matplotlib.pyplot as plt
-import multiprocessing as mp
-
 from tqdm import tqdm
 import os
 import matplotlib.patches as patches
@@ -12,6 +9,167 @@ from firedrake import *
 from background_flow import *
 from build_3d_geometry import *
 from perturbed_flow import *
+
+
+
+
+class F_p_grid:
+
+    def __init__(self, R, H, W, a, Re_p, L, particle_maxh, global_maxh, eps):
+
+        self.R = R
+        self.H = H
+        self.W = W
+        self.a = a
+        self.Re_p = Re_p
+        self.L = L
+
+        self.particle_maxh = particle_maxh
+        self.global_maxh = global_maxh
+        self.eps = eps
+
+        self.r_min = -W / 2 + 1.0 + eps
+        self.r_max = W / 2 - 1.0 - eps
+        self.z_min = -H / 2 + 1.0 + eps
+        self.z_max = H / 2 - 1.0 - eps
+
+        self.mesh_nx = 120
+        self.mesh_ny = 120
+
+    def compute_F_p_grid_ensemble(self, N_r, N_z, u_bg_data_np, p_bg_data_np):
+        from mpi4py import MPI
+
+        ensemble = Ensemble(COMM_WORLD, 1)
+        my_comm = ensemble.comm
+
+        global_rank = COMM_WORLD.rank
+        global_size = COMM_WORLD.size
+
+        mesh2d_local = RectangleMesh(self.mesh_nx, self.mesh_ny, self.W, self.H, quadrilateral=False, comm=my_comm)
+
+        V_local = VectorFunctionSpace(mesh2d_local, "CG", 2, dim=3)
+        Q_local = FunctionSpace(mesh2d_local, "CG", 1)
+
+        u_bg_local = Function(V_local)
+        p_bg_local = Function(Q_local)
+
+        u_bg_local.dat.data[:] = u_bg_data_np
+        p_bg_local.dat.data[:] = p_bg_data_np
+
+        r_vals = np.linspace(self.r_min, self.r_max, N_r)
+        z_vals = np.linspace(self.z_min, self.z_max, N_z)
+
+        all_tasks = []
+        for i in range(N_r):
+            for j in range(N_z):
+                all_tasks.append((i, j, r_vals[i], z_vals[j]))
+
+        my_tasks = all_tasks[global_rank::global_size]
+        local_results = []
+
+        if global_rank == 0:
+            print(f"Start Ensemble Grid: {len(all_tasks)} points on {global_size} cores.")
+
+        for task in tqdm(my_tasks, disable=(global_rank != 0)):
+            (i, j, r_loc, z_loc) = task
+
+            try:
+                mesh3d, tags = make_curved_channel_section_with_spherical_hole(
+                    self.R, self.H, self.W, self.L, self.a,
+                    self.particle_maxh, self.global_maxh,
+                    r_off=r_loc, z_off=z_loc,
+                    comm=my_comm
+                )
+
+                u_3d, p_3d = build_3d_background_flow(self.R, self.H, self.W, mesh3d, u_bg_local, p_bg_local)
+
+                pf = perturbed_flow(self.R, self.H, self.W, self.a, self.Re_p, mesh3d, tags, u_3d, p_3d)
+                F_vec = pf.F_p()
+
+                cx, cy, cz = tags["particle_center"]
+                r0 = float(np.hypot(cx, cy))
+                ex0 = np.array([1., 0., 0.]) if r0 < 1e-14 else np.array([cx / r0, cy / r0, 0.])
+                ez0 = np.array([0., 0., 1.])
+
+                Fr = float(np.dot(ex0, F_vec))
+                Fz = float(np.dot(ez0, F_vec))
+
+                local_results.append((i, j, Fr, Fz))
+
+            except Exception as e:
+                print(f"[Rank {global_rank}] Error at {i},{j}: {e}")
+                local_results.append((i, j, 0.0, 0.0))
+
+
+        all_data = COMM_WORLD.gather(local_results, root=0)
+
+
+        if global_rank == 0:
+            Fr_grid = np.zeros((N_r, N_z))
+            Fz_grid = np.zeros((N_r, N_z))
+
+            for rank_result_list in all_data:
+                for (i, j, Fr, Fz) in rank_result_list:
+                    Fr_grid[i, j] = Fr
+                    Fz_grid[i, j] = Fz
+
+            phi = np.sqrt(Fr_grid ** 2 + Fz_grid ** 2)
+            self.r_vals = r_vals
+            self.z_vals = z_vals
+            self.phi = phi
+            self.Fr_grid = Fr_grid
+            self.Fz_grid = Fz_grid
+
+            return r_vals, z_vals, phi, Fr_grid, Fz_grid
+        else:
+            return None, None, None, None, None
+
+    def plot_paper_reproduction(self, r_vals, z_vals, phi, Fr_grid, Fz_grid):
+
+        R_grid, Z_grid = np.meshgrid(r_vals, z_vals, indexing='ij')
+
+        exclusion_dist = 1.0 + self.eps
+
+        fig, ax = plt.subplots(figsize=(8, 6))
+
+        levels = np.linspace(np.nanmin(phi), np.nanmax(phi), 40)
+        cs = ax.contourf(R_grid, Z_grid, phi, levels=levels, cmap="viridis", alpha=0.9)
+        cbar = plt.colorbar(cs, ax=ax, fraction=0.046, pad=0.04)
+        cbar.set_label(r"Force Magnitude $\|\mathbf{F}\|$")
+
+        ax.contour(R_grid, Z_grid, Fr_grid, levels=[0], colors="cyan", linestyles="--", linewidths=2)
+        ax.contour(R_grid, Z_grid, Fz_grid, levels=[0], colors="magenta", linestyles="-", linewidths=2)
+
+        wall_rect = patches.Rectangle((-self.W / 2, -self.H / 2), self.W, self.H,
+                                      linewidth=3, edgecolor='black', facecolor='none', zorder=10)
+        ax.add_patch(wall_rect)
+
+        ax.add_patch(patches.Rectangle((-self.W / 2, -self.H / 2), exclusion_dist, self.H,
+                                       facecolor='gray', alpha=0.3, hatch='///'))
+
+        ax.add_patch(patches.Rectangle((self.W / 2 - exclusion_dist, -self.H / 2), exclusion_dist, self.H,
+                                       facecolor='gray', alpha=0.3, hatch='///'))
+
+        ax.add_patch(patches.Rectangle((-self.W / 2, -self.H / 2), self.W, exclusion_dist,
+                                       facecolor='gray', alpha=0.3, hatch='///'))
+
+        ax.add_patch(patches.Rectangle((-self.W / 2, self.H / 2 - exclusion_dist), self.W, exclusion_dist,
+                                       facecolor='gray', alpha=0.3, hatch='///'))
+
+        margin = self.eps
+        ax.set_xlim(-self.W / 2 - margin, self.W / 2 + margin)
+        ax.set_ylim(-self.H / 2 - margin, self.H / 2 + margin)
+        ax.set_aspect('equal')
+        ax.set_xlabel("r (local)")
+        ax.set_ylabel("z (local)")
+        ax.set_title(f"Force Map (a={self.a:.2f}, R={self.R:.1f})")
+
+        plt.tight_layout()
+        filename = f"Force Map (a={self.a:.2f}, R={self.R:.1f}).png"
+        plt.savefig(filename)
+        print(f"Plot saved to {filename}")
+        plt.show()
+
 
 '''
 class F_p_grid:
@@ -286,188 +444,6 @@ class F_p_grid:
         plt.tight_layout()
         plt.savefig(f"a_{a}_R_{R}_with_roots.png")
 '''
-
-
-class F_p_grid:
-
-    def __init__(self, R, H, W, a, Re_p, L, particle_maxh, global_maxh, eps):
-
-        self.R = R
-        self.H = H
-        self.W = W
-        self.a = a
-        self.Re_p = Re_p
-        self.L = L
-
-        self.particle_maxh = particle_maxh
-        self.global_maxh = global_maxh
-        self.eps = eps
-
-        self.r_min = -W / 2 + 1.0 + eps
-        self.r_max = W / 2 - 1.0 - eps
-        self.z_min = -H / 2 + 1.0 + eps
-        self.z_max = H / 2 - 1.0 - eps
-
-        # Mesh Parameter hardcoded oder übergeben, müssen zu u_bg_data_np passen
-        self.mesh_nx = 120
-        self.mesh_ny = 120
-
-    def compute_F_p_grid_ensemble(self, N_r, N_z, u_bg_data_np, p_bg_data_np):
-        from mpi4py import MPI
-
-        # 1. Ensemble erstellen
-        ensemble = Ensemble(COMM_WORLD, 1)
-        my_comm = ensemble.comm
-
-        global_rank = COMM_WORLD.rank
-        global_size = COMM_WORLD.size
-
-        # 2. Lokalen Background Flow "rehydrieren"
-        # Mesh erstellen auf dem Sub-Communicator
-        mesh2d_local = RectangleMesh(self.mesh_nx, self.mesh_ny, self.W, self.H, quadrilateral=False, comm=my_comm)
-
-        V_local = VectorFunctionSpace(mesh2d_local, "CG", 2, dim=3)
-        Q_local = FunctionSpace(mesh2d_local, "CG", 1)
-
-        u_bg_local = Function(V_local)
-        p_bg_local = Function(Q_local)
-
-        # Daten einfüllen
-        u_bg_local.dat.data[:] = u_bg_data_np
-        p_bg_local.dat.data[:] = p_bg_data_np
-
-        # Grid definieren
-        r_vals = np.linspace(self.r_min, self.r_max, N_r)
-        z_vals = np.linspace(self.z_min, self.z_max, N_z)
-
-        # Aufgaben erstellen
-        all_tasks = []
-        for i in range(N_r):
-            for j in range(N_z):
-                all_tasks.append((i, j, r_vals[i], z_vals[j]))
-
-        # Aufgaben verteilen
-        my_tasks = all_tasks[global_rank::global_size]
-        local_results = []
-
-        if global_rank == 0:
-            print(f"Start Ensemble Grid: {len(all_tasks)} points on {global_size} cores.")
-
-        for task in tqdm(my_tasks, disable=(global_rank != 0)):
-            (i, j, r_loc, z_loc) = task
-
-            try:
-                mesh3d, tags = make_curved_channel_section_with_spherical_hole(
-                    self.R, self.H, self.W, self.L, self.a,
-                    self.particle_maxh, self.global_maxh,
-                    r_off=r_loc, z_off=z_loc,
-                    comm=my_comm
-                )
-
-                u_3d, p_3d = build_3d_background_flow(self.R, self.H, self.W, mesh3d, u_bg_local, p_bg_local)
-
-                # Solver
-                pf = perturbed_flow(self.R, self.H, self.W, self.a, self.Re_p, mesh3d, tags, u_3d, p_3d)
-                F_vec = pf.F_p()
-
-                cx, cy, cz = tags["particle_center"]
-                r0 = float(np.hypot(cx, cy))
-                ex0 = np.array([1., 0., 0.]) if r0 < 1e-14 else np.array([cx / r0, cy / r0, 0.])
-                ez0 = np.array([0., 0., 1.])
-
-                Fr = float(np.dot(ex0, F_vec))
-                Fz = float(np.dot(ez0, F_vec))
-
-                local_results.append((i, j, Fr, Fz))
-
-            except Exception as e:
-                print(f"[Rank {global_rank}] Error at {i},{j}: {e}")
-                local_results.append((i, j, 0.0, 0.0))
-
-
-        all_data = COMM_WORLD.gather(local_results, root=0)
-
-
-        if global_rank == 0:
-            Fr_grid = np.zeros((N_r, N_z))
-            Fz_grid = np.zeros((N_r, N_z))
-
-            for rank_result_list in all_data:
-                for (i, j, Fr, Fz) in rank_result_list:
-                    Fr_grid[i, j] = Fr
-                    Fz_grid[i, j] = Fz
-
-            phi = np.sqrt(Fr_grid ** 2 + Fz_grid ** 2)
-            self.r_vals = r_vals;
-            self.z_vals = z_vals;
-            self.phi = phi
-            self.Fr_grid = Fr_grid;
-            self.Fz_grid = Fz_grid
-
-            return r_vals, z_vals, phi, Fr_grid, Fz_grid
-        else:
-            return None, None, None, None, None
-
-    def plot_paper_reproduction(self, r_vals, z_vals, phi, Fr_grid, Fz_grid):
-
-        # Meshgrid für Matplotlib (indexing='ij' passt zu unserer Matrixstruktur [i, j])
-        R_grid, Z_grid = np.meshgrid(r_vals, z_vals, indexing='ij')
-
-        # Bereich, in dem das Partikel die Wand berühren würde (physikalisch verboten)
-        # Da wir in Skalierung 2 sind, ist der Partikelradius = 1.0
-        # self.a ist im Konstruktor bereits der skalierte Wert (also 1.0),
-        # aber wir nutzen hier sicherheitshalber 1.0 + eps
-        exclusion_dist = 1.0 + self.eps
-
-        fig, ax = plt.subplots(figsize=(8, 6))
-
-        # Plot Magnitude
-        levels = np.linspace(np.nanmin(phi), np.nanmax(phi), 40)
-        cs = ax.contourf(R_grid, Z_grid, phi, levels=levels, cmap="viridis", alpha=0.9)
-        cbar = plt.colorbar(cs, ax=ax, fraction=0.046, pad=0.04)
-        cbar.set_label(r"Force Magnitude $\|\mathbf{F}\|$")
-
-        # Null-Isolinien (Gleichgewichtspunkte sind Schnittpunkte)
-        # Fr = 0 (cyan, gestrichelt)
-        ax.contour(R_grid, Z_grid, Fr_grid, levels=[0], colors="cyan", linestyles="--", linewidths=2)
-        # Fz = 0 (magenta, durchgezogen)
-        ax.contour(R_grid, Z_grid, Fz_grid, levels=[0], colors="magenta", linestyles="-", linewidths=2)
-
-        # Wände zeichnen
-        wall_rect = patches.Rectangle((-self.W / 2, -self.H / 2), self.W, self.H,
-                                      linewidth=3, edgecolor='black', facecolor='none', zorder=10)
-        ax.add_patch(wall_rect)
-
-        # Verbotene Zonen schraffieren
-        # Links
-        ax.add_patch(patches.Rectangle((-self.W / 2, -self.H / 2), exclusion_dist, self.H,
-                                       facecolor='gray', alpha=0.3, hatch='///'))
-        # Rechts
-        ax.add_patch(patches.Rectangle((self.W / 2 - exclusion_dist, -self.H / 2), exclusion_dist, self.H,
-                                       facecolor='gray', alpha=0.3, hatch='///'))
-        # Unten
-        ax.add_patch(patches.Rectangle((-self.W / 2, -self.H / 2), self.W, exclusion_dist,
-                                       facecolor='gray', alpha=0.3, hatch='///'))
-        # Oben
-        ax.add_patch(patches.Rectangle((-self.W / 2, self.H / 2 - exclusion_dist), self.W, exclusion_dist,
-                                       facecolor='gray', alpha=0.3, hatch='///'))
-
-        margin = self.eps
-        ax.set_xlim(-self.W / 2 - margin, self.W / 2 + margin)
-        ax.set_ylim(-self.H / 2 - margin, self.H / 2 + margin)
-        ax.set_aspect('equal')
-        ax.set_xlabel("r (local)")
-        ax.set_ylabel("z (local)")
-        ax.set_title(f"Force Map (a={self.a:.2f}, R={self.R:.1f})")
-
-        plt.tight_layout()
-        filename = f"Force Map (a={self.a:.2f}, R={self.R:.1f}).png"
-        plt.savefig(filename)
-        print(f"Plot saved to {filename}")
-        plt.show()
-
-
-
 '''
 class F_p_grid:
 

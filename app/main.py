@@ -58,14 +58,14 @@ if __name__ == "__main__":
     if comm.rank == 0:
         print("Rank 0: Calculating 2D Background Flow...")
 
-        R, H, W, L_c, U_c, Re = first_nondimensionalisation(R, H, W, Q, rho, mu)
+        R, H, W, L_c, U_c, Re = first_nondimensionalisation(R, H, W, Q, rho, mu, print_values=True)
 
         bg = background_flow(R, H, W, L_c, Re, comm=MPI.COMM_SELF)
 
         u_bar_2d, p_bar_2d, U_m = bg.solve_2D_background_flow()
         bg.plot_2D_background_flow()
 
-        R_s2, H_s2, W_s2, a_s2, u_bar_s2, p_bar_s2, Re_p = second_nondimensionalisation(R, H, W,  a, L_c, U_c, Re, u_bar_2d, p_bar_2d, U_m, print_values=True)
+        R_s2, H_s2, W_s2, a_s2, U_c_p, u_bar_s2, p_bar_s2, Re_p = second_nondimensionalisation(R, H, W,  a, L_c, U_c, Re, u_bar_2d, p_bar_2d, U_m, print_values=True)
 
         u_data_np = u_bar_s2.copy()
         p_data_np = p_bar_s2.copy()

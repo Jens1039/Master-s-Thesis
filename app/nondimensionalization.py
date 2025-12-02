@@ -55,4 +55,4 @@ def second_nondimensionalisation(R, H, W, a, L_c, U_c, Re, u_bar_2d, p_bar_2d, U
         print("p_bar = ", p_bar_nd)
         print("Re_p = ", Re_p)
 
-    return R_nd, H_nd, W_nd, a_nd, u_bar_nd, p_bar_nd, Re_p
+    return R_nd, H_nd, W_nd, a_nd, U_c_p, u_bar_nd, p_bar_nd, Re_p

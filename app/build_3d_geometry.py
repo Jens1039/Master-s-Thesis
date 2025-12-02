@@ -51,17 +51,12 @@ def make_curved_channel_section_with_spherical_hole(R, H, W, L, a, particle_maxh
     particle_surface.name = "particle"
     particle_surface.maxh = particle_maxh
 
-    # preparation for clean parallel solving later
-    # 2. ÄNDERUNG: Wir prüfen comm.rank statt COMM_WORLD.rank
-    # Im Ensemble-Modus mit 1 Rank pro Sim ist comm.rank immer 0.
     if comm.rank == 0:
         netgenmesh = OCCGeometry(fluid, dim=3).GenerateMesh(maxh=global_maxh)
 
     else:
         netgenmesh = netgen.libngpy._meshing.Mesh(3)
 
-    # 3. ÄNDERUNG: Hier übergeben wir den comm an Firedrake
-    # Das ist der wichtigste Schritt! Damit weiß Firedrake: "Dieses Mesh gehört nur mir".
     mesh3d = Mesh(Mesh(netgenmesh, comm=comm).curve_field(order))
 
     names = netgenmesh.GetRegionNames(codim=1)
