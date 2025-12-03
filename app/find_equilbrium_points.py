@@ -36,6 +36,7 @@ class F_p_grid:
         self.mesh_nx = 120
         self.mesh_ny = 120
 
+
     def compute_F_p_grid_ensemble(self, N_r, N_z, u_bg_data_np, p_bg_data_np):
         from mpi4py import MPI
 
@@ -124,7 +125,8 @@ class F_p_grid:
         else:
             return None, None, None, None, None
 
-    def plot_paper_reproduction(self, r_vals, z_vals, phi, Fr_grid, Fz_grid):
+
+    def plot_paper_reproduction(self, L_c_p, L_c, r_vals, z_vals, phi, Fr_grid, Fz_grid):
 
         R_grid, Z_grid = np.meshgrid(r_vals, z_vals, indexing='ij')
 
@@ -162,10 +164,13 @@ class F_p_grid:
         ax.set_aspect('equal')
         ax.set_xlabel("r (local)")
         ax.set_ylabel("z (local)")
-        ax.set_title(f"Force Map (a={self.a:.2f}, R={self.R:.1f})")
 
+        a = (L_c_p/L_c) * self.a
+        R = (L_c_p/L_c) * self.R
+
+        ax.set_title(f"Force_Map_a={a:.3f}_R={R:.1f}")
         plt.tight_layout()
-        filename = f"Force Map (a={self.a:.2f}, R={self.R:.1f}).png"
+        filename = f"cache/Force_Map_a={a:.3f}_R={R:.1f}.png"
         plt.savefig(filename)
         print(f"Plot saved to {filename}")
         plt.show()
