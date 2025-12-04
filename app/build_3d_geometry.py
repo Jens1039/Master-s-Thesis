@@ -1,74 +1,71 @@
 import math
-from firedrake import Mesh, COMM_WORLD
+from firedrake import Mesh, COMM_SELF
 from netgen.occ import *
-import netgen.meshing
 
 
-def make_curved_channel_section_with_spherical_hole(R, H, W, L, a, particle_maxh, global_maxh, r_off=0.0, z_off=0.0, order=3, comm=COMM_WORLD):
+def make_curved_channel_section_with_spherical_hole(R, H, W, L, a, particle_maxh, global_maxh, r_off=0.0, z_off=0.0, order=3, comm=COMM_SELF):
 
-    theta = L / R
+    SECURE_a = 0.025
 
-    # creates a point with the coordinates (R, 0, 0) cross-sectional middle point of our curved duct section
-    p_0 = Pnt(R*math.cos(0.0),       R*math.sin(0.0),       0.0)
-    # creates a point halfway through the curved duct section
-    p_m = Pnt(R*math.cos(theta*0.5), R*math.sin(theta*0.5), 0.0)
-    # creates a point at the end of the cross-section
-    p_1 = Pnt(R*math.cos(theta),     R*math.sin(theta),     0.0)
+    _R = R * SECURE_a
+    _H = H * SECURE_a
+    _W = W * SECURE_a
+    _L = L * SECURE_a
+    _a = a * SECURE_a
+    _particle_maxh = particle_maxh * SECURE_a
+    _global_maxh = global_maxh * SECURE_a
+    _r_off = r_off * SECURE_a
+    _z_off = z_off * SECURE_a
 
-    # ArcOfCircle constructs the geometry, Wire adds the topology
+    theta = _L / _R
+
+    p_0 = Pnt(_R * math.cos(0.0), _R * math.sin(0.0), 0.0)
+    p_m = Pnt(_R * math.cos(theta * 0.5), _R * math.sin(theta * 0.5), 0.0)
+    p_1 = Pnt(_R * math.cos(theta), _R * math.sin(theta), 0.0)
+
     spine = Wire([ArcOfCircle(p_0, p_m, p_1)])
-
-    # create a plane with "anchor-point" (p_0.x, p_0.y, p_0.z) normal vector Y and horizontal direction Z
     wp = WorkPlane(Axes((p_0.x, p_0.y, p_0.z), n=Y, h=Z))
-
-    # the 2d shape, which is later extruded along the spine is created here on the workplane
-    rect_face = wp.RectangleC(W, H).Face()
-
-    # extrudes the 2d rectangular face along the spine to create a 3d manifold
+    rect_face = wp.RectangleC(_W, _H).Face()
     channel_section = Pipe(spine, rect_face)
-
-    # Initially, all the facets are identified as walls - we differentiate that later
     channel_section.faces.name = "walls"
 
-    # cylindrical coordinates of the sphere center
-    cx = (R + r_off) * math.cos(theta*0.5)
-    cy = (R + r_off) * math.sin(theta*0.5)
-    cz = z_off
+    cx = (_R + _r_off) * math.cos(theta * 0.5)
+    cy = (_R + _r_off) * math.sin(theta * 0.5)
+    cz = _z_off
 
-    # creates a sphere with radius a around the previously determined particle center
-    sphere_filled = Sphere(Pnt(cx, cy, cz), a)
+    sphere_filled = Sphere(Pnt(cx, cy, cz), _a)
     sphere_filled.faces.name = "particle"
 
-    # creates the final geometrie curved channel section with spherical hole
     fluid = channel_section - sphere_filled
-
-    # differentiates inlet and outlet from the other walls by proximity to the starting and end point of the channel section
     fluid.faces.Nearest((p_0.x, p_0.y, p_0.z)).name = "inlet"
     fluid.faces.Nearest((p_1.x, p_1.y, p_1.z)).name = "outlet"
 
-    # Locating the sphere surface
-    particle_surface = fluid.faces.Nearest((cx + a, cy, cz))
+    particle_surface = fluid.faces.Nearest((cx + _a, cy, cz))
     particle_surface.name = "particle"
-    particle_surface.maxh = particle_maxh
+    particle_surface.maxh = _particle_maxh
 
-    if comm.rank == 0:
-        netgenmesh = OCCGeometry(fluid, dim=3).GenerateMesh(maxh=global_maxh)
+    netgenmesh = OCCGeometry(fluid, dim=3).GenerateMesh(maxh=_global_maxh)
+    netgenmesh.Curve(order)
 
-    else:
-        netgenmesh = netgen.libngpy._meshing.Mesh(3)
+    netgenmesh.Scale(1.0 / SECURE_a)
+    cx *= 1.0 / SECURE_a
+    cy *= 1.0 / SECURE_a
+    cz *= 1.0 / SECURE_a
 
-    mesh3d = Mesh(Mesh(netgenmesh, comm=comm).curve_field(order))
+    mesh3d = Mesh(netgenmesh, comm=comm)
 
     names = netgenmesh.GetRegionNames(codim=1)
+
     def _id(name):
         return names.index(name) + 1 if name in names else None
 
     tags = {
-        "walls":    _id("walls"),
-        "inlet":    _id("inlet"),
-        "outlet":   _id("outlet"),
+        "walls": _id("walls"),
+        "inlet": _id("inlet"),
+        "outlet": _id("outlet"),
         "particle": _id("particle"),
-        "theta":    theta,
-        "particle_center":   (cx, cy, cz),
+        "theta": theta,
+        "particle_center": (cx, cy, cz),
     }
+
     return mesh3d, tags

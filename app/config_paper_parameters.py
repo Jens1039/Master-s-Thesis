@@ -13,5 +13,5 @@ R = 160*H / 2                # bend radius [m]
 # ------------------------------------------------------
 
 # ---VOLUMETRIC FLOW RATE (CHOSEN TO MATCH ASSUMPTIONS FROM THE PAPER)
-Q = 5e-10                    # volumetric flow rate [m^3/s]
+Q = 1e-10                    # volumetric flow rate [m^3/s]
 # ------------------------------------------------------
