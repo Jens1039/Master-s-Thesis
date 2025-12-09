@@ -1,5 +1,3 @@
-from firedrake import *
-
 def first_nondimensionalisation(R, H, W, Q, rho, mu, print_values=True):
 
     # characteristic length is the hydraulic diameter D_h

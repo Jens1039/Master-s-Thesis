@@ -239,43 +239,31 @@ class background_flow:
 
 
 def build_3d_background_flow(R, H, W, G, mesh3d, u_bar_2d, p_bar_2d):
-    """
-    Kombiniert die Geschwindigkeit des funktionierenden Codes
-    mit der Argument-Struktur (G), die dein aktueller Code erwartet.
-    """
 
-    # 1. Funktionsräume auf dem 3D Mesh erstellen
     V_3d = VectorFunctionSpace(mesh3d, "CG", 2)
     Q_3d = FunctionSpace(mesh3d, "CG", 1)
 
     u_3d = Function(V_3d)
     p_3d = Function(Q_3d)
 
-    # --- GESCHWINDIGKEIT (Vektoriell, CG2) ---
-
-    # Koordinaten aller DoFs holen
     V_coords = VectorFunctionSpace(mesh3d, "CG", 2)
     coords_func_u = Function(V_coords).interpolate(SpatialCoordinate(mesh3d))
     xyz_nodes_u = coords_func_u.dat.data_ro
 
-    # Berechnung der lokalen Koordinaten
     r_3d = np.sqrt(xyz_nodes_u[:, 0] ** 2 + xyz_nodes_u[:, 1] ** 2)
     theta_3d = np.arctan2(xyz_nodes_u[:, 1], xyz_nodes_u[:, 0])
     z_3d = xyz_nodes_u[:, 2]
 
-    # Mapping auf das 2D Mesh (Scale 2 Parameter R, H, W nutzen)
     x_query_u = (r_3d - R) + 0.5 * W
     y_query_u = z_3d + 0.5 * H
 
-    # Clipping um numerische Fehler am Rand abzufangen
     epsilon = 1e-12
     x_query_u = np.clip(x_query_u, 0.0, W)
     y_query_u = np.clip(y_query_u, 0.0, H)
 
     query_points_u = np.column_stack((x_query_u, y_query_u))
 
-    # --- HIER IST DER UNTERSCHIED: Vektorisierte Auswertung ---
-    # Firedrake .at() ist extrem schnell im Vergleich zu PointEvaluator in einer Schleife
+
     try:
         u_vals = np.array(u_bar_2d.at(query_points_u, tolerance=1e-8))
     except Exception as e:
@@ -286,7 +274,6 @@ def build_3d_background_flow(R, H, W, G, mesh3d, u_bar_2d, p_bar_2d):
     u_z = u_vals[:, 1]
     u_th = u_vals[:, 2]
 
-    # Rücktransformation
     cos_th = np.cos(theta_3d)
     sin_th = np.sin(theta_3d)
 
@@ -296,14 +283,12 @@ def build_3d_background_flow(R, H, W, G, mesh3d, u_bar_2d, p_bar_2d):
 
     u_3d.dat.data[:] = np.column_stack((u_x_3d, u_y_3d, u_z_3d))
 
-    # --- DRUCK (Skalar, CG1) ---
-
     Q_coords = VectorFunctionSpace(mesh3d, "CG", 1)
     coords_func_p = Function(Q_coords).interpolate(SpatialCoordinate(mesh3d))
     xyz_nodes_p = coords_func_p.dat.data_ro
 
     r_3d_p = np.sqrt(xyz_nodes_p[:, 0] ** 2 + xyz_nodes_p[:, 1] ** 2)
-    theta_3d_p = np.arctan2(xyz_nodes_p[:, 1], xyz_nodes_p[:, 0])  # Wichtig für Druckkorrektur G
+    theta_3d_p = np.arctan2(xyz_nodes_p[:, 1], xyz_nodes_p[:, 0])
     z_3d_p = xyz_nodes_p[:, 2]
 
     x_query_p = np.clip((r_3d_p - R) + 0.5 * W, 0.0, W)
@@ -320,11 +305,7 @@ def build_3d_background_flow(R, H, W, G, mesh3d, u_bar_2d, p_bar_2d):
     if p_vals.ndim > 1:
         p_vals = p_vals.flatten()
 
-    # Druckkorrektur anwenden (p_total = p_tilde - G * R * theta)
-    # Das fehlte in deiner alten "funktionierenden" Version eventuell,
-    # ist aber physikalisch im gekrümmten Kanal wichtig!
     p_total = p_vals - G * R * theta_3d_p
-
     p_3d.dat.data[:] = p_total
 
     return u_3d, p_3d

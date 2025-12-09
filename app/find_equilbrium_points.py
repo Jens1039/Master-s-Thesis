@@ -85,17 +85,9 @@ class F_p_grid:
                 u_3d, p_3d = build_3d_background_flow(self.R, self.H, self.W, self.G, mesh3d, u_bg_local, p_bg_local)
 
                 pf = perturbed_flow(self.R, self.H, self.W, self.a, self.Re_p, mesh3d, tags, u_3d, p_3d)
-                F_vec = pf.F_p()
+                F_r, F_z = pf.F_p()
 
-                cx, cy, cz = tags["particle_center"]
-                r0 = float(np.hypot(cx, cy))
-                ex0 = np.array([1., 0., 0.]) if r0 < 1e-14 else np.array([cx / r0, cy / r0, 0.])
-                ez0 = np.array([0., 0., 1.])
-
-                Fr = float(np.dot(ex0, F_vec))
-                Fz = float(np.dot(ez0, F_vec))
-
-                local_results.append((i, j, Fr, Fz))
+                local_results.append((i, j, F_r, F_z))
 
             except Exception as e:
                 print(f"[Rank {global_rank}] Error at {i},{j}: {e}")
@@ -114,12 +106,14 @@ class F_p_grid:
                     Fr_grid[i, j] = Fr
                     Fz_grid[i, j] = Fz
 
-            phi = np.sqrt(Fr_grid ** 2 + Fz_grid ** 2)
+            self.Fr_grid = Fr_grid.T
+            self.Fz_grid = Fz_grid.T
+
+            phi = np.sqrt(Fr_grid.T ** 2 + Fz_grid.T ** 2)
+            self.phi = phi
+
             self.r_vals = r_vals
             self.z_vals = z_vals
-            self.phi = phi
-            self.Fr_grid = Fr_grid
-            self.Fz_grid = Fz_grid
 
             return r_vals, z_vals, phi, Fr_grid, Fz_grid
         else:
@@ -174,21 +168,32 @@ class F_p_grid:
         return initial_guesses
 
 
-    def plot_paper_reproduction(self, L_c_p, L_c, r_vals, z_vals, phi, Fr_grid, Fz_grid, initial_guesses=None):
+    def plot_paper_reproduction(self, L_c_p, L_c, initial_guesses=None):
 
-        R_grid, Z_grid = np.meshgrid(r_vals, z_vals, indexing='ij')
+        # np.meshgrid takes in 2 (or more 1d arrays, which define the coordinates along the axis)
+        # It returns two matrices which have the x coordinates in every row and the y coordinates in every column
+        # indexing="xy" (Cartesian Indexing) means that the first argument defines the numbers on the horizontal axis and the second on the vertical axis
+        R_grid, Z_grid = np.meshgrid(self.r_vals, self.z_vals, indexing='xy')
 
         exclusion_dist = 1.0 + self.eps
 
+        # This creates the "canvas" (Leinwand) for the plot
         fig, ax = plt.subplots(figsize=(8, 6))
 
-        levels = np.linspace(np.nanmin(phi), np.nanmax(phi), 40)
-        cs = ax.contourf(R_grid, Z_grid, phi, levels=levels, cmap="viridis", alpha=0.9)
+        # Since phi = np.sqrt(Fr_grid ** 2 + Fz_grid ** 2) this returns the force magnitude to colour the plot later
+        # np.linespace produces num equdistant values between the first and second argument
+        # The default would be to choose nice round numbers for the colour transition values, which leads to the max and min being shifted
+        levels = np.linspace(np.nanmin(self.phi), np.nanmax(self.phi), 40)
+
+        # ax.contourf takes in the R_grid and Z_grid (matrices from above) and plots the function phi on theese gridpoints levels
+        # It also uses cartesian indexing
+        cs = ax.contourf(R_grid, Z_grid, self.phi, levels=levels, cmap="viridis", alpha=1)
+
         cbar = plt.colorbar(cs, ax=ax, fraction=0.046, pad=0.04)
         cbar.set_label(r"Force Magnitude $\|\mathbf{F}\|$")
 
-        ax.contour(R_grid, Z_grid, Fr_grid, levels=[0], colors="cyan", linestyles="--", linewidths=2)
-        ax.contour(R_grid, Z_grid, Fz_grid, levels=[0], colors="magenta", linestyles="-", linewidths=2)
+        ax.contour(R_grid, Z_grid, self.Fr_grid, levels=[0], colors="black", linestyles="-", linewidths=2)
+        ax.contour(R_grid, Z_grid, self.Fz_grid, levels=[0], colors="white", linestyles="-", linewidths=2)
 
         wall_rect = patches.Rectangle((-self.W / 2, -self.H / 2), self.W, self.H,
                                       linewidth=3, edgecolor='black', facecolor='none', zorder=10)
@@ -218,15 +223,15 @@ class F_p_grid:
         ax.set_xlim(-self.W / 2 - margin, self.W / 2 + margin)
         ax.set_ylim(-self.H / 2 - margin, self.H / 2 + margin)
         ax.set_aspect('equal')
-        ax.set_xlabel("r (local)")
-        ax.set_ylabel("z (local)")
+        ax.set_xlabel("r")
+        ax.set_ylabel("z")
 
-        a = (L_c_p/L_c) * self.a
-        R = (L_c_p/L_c) * self.R
+        a = (L_c_p/L_c) * self.a * 2
+        R = (L_c_p/L_c) * self.R * 2
 
-        ax.set_title(f"Force_Map_a={a:.3f}_R={R:.1f}")
+        ax.set_title(f"Force_Map_a={a:.3f}_R={R:.1f}_with_H=W=2")
         plt.tight_layout()
-        filename = f"cache/Force_Map_a={a:.3f}_R={R:.1f}.png"
+        filename = f"Force_Map_a={a:.3f}_R={R:.1f}.png"
         plt.savefig(filename)
         print(f"Plot saved to {filename}")
         plt.show()

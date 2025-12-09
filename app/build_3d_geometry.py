@@ -25,7 +25,7 @@ def make_curved_channel_section_with_spherical_hole(R, H, W, L, a, particle_maxh
 
     spine = Wire([ArcOfCircle(p_0, p_m, p_1)])
     wp = WorkPlane(Axes((p_0.x, p_0.y, p_0.z), n=Y, h=Z))
-    rect_face = wp.RectangleC(_W, _H).Face()
+    rect_face = wp.RectangleC(_H, _W).Face()
     channel_section = Pipe(spine, rect_face)
     channel_section.faces.name = "walls"
 

@@ -15,3 +15,6 @@ R = 160*H / 2                # bend radius [m]
 # ---VOLUMETRIC FLOW RATE (CHOSEN TO MATCH ASSUMPTIONS FROM THE PAPER)
 Q = 1e-10                    # volumetric flow rate [m^3/s]
 # ------------------------------------------------------
+
+kappa = (H**4)/(4*(a**3)*R)
+# print(kappa)  # = 200
