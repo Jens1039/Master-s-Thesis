@@ -157,7 +157,7 @@ class perturbed_flow:
 
         fluid_stress_term = fluid_stress_integral_x * e_x_prime_np + fluid_stress_integral_z * e_z_np
 
-        F_0 = fluid_stress_term + centrifugal_term + inertial_term
+        F_0 = fluid_stress_term + inertial_term + centrifugal_term
 
         return F_0
 
@@ -167,10 +167,10 @@ class perturbed_flow:
         Computes the inertial lift force F_0 using the low flow rate approximation.
         Per Section 3 (Page 16) of the paper, terms involving secondary flow
         (u_bar_s, v_0_s) are neglected in this calculation as they scale
-        with higher orders of epsilon.
+        with higher orders of epsilon = L_c/2R.
         """
 
-        x_p_np = np.array(self.x_p_prime.values())
+        x_p_np = np.array(self.x_p.values())
         e_x_prime_np = np.array(self.e_x_prime.values())
         e_z = Constant([0, 0, 1])
         e_z_np = np.array([0, 0, 1])
@@ -179,10 +179,6 @@ class perturbed_flow:
 
         centrifugal_term = - (4 * np.pi) / 3 * (Theta_np ** 2) * np.cross(e_z_np, np.cross(e_z_np, x_p_np))
 
-        # We approximate volume integral of u . grad(u) over the particle.
-        # Only axial flow (u_bar_a) is retained.
-        # Logic: Divergence theorem converts volume integral to surface integral.
-        # n points INTO particle (FEniCS convention), so outward normal is -n.
         inertial_integrand = dot(u_bar_a, -n) * u_bar_a
 
         inertial_integral_x = assemble(inertial_integrand[0] * ds(self.tags["particle"], degree=6))
@@ -190,37 +186,31 @@ class perturbed_flow:
         inertial_integral_z = assemble(inertial_integrand[2] * ds(self.tags["particle"], degree=6))
         inertial_term = np.array([inertial_integral_x, inertial_integral_y, inertial_integral_z])
 
-        # We only retain terms involving v_0_a and u_bar_a.
-        # Terms with v_0_s and u_bar_s are dropped.
-
-        # X-Component
         fluid_stress_term_x = (
             inner(u_x,
-                  # Coriolis-like term on disturbance
+
                   cross(Theta * e_z, v_0_a)
-                  # Advection of disturbance by background
+
                   + dot(grad(u_bar_a), v_0_a)
-                  # Advection of background by disturbance (linearized)
-                  # Note: The term (v_0_a + u_bar_a - cross(...)) represents the total velocity
-                  # relative to the rotating frame contribution.
-                  + dot(grad(v_0_a), v_0_a + u_bar_a - cross(Theta * e_z, self.x_prime))
+
+
+
+                  + dot(grad(v_0_a), v_0_a + u_bar_a - cross(Theta * e_z, self.x))
                   )
         )
         fluid_stress_integral_x = assemble(fluid_stress_term_x * dx(degree=6))
 
-        # Z-Component
         fluid_stress_term_z = (
             inner(u_z,
                   cross(Theta * e_z, v_0_a)
                   + dot(grad(u_bar_a), v_0_a)
-                  + dot(grad(v_0_a), v_0_a + u_bar_a - cross(Theta * e_z, self.x_prime))
+                  + dot(grad(v_0_a), v_0_a + u_bar_a - cross(Theta * e_z, self.x))
                   )
         )
         fluid_stress_integral_z = assemble(fluid_stress_term_z * dx(degree=6))
 
         fluid_stress_term = fluid_stress_integral_x * e_x_prime_np + fluid_stress_integral_z * e_z_np
 
-        # Total F_0
         F_0 = fluid_stress_term + centrifugal_term + inertial_term
 
         return F_0

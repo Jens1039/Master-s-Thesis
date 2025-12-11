@@ -1,9 +1,7 @@
 from tqdm import tqdm
-import os
 import matplotlib.patches as patches
 from scipy.interpolate import RectBivariateSpline
 from scipy.optimize import root
-from firedrake import *
 
 
 from background_flow import *
@@ -106,10 +104,10 @@ class F_p_grid:
                     Fr_grid[i, j] = Fr
                     Fz_grid[i, j] = Fz
 
-            self.Fr_grid = Fr_grid.T
-            self.Fz_grid = Fz_grid.T
+            self.Fr_grid = Fr_grid
+            self.Fz_grid = Fz_grid
 
-            phi = np.sqrt(Fr_grid.T ** 2 + Fz_grid.T ** 2)
+            phi = np.sqrt(Fr_grid ** 2 + Fz_grid ** 2)
             self.phi = phi
 
             self.r_vals = r_vals
@@ -173,7 +171,7 @@ class F_p_grid:
         # np.meshgrid takes in 2 (or more 1d arrays, which define the coordinates along the axis)
         # It returns two matrices which have the x coordinates in every row and the y coordinates in every column
         # indexing="xy" (Cartesian Indexing) means that the first argument defines the numbers on the horizontal axis and the second on the vertical axis
-        R_grid, Z_grid = np.meshgrid(self.r_vals, self.z_vals, indexing='xy')
+        R_grid, Z_grid = np.meshgrid(self.r_vals, self.z_vals, indexing='ij')
 
         exclusion_dist = 1.0 + self.eps
 
@@ -231,8 +229,75 @@ class F_p_grid:
 
         ax.set_title(f"Force_Map_a={a:.3f}_R={R:.1f}_with_H=W=2")
         plt.tight_layout()
-        filename = f"Force_Map_a={a:.3f}_R={R:.1f}.png"
+        filename = f"cache/Force_Map_a={a:.3f}_R={R:.1f}.png"
         plt.savefig(filename)
         print(f"Plot saved to {filename}")
         plt.show()
 
+
+    @staticmethod
+    def approx_jacobian():
+        pass
+
+
+    def classify_single_equilibrium(self, x_eq, eps_rel=1e-4, tol_eig=1e-6):
+
+        x_eq = np.asarray(x_eq, dtype=float)
+
+        def F_func(x):
+            return np.asarray(self.evaluate_F(x), dtype=float)
+
+        J = self.approx_jacobian(F_func, x_eq, eps_rel=eps_rel)
+
+        eigvals, eigvecs = np.linalg.eig(J)
+        real_parts = eigvals.real
+
+        tr = np.trace(J)
+        det = np.linalg.det(J)
+
+        if np.any(np.isnan(real_parts)):
+            eq_type = "unclear (NaN)"
+            color = "gray"
+        else:
+            # Toleranz prüfen, um numerisches Rauschen um 0 nicht falsch zu deuten
+            if real_parts[0] * real_parts[1] < -tol_eig ** 2:
+                # Ein positiver, ein negativer Eigenwert
+                eq_type = "saddle"
+                color = "orange"  # oder yellow
+            elif np.all(real_parts < -tol_eig):
+                # Alle Eigenwerte negativ -> Senke
+                eq_type = "stable"
+                color = "green"
+            elif np.all(real_parts > tol_eig):
+                # Alle Eigenwerte positiv -> Quelle
+                eq_type = "unstable"
+                color = "red"
+            else:
+                # Nahe Null (Marginal stabil oder Zentrum)
+                eq_type = "marginal/center"
+                color = "blue"
+
+        return {
+            "x_eq": x_eq,
+            "J": J,
+            "eigvals": eigvals,
+            "trace": tr,
+            "det": det,
+            "type": eq_type,
+            "color": color
+        }
+
+
+    def classify_equilibria(self, equilibria, tol_eig=1e-6):
+
+        equilibria = np.asarray(equilibria, dtype=float)
+        if equilibria.ndim == 1:
+            equilibria = equilibria[None, :]
+
+        results = []
+
+        for k, x_eq in enumerate(equilibria, start=1):
+            info = self.classify_single_equilibrium(x_eq, tol_eig=tol_eig)
+            results.append(info)
+
+        return results

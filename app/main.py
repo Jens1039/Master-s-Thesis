@@ -17,7 +17,7 @@ from nondimensionalization import *
 from find_equilbrium_points import *
 
 
-def auto_start_mpi(n_procs=10):
+def auto_start_mpi(n_procs=5):
 
     is_mpi = "OMPI_COMM_WORLD_RANK" in os.environ or "PMI_RANK" in os.environ
 
@@ -49,7 +49,7 @@ if __name__ == "__main__":
     if comm.rank == 0:
         print("Rank 0: Calculating 2D Background Flow...")
 
-        R_hat, H_hat, W_hat, L_c, U_c, Re = first_nondimensionalisation(R, H, W, Q, rho, mu, print_values=False)
+        R_hat, H_hat, W_hat, L_c, U_c, Re = first_nondimensionalisation(R, H, W, Q, rho, mu, print_values=True)
 
 
         bg = background_flow(R_hat, H_hat, W_hat, Re, comm=MPI.COMM_SELF)
@@ -77,4 +77,6 @@ if __name__ == "__main__":
 
     if comm.rank == 0:
         r_vals, z_vals, phi, Fr_grid, Fz_grid = grid_values
-        force_grid.plot_paper_reproduction(L_c_p, L_c)
+        # force_grid.plot_paper_reproduction(L_c_p, L_c)
+        initial_guesses = force_grid.generate_initial_guesses()
+        force_grid.plot_paper_reproduction(L_c_p, L_c, initial_guesses)

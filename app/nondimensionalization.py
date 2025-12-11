@@ -31,6 +31,7 @@ def second_nondimensionalisation(R_hat, H_hat, W_hat, a, L_c, U_c, G_hat, Re, u_
     L_c_p = a
 
     # characteristic velocity is the maximal axial velocity with a length correction (analogous to the paper)
+    # U_m = (U_m_hat * U_c)
     U_c_p = (U_m_hat * U_c) * (L_c_p / L_c)
 
     # Rescale Scalar Geometry Parameters
@@ -38,12 +39,14 @@ def second_nondimensionalisation(R_hat, H_hat, W_hat, a, L_c, U_c, G_hat, Re, u_
     H_hat_hat = H_hat * (L_c/L_c_p)
     W_hat_hat = W_hat * (L_c/L_c_p)
     a_hat_hat = a * (1.0 / L_c_p)
-    G_hat_hat = (L_c/L_c_p) * (U_c_p/U_c) * G_hat
+    G_hat_hat = G_hat * ((U_c / U_c_p)**2) * (L_c_p / L_c)
 
     mesh2d = u_bar_2d_hat.function_space().mesh()
     mesh2d.coordinates.dat.data[:] *= (L_c/L_c_p)
+
     u_bar_2d_hat.dat.data[:] *= (U_c/U_c_p)
     p_bar_2d_hat.dat.data[:] *= ((U_c/U_c_p)**2)
+
     u_bar_2d_hat_hat = u_bar_2d_hat
     p_bar_2d_hat_hat = p_bar_2d_hat
 
