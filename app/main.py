@@ -17,7 +17,7 @@ from nondimensionalization import *
 from find_equilbrium_points import *
 
 
-def auto_start_mpi(n_procs=5):
+def auto_start_mpi(n_procs=4):
 
     is_mpi = "OMPI_COMM_WORLD_RANK" in os.environ or "PMI_RANK" in os.environ
 
@@ -51,13 +51,13 @@ if __name__ == "__main__":
 
         R_hat, H_hat, W_hat, L_c, U_c, Re = first_nondimensionalisation(R, H, W, Q, rho, mu, print_values=True)
 
+        a = a/H
 
         bg = background_flow(R_hat, H_hat, W_hat, Re, comm=MPI.COMM_SELF)
         u_bar_2d_hat, p_bar_2d_hat, G_hat, U_m_hat = bg.solve_2D_background_flow()
         # bg.plot_2D_background_flow()
 
-        R_hat_hat, H_hat_hat, W_hat_hat, a_hat_hat, L_c_p, U_c_p, u_bar_2d_hat_hat, p_bar_2d_hat_hat, G_hat_hat, Re_p \
-            = second_nondimensionalisation(R_hat, H_hat, W_hat,  a, L_c, U_c, G_hat, Re, u_bar_2d_hat, p_bar_2d_hat, U_m_hat, print_values=False)
+        R_hat_hat, H_hat_hat, W_hat_hat, a_hat_hat, u_bar_2d_hat_hat, p_bar_2d_hat_hat, G_hat_hat, Re_p = R_hat, H_hat, W_hat, a, u_bar_2d_hat, p_bar_2d_hat, G_hat, Re*((a/H_hat)**2)*U_m_hat
 
         u_bar_2d_hat_hat_np = u_bar_2d_hat_hat.dat.data_ro.copy()
         p_bar_2d_hat_hat_np = p_bar_2d_hat_hat.dat.data_ro.copy()
@@ -77,6 +77,12 @@ if __name__ == "__main__":
 
     if comm.rank == 0:
         r_vals, z_vals, phi, Fr_grid, Fz_grid = grid_values
-        # force_grid.plot_paper_reproduction(L_c_p, L_c)
         initial_guesses = force_grid.generate_initial_guesses()
-        force_grid.plot_paper_reproduction(L_c_p, L_c, initial_guesses)
+        # force_grid.plot_paper_reproduction(1, 1, initial_guesses=initial_guesses)
+
+        F_p_roots = F_p_roots(R_hat_hat, W_hat_hat, H_hat_hat, G_hat_hat, 4*max(H, W), a, u_bar=u_bar_2d_hat_hat_np, p_bar=p_bar_2d_hat_hat_np,
+                          particle_maxh=0.2*a_hat_hat, global_maxh=0.2*min(H_hat_hat, W_hat_hat), Re=Re, Re_p=Re*((a/H_hat_hat)**2), eps=0.2*a_hat_hat)
+
+        equilibria = initial_guesses
+        classified_equilibria = F_p_roots.classify_equilibria(equilibria)
+        force_grid.plot_paper_reproduction(1, 1, classified_equilibria=classified_equilibria)

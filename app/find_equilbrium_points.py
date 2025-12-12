@@ -27,13 +27,18 @@ class F_p_grid:
         self.global_maxh = global_maxh
         self.eps = eps
 
-        self.r_min = -W / 2 + 1.0 + eps
-        self.r_max = W / 2 - 1.0 - eps
-        self.z_min = -H / 2 + 1.0 + eps
-        self.z_max = H / 2 - 1.0 - eps
+        self.r_min = -W / 2 + a + eps
+        self.r_max = W / 2 - a - eps
+        self.z_min = -H / 2 + a + eps
+        self.z_max = H / 2 - a - eps
 
         self.mesh_nx = 120
         self.mesh_ny = 120
+
+        self._current_mesh = None
+        self._original_coords = None
+        self._current_r = None
+        self._current_z = None
 
 
     def compute_F_p_grid_ensemble(self, N_r, N_z, u_bg_data_np, p_bg_data_np):
@@ -166,14 +171,14 @@ class F_p_grid:
         return initial_guesses
 
 
-    def plot_paper_reproduction(self, L_c_p, L_c, initial_guesses=None):
+    def plot_paper_reproduction(self, L_c_p, L_c, initial_guesses=None, classified_equilibria=None):
 
         # np.meshgrid takes in 2 (or more 1d arrays, which define the coordinates along the axis)
         # It returns two matrices which have the x coordinates in every row and the y coordinates in every column
         # indexing="xy" (Cartesian Indexing) means that the first argument defines the numbers on the horizontal axis and the second on the vertical axis
         R_grid, Z_grid = np.meshgrid(self.r_vals, self.z_vals, indexing='ij')
 
-        exclusion_dist = 1.0 + self.eps
+        exclusion_dist = self.a + self.eps
 
         # This creates the "canvas" (Leinwand) for the plot
         fig, ax = plt.subplots(figsize=(8, 6))
@@ -215,7 +220,25 @@ class F_p_grid:
                 ax.scatter(guesses[0], guesses[1], c='red', marker='x', s=100, linewidths=2, label='Initial Guess', zorder=20)
             elif guesses.ndim == 2:
                 ax.scatter(guesses[:, 0], guesses[:, 1], c='red', marker='x', s=100, linewidths=2, label='Initial Guesses', zorder=20)
-            ax.legend(loc='upper right', framealpha=1.0)
+
+
+        if classified_equilibria is not None:
+
+            plotted_types = set()
+
+            for eq in classified_equilibria:
+                r_eq, z_eq = eq["x_eq"]
+                color = eq["color"]
+                eq_type = eq["type"]
+
+                label = None
+                if eq_type not in plotted_types:
+                    label = f"Equilibrium ({eq_type})"
+                    plotted_types.add(eq_type)
+
+                ax.scatter(r_eq, z_eq, c=color, marker='o', s=150, edgecolors='black', linewidths=1.5, label=label, zorder=30)
+
+        ax.legend(loc='upper right', framealpha=1.0, fontsize='small')
 
         margin = self.eps
         ax.set_xlim(-self.W / 2 - margin, self.W / 2 + margin)
@@ -235,19 +258,209 @@ class F_p_grid:
         plt.show()
 
 
+
+class F_p_roots:
+
+    def __init__(self, R, W, H, G, L, a, particle_maxh, global_maxh, Re, Re_p, u_bar, p_bar, eps):
+        self.R, self.W, self.H, self.L = R, W, H, L
+        self.a, self.particle_maxh, self.global_maxh = a, particle_maxh, global_maxh
+        self.Re, self.Re_p = Re, Re_p
+        self.u_bar, self.p_bar = u_bar, p_bar
+        self.G = G
+
+        self.eps = eps
+
+        self.r_min = -0.5 * self.W + self.a + self.eps
+        self.r_max = 0.5 * self.W - self.a - self.eps
+        self.z_min = -0.5 * self.H + self.a + self.eps
+        self.z_max = 0.5 * self.H - self.a - self.eps
+
+        self.mesh2d_static = RectangleMesh(120, 120, self.W, self.H, quadrilateral=False, comm=COMM_SELF)
+
+        V_2d = VectorFunctionSpace(self.mesh2d_static, "CG", 2, dim=3)
+        Q_2d = FunctionSpace(self.mesh2d_static, "CG", 1)
+
+        self.u_2d_func = Function(V_2d)
+        self.p_2d_func = Function(Q_2d)
+
+        self.u_2d_func.dat.data[:] = u_bar
+        self.p_2d_func.dat.data[:] = p_bar
+
+        self._current_mesh = None
+        self._current_tags = None
+        self._current_r = None
+        self._current_z = None
+        self._original_coords = None
+
+
     @staticmethod
-    def approx_jacobian():
-        pass
+    def move_mesh_elasticity(mesh, tags, displacement_vector, verbose=False):
+
+        V_disp = VectorFunctionSpace(mesh, "CG", 1)
+
+        u = TrialFunction(V_disp)
+        v = TestFunction(V_disp)
+
+        x = SpatialCoordinate(mesh)
+        cx, cy, cz = tags["particle_center"]
+        r_dist = sqrt((x[0] - cx) ** 2 + (x[1] - cy) ** 2 + (x[2] - cz) ** 2)
+
+        stiff = 1.0 / (r_dist ** 2 + 0.01)
+
+        mu = Constant(1.0) * stiff
+        lmbda = Constant(1.0) * stiff
+
+        def epsilon(u):
+            return 0.5 * (grad(u) + grad(u).T)
+
+        def sigma(u):
+            return lmbda * div(u) * Identity(3) + 2 * mu * epsilon(u)
+
+        a = inner(sigma(u), epsilon(v)) * dx
+        L = inner(Constant((0, 0, 0)), v) * dx
+
+        bc_walls = DirichletBC(V_disp, Constant((0., 0., 0.)), tags["walls"])
+        bc_in = DirichletBC(V_disp, Constant((0., 0., 0.)), tags["inlet"])
+        bc_out = DirichletBC(V_disp, Constant((0., 0., 0.)), tags["outlet"])
+
+        disp_const = Constant(displacement_vector)
+        bc_part = DirichletBC(V_disp, disp_const, tags["particle"])
+
+        bcs = [bc_walls, bc_in, bc_out, bc_part]
+
+        displacement_sol = Function(V_disp)
+        solve(a == L, displacement_sol, bcs=bcs,
+              solver_parameters={'ksp_type': 'preonly', 'pc_type': 'lu', "pc_factor_mat_solver_type": "mumps"})
+
+        V_coords = mesh.coordinates.function_space()
+
+        displacement_high_order = Function(V_coords)
+
+        displacement_high_order.interpolate(displacement_sol)
+
+        mesh.coordinates.assign(mesh.coordinates + displacement_high_order)
+
+        return displacement_sol
+
+    @staticmethod
+    def approx_jacobian(F, x, Fx=None, eps_rel=1e-3, eps_abs=1e-4, r_min=None, r_max=None, z_min=None, z_max=None):
+
+        x = np.asarray(x, float)
+
+        if Fx is None:
+            Fx = F(x)
+
+        clamp = not (r_min is None or r_max is None or z_min is None or z_max is None)
+        J = np.zeros((2, 2), float)
+
+        for i in range(2):
+            h = max(eps_rel * (1.0 + abs(x[i])), eps_abs)
+
+            dx = np.zeros(2)
+            dx[i] = h
+
+            xp = x + dx
+            xm = x - dx
+
+            if clamp:
+                xp[0] = np.clip(xp[0], r_min, r_max)
+                xp[1] = np.clip(xp[1], z_min, z_max)
+                xm[0] = np.clip(xm[0], r_min, r_max)
+                xm[1] = np.clip(xm[1], z_min, z_max)
+
+            fp = F(xp)
+            fm = F(xm)
+
+            denom = xp[i] - xm[i]
+            if abs(denom) < 1e-14:
+                denom = h
+                fp = F(x + dx)
+                J[:, i] = (fp - Fx) / denom
+            else:
+                J[:, i] = (fp - fm) / denom
+
+        return J
 
 
-    def classify_single_equilibrium(self, x_eq, eps_rel=1e-4, tol_eig=1e-6):
+    def _get_mesh_at(self, r, z):
+
+        if self._current_mesh is None:
+            if self._check_inside_box(r, z):
+                print(f"Generating BASE mesh at r={r:.4f}, z={z:.4f}")
+                mesh, tags = make_curved_channel_section_with_spherical_hole(
+                    self.R, self.H, self.W, self.L, self.a,
+                    self.particle_maxh, self.global_maxh,
+                    r_off=r, z_off=z
+                )
+                self._current_mesh = mesh
+                self._current_tags = tags
+                self._current_r = r
+                self._current_z = z
+
+                self._original_coords = Function(mesh.coordinates)
+                return mesh, tags
+            else:
+                raise ValueError("Initial guess outside box")
+
+        self._current_mesh.coordinates.assign(self._original_coords)
+
+        dr = r - self._current_r
+        dz = z - self._current_z
+
+        dist = sqrt(dr ** 2 + dz ** 2)
+        if dist > 2.0 * self.a:
+            print(f"Deformation too large ({dist:.3f} > {2 * self.a:.3f}). Remeshing base...")
+            self._current_mesh = None
+            return self._get_mesh_at(r, z)
+
+        theta_p = (self.L / self.R) * 0.5
+
+        dx = dr * cos(theta_p)
+        dy = dr * sin(theta_p)
+        dz_disp = dz
+
+        disp_vec = [dx, dy, dz_disp]
+
+        self.move_mesh_elasticity(self._current_mesh, self._current_tags, disp_vec)
+
+        return self._current_mesh, self._current_tags
+
+
+    def evaluate_F(self, x):
+        r, z = float(x[0]), float(x[1])
+
+        if not self._check_inside_box(r, z):
+            raise ValueError(f"Out of bounds: {r}, {z}")
+
+        mesh3d, tags = self._get_mesh_at(r, z)
+
+
+
+        u_3d, p_3d = build_3d_background_flow(self.R, self.H, self.W, self.G,
+                                                  mesh3d, self.u_2d_func, self.p_2d_func)
+
+
+        pf = perturbed_flow(self.R, self.H, self.W, self.a, self.Re_p, mesh3d, tags, u_3d, p_3d)
+
+        Fr, Fz = pf.F_p()
+
+        return np.array([Fr, Fz], dtype=float)
+
+
+    def _check_inside_box(self, r, z):
+        return (self.r_min <= r <= self.r_max) and (self.z_min <= z <= self.z_max)
+
+
+    def classify_single_equilibrium(self, x_eq, eps_rel=1e-2, eps_abs=1e-3, ode_sign=-1.0, tol_eig=1e-6):
 
         x_eq = np.asarray(x_eq, dtype=float)
 
-        def F_func(x):
-            return np.asarray(self.evaluate_F(x), dtype=float)
+        def G(x):
+            F = np.asarray(self.evaluate_F(x), dtype=float)
+            return ode_sign * F
 
-        J = self.approx_jacobian(F_func, x_eq, eps_rel=eps_rel)
+        Gx = G(x_eq)
+        J = self.approx_jacobian(G, x_eq, Fx=Gx, eps_rel=eps_rel, eps_abs=eps_abs)
 
         eigvals, eigvecs = np.linalg.eig(J)
         real_parts = eigvals.real
@@ -256,26 +469,16 @@ class F_p_grid:
         det = np.linalg.det(J)
 
         if np.any(np.isnan(real_parts)):
-            eq_type = "unclear (NaN)"
-            color = "gray"
+            eq_type = "unclear (NaN in eigenvalues)"
         else:
-            # Toleranz prüfen, um numerisches Rauschen um 0 nicht falsch zu deuten
             if real_parts[0] * real_parts[1] < -tol_eig ** 2:
-                # Ein positiver, ein negativer Eigenwert
                 eq_type = "saddle"
-                color = "orange"  # oder yellow
             elif np.all(real_parts < -tol_eig):
-                # Alle Eigenwerte negativ -> Senke
                 eq_type = "stable"
-                color = "green"
             elif np.all(real_parts > tol_eig):
-                # Alle Eigenwerte positiv -> Quelle
                 eq_type = "unstable"
-                color = "red"
             else:
-                # Nahe Null (Marginal stabil oder Zentrum)
-                eq_type = "marginal/center"
-                color = "blue"
+                eq_type = "unclear"
 
         return {
             "x_eq": x_eq,
@@ -284,20 +487,43 @@ class F_p_grid:
             "trace": tr,
             "det": det,
             "type": eq_type,
-            "color": color
         }
 
 
-    def classify_equilibria(self, equilibria, tol_eig=1e-6):
+    def classify_equilibria(self, equilibria, ode_sign=-1.0, tol_eig=1e-6, eps_rel=1e-2, eps_abs=1e-3, verbose=True):
 
         equilibria = np.asarray(equilibria, dtype=float)
         if equilibria.ndim == 1:
             equilibria = equilibria[None, :]
 
-        results = []
+        classified_equilibria = []
 
         for k, x_eq in enumerate(equilibria, start=1):
-            info = self.classify_single_equilibrium(x_eq, tol_eig=tol_eig)
-            results.append(info)
 
-        return results
+            self._current_mesh = None
+            self._current_r = None
+            self._current_z = None
+
+            info = self.classify_single_equilibrium(x_eq, ode_sign=ode_sign, tol_eig=tol_eig,
+                                                    eps_rel=eps_rel, eps_abs=eps_abs)
+
+            if info["type"] == "stable":
+                info["color"] = "green"
+            elif info["type"] == "unstable":
+                info["color"] = "red"
+            elif info["type"] == "saddle":
+                info["color"] = "yellow"
+            else:
+                info["color"] = "gray"
+
+            classified_equilibria.append(info)
+
+            if verbose:
+                ev = info["eigvals"]
+                print(f"EQ #{k}: x_eq = ({x_eq[0]:.6f}, {x_eq[1]:.6f})")
+                print(f"        eigenvalues(J_dyn): "
+                      f"{ev[0].real:+.3e}{ev[0].imag:+.3e}i, "
+                      f"{ev[1].real:+.3e}{ev[1].imag:+.3e}i")
+                print(f"        Typ: {info['type']}\n")
+
+        return classified_equilibria
