@@ -5,8 +5,9 @@ from netgen.occ import *
 
 def make_curved_channel_section_with_spherical_hole(R, H, W, L, a, particle_maxh, global_maxh, r_off=0.0, z_off=0.0, order=3, comm=COMM_SELF):
 
-    # SECURE_a = 0.025 for second_nondimensionalisation
-    SECURE_a = 1 # for first_nondimensionalisation
+    # We need to scale down the coordinates, since Netgen struggles with very large coordinates.
+    SECURE_a = 0.025 # for second_nondimensionalisation
+    # SECURE_a = 1 # for first_nondimensionalisation
 
     _R = R * SECURE_a
     _H = H * SECURE_a

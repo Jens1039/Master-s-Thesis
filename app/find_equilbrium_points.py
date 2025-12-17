@@ -2,7 +2,7 @@ from tqdm import tqdm
 import matplotlib.patches as patches
 from scipy.interpolate import RectBivariateSpline
 from scipy.optimize import root
-
+import numpy as np
 
 from background_flow import *
 from build_3d_geometry import *
@@ -145,12 +145,9 @@ class F_p_grid:
 
                 # returns a boolean expression depending on the success of the root search
                 if solution.success:
-                    # solution.x stores the solution coordinates r and z while "solution" stores all the information
-                    # about the executed solution attempt
                     r_sol, z_sol = solution.x
 
                     if not (self.r_min <= r_sol <= self.r_max and self.z_min <= z_sol <= self.z_max):
-                        # The remainder of this iteration is skipped and we go right into the next iteration
                         continue
 
                     if np.linalg.norm(_interpolated_coarse_grid((r_sol, z_sol))) > tol_residual:
@@ -171,25 +168,57 @@ class F_p_grid:
         return initial_guesses
 
 
-    def plot_paper_reproduction(self, L_c_p, L_c, initial_guesses=None, classified_equilibria=None):
+    def classify_equilibria_on_grid(self, equilibria):
 
-        # np.meshgrid takes in 2 (or more 1d arrays, which define the coordinates along the axis)
-        # It returns two matrices which have the x coordinates in every row and the y coordinates in every column
-        # indexing="xy" (Cartesian Indexing) means that the first argument defines the numbers on the horizontal axis and the second on the vertical axis
+        classified_equilibria = []
+
+        for k, x_eq in enumerate(equilibria, start=1):
+            r, z = x_eq[0], x_eq[1]
+
+            dFr_dr = self.interp_Fr(r, z, dx=1, dy=0)[0, 0]
+            dFr_dz = self.interp_Fr(r, z, dx=0, dy=1)[0, 0]
+            dFz_dr = self.interp_Fz(r, z, dx=1, dy=0)[0, 0]
+            dFz_dz = self.interp_Fz(r, z, dx=0, dy=1)[0, 0]
+
+            J = np.array([
+                [dFr_dr, dFr_dz],
+                [dFz_dr, dFz_dz]
+            ])
+
+            eigvals, eigvecs = np.linalg.eig(J)
+            real_parts = eigvals.real
+
+            if real_parts[0] * real_parts[1] < 0:
+                eq_type = "saddle"
+                color = "yellow"
+            elif np.all(real_parts < 0):
+                eq_type = "stable"
+                color = "green"
+            elif np.all(real_parts > 0):
+                eq_type = "unstable"
+                color = "red"
+
+            info = {
+                "x_eq": x_eq,
+                "type": eq_type,
+                "color": color
+            }
+
+            classified_equilibria.append(info)
+
+        return classified_equilibria
+
+
+    def plot(self, L_c_p, L_c, initial_guesses=None, classified_equilibria=None):
+
         R_grid, Z_grid = np.meshgrid(self.r_vals, self.z_vals, indexing='ij')
 
         exclusion_dist = self.a + self.eps
 
-        # This creates the "canvas" (Leinwand) for the plot
         fig, ax = plt.subplots(figsize=(8, 6))
 
-        # Since phi = np.sqrt(Fr_grid ** 2 + Fz_grid ** 2) this returns the force magnitude to colour the plot later
-        # np.linespace produces num equdistant values between the first and second argument
-        # The default would be to choose nice round numbers for the colour transition values, which leads to the max and min being shifted
         levels = np.linspace(np.nanmin(self.phi), np.nanmax(self.phi), 40)
 
-        # ax.contourf takes in the R_grid and Z_grid (matrices from above) and plots the function phi on theese gridpoints levels
-        # It also uses cartesian indexing
         cs = ax.contourf(R_grid, Z_grid, self.phi, levels=levels, cmap="viridis", alpha=1)
 
         cbar = plt.colorbar(cs, ax=ax, fraction=0.046, pad=0.04)
@@ -247,19 +276,20 @@ class F_p_grid:
         ax.set_xlabel("r")
         ax.set_ylabel("z")
 
+        # Just for visualisation purposes
         a = (L_c_p/L_c) * self.a * 2
         R = (L_c_p/L_c) * self.R * 2
 
         ax.set_title(f"Force_Map_a={a:.3f}_R={R:.1f}_with_H=W=2")
         plt.tight_layout()
-        filename = f"cache/Force_Map_a={a:.3f}_R={R:.1f}.png"
+        filename = f"images/Force_Map_a={a:.3f}_R={R:.1f}.png"
         plt.savefig(filename)
         print(f"Plot saved to {filename}")
         plt.show()
 
 
 
-class F_p_roots:
+class F_p_exact_roots:
 
     def __init__(self, R, W, H, G, L, a, particle_maxh, global_maxh, Re, Re_p, u_bar, p_bar, eps):
         self.R, self.W, self.H, self.L = R, W, H, L
@@ -294,24 +324,29 @@ class F_p_roots:
 
 
     @staticmethod
-    def move_mesh_elasticity(mesh, tags, displacement_vector, verbose=False):
+    def move_mesh_elasticity(mesh3d, tags, displacement_vector):
 
-        V_disp = VectorFunctionSpace(mesh, "CG", 1)
-
+        # We set up a new function space to solve the elasticity equation for the mesh deformation function u
+        V_disp = VectorFunctionSpace(mesh3d, "CG", 1)
         u = TrialFunction(V_disp)
         v = TestFunction(V_disp)
 
-        x = SpatialCoordinate(mesh)
+        x = SpatialCoordinate(mesh3d)
         cx, cy, cz = tags["particle_center"]
         r_dist = sqrt((x[0] - cx) ** 2 + (x[1] - cy) ** 2 + (x[2] - cz) ** 2)
 
-        stiff = 1.0 / (r_dist ** 2 + 0.01)
+        stiffness = 1.0 / (r_dist ** 2 + 0.02)
 
-        mu = Constant(1.0) * stiff
-        lmbda = Constant(1.0) * stiff
+        mu = Constant(1.0) * stiffness
+        lmbda = Constant(1.0) * stiffness
 
-        def epsilon(u):
-            return 0.5 * (grad(u) + grad(u).T)
+        # We want to view the mesh as if the edges would be made of rubber or as if they would be springs
+        # Therefore they obey Hooks Law div(sigma) = 0
+        # In the weak formulation we have grad(v) = 0.5 * (grad(v) + grad(v).T) + 0.5 * (grad(v) - grad(v).T)
+        # Since (sigma : (grad(v) - grad(v).T)) = 0 always, we can eleviate this term.
+
+        def epsilon(v):
+            return 0.5 * (grad(v) + grad(v).T)
 
         def sigma(u):
             return lmbda * div(u) * Identity(3) + 2 * mu * epsilon(u)
@@ -319,26 +354,32 @@ class F_p_roots:
         a = inner(sigma(u), epsilon(v)) * dx
         L = inner(Constant((0, 0, 0)), v) * dx
 
-        bc_walls = DirichletBC(V_disp, Constant((0., 0., 0.)), tags["walls"])
-        bc_in = DirichletBC(V_disp, Constant((0., 0., 0.)), tags["inlet"])
-        bc_out = DirichletBC(V_disp, Constant((0., 0., 0.)), tags["outlet"])
+        bcs_walls = DirichletBC(V_disp, Constant((0., 0., 0.)), tags["walls"])
+        bcs_in = DirichletBC(V_disp, Constant((0., 0., 0.)), tags["inlet"])
+        bcs_out = DirichletBC(V_disp, Constant((0., 0., 0.)), tags["outlet"])
 
         disp_const = Constant(displacement_vector)
         bc_part = DirichletBC(V_disp, disp_const, tags["particle"])
 
-        bcs = [bc_walls, bc_in, bc_out, bc_part]
+        bcs = [bcs_walls, bcs_in, bcs_out, bc_part]
 
         displacement_sol = Function(V_disp)
         solve(a == L, displacement_sol, bcs=bcs,
-              solver_parameters={'ksp_type': 'preonly', 'pc_type': 'lu', "pc_factor_mat_solver_type": "mumps"})
+              solver_parameters=
+              {
+                  "ksp_type": "preonly",
+                  "pc_type": "lu",
+                  "pc_factor_mat_solver_type": "mumps"
+              }
+            )
 
-        V_coords = mesh.coordinates.function_space()
+        V_coords = mesh3d.coordinates.function_space()
 
         displacement_high_order = Function(V_coords)
 
         displacement_high_order.interpolate(displacement_sol)
 
-        mesh.coordinates.assign(mesh.coordinates + displacement_high_order)
+        mesh3d.coordinates.assign(mesh3d.coordinates + displacement_high_order)
 
         return displacement_sol
 
@@ -451,7 +492,7 @@ class F_p_roots:
         return (self.r_min <= r <= self.r_max) and (self.z_min <= z <= self.z_max)
 
 
-    def classify_single_equilibrium(self, x_eq, eps_rel=1e-2, eps_abs=1e-3, ode_sign=-1.0, tol_eig=1e-6):
+    def classify_single_equilibrium(self, x_eq, eps_rel=1e-2, eps_abs=1e-3, ode_sign=1.0, tol_eig=1e-6):
 
         x_eq = np.asarray(x_eq, dtype=float)
 
