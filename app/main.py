@@ -78,7 +78,7 @@ if __name__ == "__main__":
                           global_maxh=0.2*min(H_hat_hat, W_hat_hat),
                           eps=0.2*a_hat_hat)
 
-    grid_values = force_grid.compute_F_p_grid_ensemble(N_r=10, N_z=10, u_bg_data_np=u_data_np, p_bg_data_np=p_data_np)
+    grid_values = force_grid.compute_F_p_grid_ensemble(N_r=30, N_z=30, u_bg_data_np=u_data_np, p_bg_data_np=p_data_np)
 
     if rank == 0:
         print("Finished parallel force grid calculation. Finding and classifying equilibria and visualizing...")
