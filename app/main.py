@@ -5,7 +5,7 @@ import sys
 import warnings
 from mpi4py import MPI
 
-from config_paper_parameters import *
+from config_lab_parameters import *
 from nondimensionalization import *
 from find_equilbrium_points import *
 
@@ -22,6 +22,11 @@ def auto_start_mpi(n_procs=5):
         Restart the script using mpiexec if not already running under MPI.
         Convenience function for local execution.
     """
+    os.environ["PATH"] = "/opt/homebrew/bin:" + os.environ.get("PATH", "")
+    os.environ["MPICC"] = "/opt/homebrew/bin/mpicc"
+    os.environ["MPICXX"] = "/opt/homebrew/bin/mpicxx"
+    os.environ["CC"] = "/opt/homebrew/bin/mpicc"
+    os.environ["CXX"] = "/opt/homebrew/bin/mpicxx"
 
     is_mpi = "OMPI_COMM_WORLD_RANK" in os.environ or \
              "PMI_RANK" in os.environ or \
@@ -32,7 +37,7 @@ def auto_start_mpi(n_procs=5):
         cmd = ["mpiexec", "-n", str(n_procs), sys.executable, "-u"] + sys.argv
         print(f"Executing: {' '.join(cmd)}\n")
 
-        os.execvp("mpiexec", cmd)
+        os.execv("/opt/homebrew/bin/mpiexec", ["/opt/homebrew/bin/mpiexec"] + cmd[1:])
 
 
 if __name__ == "__main__":
@@ -46,14 +51,13 @@ if __name__ == "__main__":
     if rank == 0:
         print("Calculating 2D background flow...")
 
-        R_hat, H_hat, W_hat, L_c, U_c, Re = first_nondimensionalisation(R, H, W, Q, rho, mu)
+        R_hat, H_hat, W_hat, L_c, U_c, Re = first_nondimensionalisation(R, H, W, Q, rho, mu, print_values=True)
 
         bg = background_flow(R_hat, H_hat, W_hat, Re, comm=MPI.COMM_SELF)
         G_hat, U_m_hat, u_bar_2d_hat, p_bar_2d_hat = bg.solve_2D_background_flow()
-        bg.plot()
+        # bg.plot()
 
-        R_hat_hat, H_hat_hat, W_hat_hat, a_hat_hat, G_hat_hat, L_c_p, U_c_p, u_bar_2d_hat_hat, p_bar_2d_hat_hat, Re_p \
-            = second_nondimensionalisation(R_hat, H_hat, W_hat, a, L_c, U_c, G_hat, Re, u_bar_2d_hat, p_bar_2d_hat, U_m_hat)
+        R_hat_hat, H_hat_hat, W_hat_hat, a_hat_hat, G_hat_hat, L_c_p, U_c_p, u_bar_2d_hat_hat, p_bar_2d_hat_hat, Re_p = second_nondimensionalisation(R_hat, H_hat, W_hat, a, L_c, U_c, G_hat, Re, u_bar_2d_hat, p_bar_2d_hat, U_m_hat)
 
         # Extract raw arrays for MPI broadcast (avoids pickling issues with complex FEM objects)
         u_bar_2d_hat_hat_np = u_bar_2d_hat_hat.dat.data_ro.copy()
@@ -78,7 +82,7 @@ if __name__ == "__main__":
                           global_maxh=0.2*min(H_hat_hat, W_hat_hat),
                           eps=0.2*a_hat_hat)
 
-    grid_values = force_grid.compute_F_p_grid_ensemble(N_r=30, N_z=30, u_bg_data_np=u_data_np, p_bg_data_np=p_data_np)
+    grid_values = force_grid.compute_F_p_grid_ensemble(N_r=10, N_z=10, u_bg_data_np=u_data_np, p_bg_data_np=p_data_np)
 
     if rank == 0:
         print("Finished parallel force grid calculation. Finding and classifying equilibria and visualizing...")

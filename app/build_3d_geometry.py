@@ -3,11 +3,15 @@ from firedrake import Mesh, COMM_SELF
 from netgen.occ import *
 
 
-def make_curved_channel_section_with_spherical_hole(R, H, W, L, a, particle_maxh, global_maxh, r_off=0.0, z_off=0.0, order=3, comm=COMM_SELF):
+def make_curved_channel_section_with_spherical_hole(R, H, W, L, a, particle_maxh, global_maxh, scaling="second_nondimensionalisation", r_off=0.0, z_off=0.0, order=3, comm=COMM_SELF):
 
     # We need to scale down the coordinates, since Netgen struggles with very large coordinates.
-    SECURE_a = 0.025 # for second_nondimensionalisation
-    # SECURE_a = 1 # for first_nondimensionalisation
+    if scaling == "second_nondimensionalisation":
+        SECURE_a = 0.025
+    elif scaling == "first_nondimensionalisation":
+        SECURE_a = 1
+    else:
+        raise ValueError(f"Unknown scaling {scaling}")
 
     _R = R * SECURE_a
     _H = H * SECURE_a
@@ -29,7 +33,6 @@ def make_curved_channel_section_with_spherical_hole(R, H, W, L, a, particle_maxh
     wp = WorkPlane(Axes((p_0.x, p_0.y, p_0.z), n=Y, h=Z))
     rect_face = wp.RectangleC(_H, _W).Face()
     channel_section = Pipe(spine, rect_face)
-    channel_section.faces.name = "walls"
 
     cx = (_R + _r_off) * math.cos(theta * 0.5)
     cy = (_R + _r_off) * math.sin(theta * 0.5)
@@ -39,6 +42,8 @@ def make_curved_channel_section_with_spherical_hole(R, H, W, L, a, particle_maxh
     sphere_filled.faces.name = "particle"
 
     fluid = channel_section - sphere_filled
+
+    fluid.faces.name = "walls"
 
     fluid.faces.Nearest((p_0.x, p_0.y, p_0.z)).name = "inlet"
     fluid.faces.Nearest((p_1.x, p_1.y, p_1.z)).name = "outlet"
@@ -59,17 +64,17 @@ def make_curved_channel_section_with_spherical_hole(R, H, W, L, a, particle_maxh
 
     names = netgenmesh.GetRegionNames(codim=1)
 
-    def _id(name):
-        if name not in names:
+    def _ids(name):
+        ids = tuple(i + 1 for i, nm in enumerate(names) if nm == name)
+        if not ids:
             raise ValueError(f"{name} not found")
-        else:
-            return names.index(name) + 1
+        return ids
 
     tags = {
-        "walls": _id("walls"),
-        "inlet": _id("inlet"),
-        "outlet": _id("outlet"),
-        "particle": _id("particle"),
+        "walls": _ids("walls"),
+        "inlet": _ids("inlet")[0],
+        "outlet": _ids("outlet")[0],
+        "particle": _ids("particle")[0],
         "theta": theta,
         "particle_center": (cx, cy, cz),
     }

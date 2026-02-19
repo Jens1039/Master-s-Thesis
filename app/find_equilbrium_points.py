@@ -94,7 +94,7 @@ class F_p_grid:
 
             except Exception as e:
                 print(f"[Rank {global_rank}] Error at {i},{j}: {e}")
-                local_results.append((i, j, 0.0, 0.0))
+                local_results.append((i, j, np.nan, np.nan))
 
 
         all_data = COMM_WORLD.gather(local_results, root=0)
@@ -123,10 +123,24 @@ class F_p_grid:
             return None, None, None, None, None
 
 
-    def generate_initial_guesses(self, n_grid_search=50, tol_unique=1e-3, tol_residual=1e-5):
+    def generate_initial_guesses(self, n_grid_search=50, tol_unique=1e-4, tol_residual=1e-7):
 
         self.interp_Fr = RectBivariateSpline(self.r_vals, self.z_vals, self.Fr_grid)
         self.interp_Fz = RectBivariateSpline(self.r_vals, self.z_vals, self.Fz_grid)
+
+        def F(x):
+            r, z = x
+            return np.array([
+                self.interp_Fr(r, z)[0, 0],
+                self.interp_Fz(r, z)[0, 0]
+            ], dtype=float)
+
+        def J(x):
+            r, z = x
+            return np.array([
+                [self.interp_Fr(r, z, dx=1, dy=0)[0, 0], self.interp_Fr(r, z, dx=0, dy=1)[0, 0]],
+                [self.interp_Fz(r, z, dx=1, dy=0)[0, 0], self.interp_Fz(r, z, dx=0, dy=1)[0, 0]]
+            ], dtype=float)
 
         def _interpolated_coarse_grid(x):
             r, z = x
@@ -141,7 +155,7 @@ class F_p_grid:
             for z0 in z_starts:
 
                 # finds a root on the interpolated function. It uses a hybrid method between GD and newton and starts with (r0, z0).
-                solution = root(_interpolated_coarse_grid, [r0, z0], method='hybr')
+                solution = root(F, [r0, z0], jac=J, method="lm")
 
                 # returns a boolean expression depending on the success of the root search
                 if solution.success:
@@ -197,6 +211,9 @@ class F_p_grid:
             elif np.all(real_parts > 0):
                 eq_type = "unstable"
                 color = "red"
+            else:
+                eq_type = "unclassified"
+                color = "black"
 
             info = {
                 "x_eq": x_eq,
@@ -224,8 +241,14 @@ class F_p_grid:
         cbar = plt.colorbar(cs, ax=ax, fraction=0.046, pad=0.04)
         cbar.set_label(r"Force Magnitude $\|\mathbf{F}\|$")
 
-        ax.contour(R_grid, Z_grid, self.Fr_grid, levels=[0], colors="black", linestyles="-", linewidths=2)
-        ax.contour(R_grid, Z_grid, self.Fz_grid, levels=[0], colors="white", linestyles="-", linewidths=2)
+        rf = np.linspace(self.r_min, self.r_max, 400)
+        zf = np.linspace(self.z_min, self.z_max, 400)
+        Fr_f = self.interp_Fr(rf, zf)
+        Fz_f = self.interp_Fz(rf, zf)
+
+        Rf, Zf = np.meshgrid(rf, zf, indexing="ij")
+        ax.contour(Rf, Zf, Fr_f, levels=[0], colors="black", linewidths=2)
+        ax.contour(Rf, Zf, Fz_f, levels=[0], colors="white", linewidths=2)
 
         wall_rect = patches.Rectangle((-self.W / 2, -self.H / 2), self.W, self.H,
                                       linewidth=3, edgecolor='black', facecolor='none', zorder=10)
@@ -277,12 +300,14 @@ class F_p_grid:
         ax.set_ylabel("z")
 
         # Just for visualisation purposes
-        a = (L_c_p/L_c) * self.a * 2
-        R = (L_c_p/L_c) * self.R * 2
+        a = (L_c_p/L_c) * self.a
+        R = (L_c_p/L_c) * self.R
+        H = (L_c_p/L_c) * self.H
+        W = (L_c_p/L_c) * self.W
 
-        ax.set_title(f"Force_Map_a={a:.3f}_R={R:.1f}_with_H=W=2")
+        ax.set_title(f"Force_Map_a={a:.2f}_R={R:.0f}_W={W:.0f}_H={H:.0f}")
         plt.tight_layout()
-        filename = f"images/Force_Map_a={a:.3f}_R={R:.1f}.png"
+        filename = f"images/Force_Map_a={a:.2f}_R={R:.0f}_W={W:.0f}_H={H:.0f}.png"
         plt.savefig(filename)
         print(f"Plot saved to {filename}")
         plt.show()

@@ -3,28 +3,35 @@ import matplotlib.patches as patches
 from scipy.interpolate import RectBivariateSpline
 from scipy.optimize import root
 import numpy as np
+import matplotlib.pyplot as plt
 
-from background_flow import *
-from build_3d_geometry import *
-from perturbed_flow import *
+from InertialLiftCalculation_firedrake import *
+
+import os
+os.environ["OMP_NUM_THREADS"] = "1"
+
+import sys
+import warnings
+from mpi4py import MPI
+
+comm = MPI.COMM_WORLD
+size = comm.Get_size()
+rank = comm.Get_rank()
+
 
 
 
 
 class F_p_grid:
 
-    def __init__(self, R, H, W, a, G, Re_p, L, particle_maxh, global_maxh, eps):
+    def __init__(self, R, H, W, a, Re, L, eps):
 
         self.R = R
         self.H = H
         self.W = W
+        self.Re = Re
         self.a = a
-        self.G = G
-        self.Re_p = Re_p
         self.L = L
-
-        self.particle_maxh = particle_maxh
-        self.global_maxh = global_maxh
         self.eps = eps
 
         self.r_min = -W / 2 + a + eps
@@ -32,74 +39,97 @@ class F_p_grid:
         self.z_min = -H / 2 + a + eps
         self.z_max = H / 2 - a - eps
 
-        self.mesh_nx = 120
-        self.mesh_ny = 120
-
         self._current_mesh = None
         self._original_coords = None
         self._current_r = None
         self._current_z = None
 
 
-    def compute_F_p_grid_ensemble(self, N_r, N_z, u_bg_data_np, p_bg_data_np):
+    def compute_F_p_grid_ensemble(self, N_r, N_z, procs_per_ensemble=1):
+        """
+        Compute force grid using Firedrake's Ensemble parallelization.
+        
+        Parameters:
+        -----------
+        N_r : int
+            Number of grid points in r direction
+        N_z : int
+            Number of grid points in z direction
+        procs_per_ensemble : int
+            Number of MPI processes to use per ensemble member (per grid point calculation).
+            Default is 1 (each process computes different grid points sequentially).
+            If > 1, each grid point calculation will be parallelized across procs_per_ensemble processes.
+        """
 
-        ensemble = Ensemble(COMM_WORLD, 1)
-        my_comm = ensemble.comm
-
-        global_rank = COMM_WORLD.rank
-        global_size = COMM_WORLD.size
-
-        mesh2d_local = RectangleMesh(self.mesh_nx, self.mesh_ny, self.W, self.H, quadrilateral=False, comm=my_comm)
-
-        V_local = VectorFunctionSpace(mesh2d_local, "CG", 2, dim=3)
-        Q_local = FunctionSpace(mesh2d_local, "CG", 1)
-
-        u_bg_local = Function(V_local)
-        p_bg_local = Function(Q_local)
-
-        u_bg_local.dat.data[:] = u_bg_data_np
-        p_bg_local.dat.data[:] = p_bg_data_np
+        global_comm = COMM_WORLD
+        global_rank = global_comm.rank
+        global_size = global_comm.size
+        
+        # Create ensemble - each ensemble member uses procs_per_ensemble processes
+        ensemble = Ensemble(global_comm, procs_per_ensemble)
+        ensemble_comm = ensemble.ensemble_comm  # communicator between ensemble members
+        spatial_comm = ensemble.comm            # communicator within each ensemble member
+        
+        ensemble_rank = ensemble_comm.Get_rank() if ensemble_comm != MPI.COMM_NULL else 0
+        ensemble_size = ensemble_comm.Get_size() if ensemble_comm != MPI.COMM_NULL else 1
+        
+        spatial_rank = spatial_comm.Get_rank()
+        spatial_size = spatial_comm.Get_size()
 
         r_vals = np.linspace(self.r_min, self.r_max, N_r)
         z_vals = np.linspace(self.z_min, self.z_max, N_z)
 
+        # Create all tasks
         all_tasks = []
         for i in range(N_r):
             for j in range(N_z):
                 all_tasks.append((i, j, r_vals[i], z_vals[j]))
 
-        my_tasks = all_tasks[global_rank::global_size]
+        # Distribute tasks across ensemble members
+        my_tasks = all_tasks[ensemble_rank::ensemble_size]
         local_results = []
 
         if global_rank == 0:
-            print(f"Start ensemble grid: {len(all_tasks)} points on {global_size} cores.")
+            print(f"Start ensemble grid: {len(all_tasks)} points")
+            print(f"  Global MPI processes: {global_size}")
+            print(f"  Ensemble members: {ensemble_size}")
+            print(f"  Processes per member: {spatial_size}")
+            print(f"  Tasks per member: ~{len(all_tasks)//ensemble_size}")
 
-        for task in tqdm(my_tasks, disable=(global_rank != 0)):
+        # Each ensemble member computes its assigned tasks
+        for task in tqdm(my_tasks, disable=(spatial_rank != 0)):
             (i, j, r_loc, z_loc) = task
 
             try:
-                mesh3d, tags = make_curved_channel_section_with_spherical_hole(
-                    self.R, self.H, self.W, self.L, self.a,
-                    self.particle_maxh, self.global_maxh,
-                    r_off=r_loc, z_off=z_loc,
-                    comm=my_comm
+                # Call InertialLiftCalculation with the spatial communicator
+                # This allows parallel solves if procs_per_ensemble > 1
+                F_r, F_z = InertialLiftCalculation(
+                    R=self.R,
+                    H=self.H,
+                    W=self.W,
+                    Re=self.Re,
+                    DL=self.L,
+                    px=r_loc,
+                    pz=z_loc,
+                    py=0,
+                    pr=self.a,
+                    comm=spatial_comm
                 )
-
-                u_3d, p_3d = build_3d_background_flow(self.R, self.H, self.W, self.G, mesh3d, u_bg_local, p_bg_local)
-
-                pf = perturbed_flow(self.R, self.H, self.W, self.a, self.Re_p, mesh3d, tags, u_3d, p_3d)
-                F_r, F_z = pf.F_p()
 
                 local_results.append((i, j, F_r, F_z))
 
             except Exception as e:
-                print(f"[Rank {global_rank}] Error at {i},{j}: {e}")
+                if spatial_rank == 0:
+                    print(f"[Ensemble {ensemble_rank}] Error at {i},{j}: {e}")
                 local_results.append((i, j, 0.0, 0.0))
 
+        # Gather results from all ensemble members
+        if ensemble_comm != MPI.COMM_NULL:
+            all_data = ensemble_comm.gather(local_results, root=0)
+        else:
+            all_data = [local_results]
 
-        all_data = COMM_WORLD.gather(local_results, root=0)
-
-
+        # Process results on rank 0
         if global_rank == 0:
             Fr_grid = np.zeros((N_r, N_z))
             Fz_grid = np.zeros((N_r, N_z))
@@ -282,7 +312,61 @@ class F_p_grid:
 
         ax.set_title(f"Force_Map_a={a:.3f}_R={R:.1f}_with_H=W=2")
         plt.tight_layout()
+        
+        # Create Force_grids directory if it doesn't exist
+        os.makedirs("images", exist_ok=True)
+        
         filename = f"images/Force_Map_a={a:.3f}_R={R:.1f}.png"
         plt.savefig(filename)
         print(f"Plot saved to {filename}")
         plt.show()
+
+
+def auto_start_mpi(n_procs=5):
+    """
+        Restart the script using mpiexec if not already running under MPI.
+        Convenience function for local execution.
+    """
+
+    is_mpi = "OMPI_COMM_WORLD_RANK" in os.environ or \
+             "PMI_RANK" in os.environ or \
+             "SLURM_PROCID" in os.environ
+
+    if not is_mpi:
+
+        cmd = ["mpiexec", "-n", str(n_procs), sys.executable, "-u"] + sys.argv
+        print(f"Executing: {' '.join(cmd)}\n")
+
+        os.execvp("mpiexec", cmd)
+
+
+if __name__ == "__main__":
+
+    # Start with more processes for task parallelism
+    # procs_per_ensemble=1 means each process computes different grid points
+    # procs_per_ensemble=2 means grid points are computed in parallel using 2 processes each
+    auto_start_mpi(n_procs=7)
+
+    W = 2.0
+    H = 2.0
+    R = 160
+    Re = 1.0
+    DL = 8.0
+    px = 0.0
+    py = 0.0  # always 0.0
+    pz = 0.25
+    a = 0.05
+
+    Grid = F_p_grid(R, H, W, a, Re, DL, 0.5*a)
+
+    # Use procs_per_ensemble=1 for maximum task parallelism (default)
+    # Each of the 5 processes will compute different grid points sequentially
+    Grid.compute_F_p_grid_ensemble(7, 7, procs_per_ensemble=1)
+
+    # Only rank 0 has the grid data, so only rank 0 should proceed with analysis
+    if rank == 0:
+        equilibria = Grid.generate_initial_guesses()
+
+        Grid.classify_equilibria_on_grid(equilibria)
+
+        Grid.plot(a, H)

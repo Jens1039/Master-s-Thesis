@@ -1,0 +1,19 @@
+.venv
+Backup
+firedrake_env
+*.msh
+.idea/
+app/__pycache__
+notes
+cache
+.DS_Store
+*.npz
+images
+Brendans Code
+Brendans Code Port
+
+
+
+
+
+

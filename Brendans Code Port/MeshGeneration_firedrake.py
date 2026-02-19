@@ -3,17 +3,22 @@ import gmsh
 from firedrake import *
 
 from mpi4py import MPI
-MPI_rank = MPI.COMM_WORLD.rank
-MPI_size = MPI.COMM_WORLD.size
 
 
-def GenerateCurvedDuctParticleMesh(W, H, R, px, pz, pr, L, filename=None):
+def GenerateCurvedDuctParticleMesh(W, H, R, px, pz, pr, L, filename=None, comm=None):
     """Use gmsh to generate a curved rectanglular duct with a spherical particle removed.
     It is setup so the curve centre is (-R,0,0) and the central cross-section is
     in the x-z plane centred at the origin (i.e. flow is primarily along the y-axis
     through the central cross-section).
     A particle with radius pr centered in the plane y=0 is removed from the mesh.
     The mesh is finally converted to a dolfinx compatible mesh."""
+
+    # Use provided communicator or default to COMM_WORLD
+    if comm is None:
+        comm = MPI.COMM_WORLD
+    
+    MPI_rank = comm.Get_rank()
+    MPI_size = comm.Get_size()
 
     # Set some additional parameters describing the geometry and mesh resolution
     # py = 0.0
@@ -28,6 +33,7 @@ def GenerateCurvedDuctParticleMesh(W, H, R, px, pz, pr, L, filename=None):
     if MPI_rank == 0:
         # Initialise gmsh
         gmsh.initialize()
+        gmsh.option.setNumber("General.Terminal", 0)
         # meshsize settings
         gmsh.option.setNumber("Mesh.MeshSizeMax", meshsize)
         # Describe the cross-section
@@ -142,12 +148,12 @@ def GenerateCurvedDuctParticleMesh(W, H, R, px, pz, pr, L, filename=None):
             gmsh.option.setNumber("Mesh.MshFileVersion", 2.2)
             gmsh.write(filename)
         gmsh.finalize()
-        MPI.COMM_WORLD.Barrier()
-        mesh = Mesh(filename, comm=MPI.COMM_WORLD)
+        comm.Barrier()
+        mesh = Mesh(filename, comm=comm)
         plex = mesh.topology_dm
         cell_tags = plex.getLabel("Cell Sets")
         facet_tags = plex.getLabel("Face Sets")
-        MPI.COMM_WORLD.Barrier()
+        comm.Barrier()
         # Return
         return facet_markers, mesh, cell_tags, facet_tags
 

@@ -13,8 +13,8 @@ Microfluidics Laboratory in Heidelberg. They are categorized into two groups:
 '''
 
 # ---FIXED BIOLOGICAL PARAMETERS (ACTIVE VS INACTIVE T-CELLS)-----------
-a   = 8e-6                  # radius of the smaller cell [m]
-# a = 12e-6                 # radius of the larger cell [m]
+# a   = 8e-6                  # radius of the smaller cell [m]
+a = 12e-6                 # radius of the larger cell [m]
 rho = 998                   # density [kg/m^3]
 mu  = 10.02e-4              # dyn. viscosity [Pa·s]
 # ----------------------------------------------------------------------

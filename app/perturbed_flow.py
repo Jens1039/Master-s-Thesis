@@ -1,7 +1,9 @@
 import os
 os.environ["OMP_NUM_THREADS"] = "1"
+
 from firedrake import *
 import numpy as np
+import math
 
 
 
@@ -250,3 +252,140 @@ class perturbed_flow:
         F_p_z = np.dot(e_z_np, 1/self.Re_p * F_minus_1_s + F_0)
 
         return F_p_x, F_p_z
+
+
+
+if __name__ == "__main__":
+
+    from mpi4py import MPI
+
+    MPI_rank = MPI.COMM_WORLD.rank
+    MPI_size = MPI.COMM_WORLD.size
+
+    from build_3d_geometry import *
+    from background_flow import *
+
+    # Parameters
+    W = 2.0
+    H = 2.0
+    R = 160.0
+    Re = 1.0
+    DL = 8.0  # 12.0
+    px = 0.0
+    py = 0.0  # always 0.0
+    pz = 0.0
+    pr = 0.05
+    a = pr
+    L = DL
+
+    bg = background_flow(R, H, W, Re, comm=MPI.COMM_SELF)
+    G, _, u_bar_2d, p_bar_2d = bg.solve_2D_background_flow()
+
+    Re_p = Re * (a**2)
+
+    mesh3d, tags = make_curved_channel_section_with_spherical_hole(R, H, W, L, a, particle_maxh=0.2*a, global_maxh=0.2*H)
+    particle_marker = tags["particle"]
+
+    n = FacetNormal(mesh3d)
+    Xp = Constant(np.array(tags["particle_center"], dtype=PETSc.ScalarType))
+    Xc = SpatialCoordinate(mesh3d)
+
+    # Optionally, do various checks of the generated mesh geometry
+    if True:
+        # Check that the area of various tag surfaces is correct
+        for i in ["walls", "particle", "inlet", "outlet"]:
+            result = assemble(dot(n, n) * ds(tags[i]))
+            if MPI_size > 1:
+                result = MPI.COMM_WORLD.allreduce(result, MPI.SUM)
+            if MPI_rank == 0:
+                print("Calculated surface area of surface", i, "is:", result)
+        # Print the expected values for comparison
+        if MPI_rank == 0:
+            print("Expected inlet/outlet surface area:", W * H)
+            print("Expected side wall surface area approximately:", 2 * DL * (W + H))
+            print("Expected particle surface area:", 4 * np.pi * pr ** 2)
+
+    if True:
+        # Determine if the particle is placed correctly using surface integrals
+        c1 = assemble((Xc - Xp)[0] * ds(particle_marker)) / (4 * np.pi * pr ** 2)
+        c2 = assemble((Xc - Xp)[1] * ds(particle_marker)) / (4 * np.pi * pr ** 2)
+        c3 = assemble((Xc - Xp)[2] * ds(particle_marker)) / (4 * np.pi * pr ** 2)
+        if MPI_size > 1:
+            c1, c2, c3 = MPI.COMM_WORLD.allreduce(np.array([c1, c2, c3]), MPI.SUM)
+        if MPI_rank == 0:
+            print("Error in particle surface coordinate mean:", c1, c2, c3)
+
+    if False:
+        # Print the number of cells distributed to each MPI process
+        num_cells = mesh.topology.index_map(mesh.topology.dim).size_local
+        print("Number of cells on rank", MPI_rank, "is:", num_cells)
+
+    u_bar_3d, p_bar_3d = build_3d_background_flow(R, H, W, G, mesh3d, u_bar_2d, p_bar_2d)
+
+    pf = perturbed_flow(R, H, W, a, Re_p, mesh3d, tags, u_bar_3d, p_bar_3d)
+
+    alpha = 0.5 * L / R  # = (1/2)*L/R
+    ca, sa = math.cos(alpha), math.sin(alpha)
+
+    Q = np.array([[ca, -sa, 0.0],
+                  [sa, ca, 0.0],
+                  [0.0, 0.0, 1.0]], dtype=float)
+
+
+    def to_global_3(v3):
+        return Q.T @ np.asarray(v3, dtype=float)
+
+
+    ex_g_mesh = Constant((ca, sa, 0.0))
+    ey_g_mesh = Constant((-sa, ca, 0.0))
+    ez_g_mesh = Constant((0.0, 0.0, 1.0))
+
+
+    def drag_torque_fd(v, q, mesh, tags, x_p, quad_degree=None):
+        n = FacetNormal(mesh)
+        sigma = -q * Identity(3) + (grad(v) + grad(v).T)
+        traction = dot(sigma, -n)
+
+        if quad_degree is None:
+            dS = ds(tags["particle"])
+        else:
+            dS = ds(tags["particle"], degree=quad_degree)
+
+        F_mesh = np.array([float(assemble(traction[i] * dS)) for i in range(3)], dtype=float)
+
+        x = SpatialCoordinate(mesh)
+        moment_density = cross(x - x_p, traction)
+        T_mesh = np.array([float(assemble(moment_density[i] * dS)) for i in range(3)], dtype=float)
+
+        F_glob = to_global_3(F_mesh)
+        T_glob = to_global_3(T_mesh)
+        return np.concatenate([F_glob, T_glob])
+
+
+    motions = [
+        ("U_x", ex_g_mesh),
+        ("U_y", ey_g_mesh),
+        ("U_z", ez_g_mesh),
+        ("Omega_x", cross(ex_g_mesh, Xc - Xp)),
+        ("Omega_y", cross(ey_g_mesh, Xc - Xp)),
+        ("Omega_z", cross(ez_g_mesh, Xc - Xp)),
+        ("U_bg", pf.u_bar),
+    ]
+
+    results = {}
+    for label, bc_expr in motions:
+        v, q = pf.Stokes_solver_3d(bc_expr)
+
+        quad = 8 if label == "U_bg" else None
+
+        results[label] = drag_torque_fd(v, q, pf.mesh3d, pf.tags, pf.x_p, quad_degree=quad)
+
+    if pf.mesh3d.comm.rank == 0:
+        # Brendan-style lines
+        print("U_x coefficients:", *results["U_x"])
+        print("U_y coefficients:", *results["U_y"])
+        print("U_z coefficients:", *results["U_z"])
+        print("Omega_x coefficients:", *results["Omega_x"])
+        print("Omega_y coefficients:", *results["Omega_y"])
+        print("Omega_z coefficients:", *results["Omega_z"])
+        print("Background flow induced force/torque:", *results["U_bg"])

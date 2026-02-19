@@ -9,14 +9,19 @@ Re = 1
 
 
 
-def ComputeBackgroundFlow(W, H, R, Re = 1.0, nW = 32, nH = 32, scaling = "mean"):
+def ComputeBackgroundFlow(W, H, R, Re = 1.0, nW = 32, nH = 32, scaling = "mean", comm=None):
 
     assert scaling == "mean"
+    
+    # Use provided communicator or default to COMM_WORLD
+    if comm is None:
+        comm = MPI.COMM_WORLD
 
     mesh = RectangleMesh(
         nW, nH,
         W, H,
         quadrilateral=False,  # False -> Triangles
+        comm=comm
     )
 
     x = mesh.coordinates

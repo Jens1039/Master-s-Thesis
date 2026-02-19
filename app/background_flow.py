@@ -128,6 +128,7 @@ class background_flow:
         )
 
         solver.solve()
+
         u_bar, p_bar_tilde, G_sol = w.subfunctions
 
         # Extracts the value from the scalar firedrake function
@@ -268,3 +269,27 @@ def build_3d_background_flow(R, H, W, G, mesh3d, u_bar_2d, p_bar_2d):
 
     return u_3d, p_3d
 
+
+if __name__ == "__main__":
+
+    H = 240e-6
+    rho = 998
+    mu = 10.02e-4
+    a = 0.05 * (H / 2)
+    W = 1 * H
+    R = 160 * (H / 2)
+    Q = 2 * 2.40961923848e-10
+
+    from nondimensionalization import *
+
+    R_hat, H_hat, W_hat, L_c, U_c, Re = first_nondimensionalisation(R, H, W, Q, rho, mu, print_values=True)
+
+    bg = background_flow(R_hat, H_hat, W_hat, Re)
+    G_hat, U_m_hat, u_bar_2d_hat, p_bar_2d_hat = bg.solve_2D_background_flow()
+    bg.plot()
+
+    from build_3d_geometry import make_curved_channel_section_with_spherical_hole
+
+    mesh3d = make_curved_channel_section_with_spherical_hole(R_hat, H_hat, W_hat, L=8, a=0.05, particle_maxh=0.05*0.2, global_maxh=min(H_hat, W_hat)*0.02, scaling="first_nondimensionalisation")
+
+    build_3d_background_flow(R_hat, H_hat, W_hat, G_hat, mesh3d, u_bar_2d_hat, p_bar_2d_hat)
