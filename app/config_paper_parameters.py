@@ -16,10 +16,15 @@ mu  = 10.02e-4              # dyn. viscosity [Pa·s]
 
 # ---LENGTH RATIOS FROM THE PAPER-----------------------
 a = 0.05 * (H/2)            # radius of the cell/particle [m]
-W = 1*H                       # duct width  [m]
+W = 1*H                     # duct width  [m]
 R = 160 * (H/2)             # bend radius [m]
 # ------------------------------------------------------
 
 # ---VOLUMETRIC FLOW RATE (Chosen to match a low Reynolds number (According to the paper results hold up to Re = O(10)))
 Q = 2*2.40961923848e-10                   # volumetric flow rate [m^3/s]
+# ------------------------------------------------------
+
+
+# ---NUMERICAL PRECISION--------------------------------
+N_grid = 14
 # ------------------------------------------------------

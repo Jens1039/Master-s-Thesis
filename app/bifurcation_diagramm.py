@@ -7,6 +7,10 @@ import warnings
 import numpy as np
 import matplotlib.pyplot as plt
 from mpi4py import MPI
+try:
+    import plotly.graph_objects as go
+except ImportError:
+    go = None
 
 from config_paper_parameters import *
 from nondimensionalization import *
@@ -18,11 +22,10 @@ warnings.filterwarnings("ignore", message=".*import SLEPc.*", category=UserWarni
 comm = MPI.COMM_WORLD
 rank = comm.Get_rank()
 
+ALPHA_VALUES = np.round(np.arange(0.115, 0.117, 0.00025), 5)
 
-ALPHA_VALUES = np.round(np.arange(0.01, 0.151, 0.01), 2)
-
-RESULTS_FILE = "bifurcation_results.json"
-
+RESULTS_FILE = "images/bifurcation_results.json"
+PLOT_MODE = "3d"  # allowed: "3d", "2d_r", "2d_z"
 
 def auto_start_mpi(n_procs=5):
 
@@ -43,57 +46,163 @@ def auto_start_mpi(n_procs=5):
         os.execv("/opt/homebrew/bin/mpiexec", ["/opt/homebrew/bin/mpiexec"] + cmd[1:])
 
 
-def plot_bifurcation_diagram(data, output_file="Force_grids/bifurcation_diagram.png"):
+def plot_bifurcation_diagram(data, plot_mode="3d", save=True, show=True):
     """
-    Bifurcation diagram:
-      x-axis: relative particle size  a_hat = a / (H/2)
-      y-axis: equilibrium r-position  r_norm = r / (H/2)  (singly nondimensional)
-    r_norm lies in [-W_hat/2, W_hat/2]; for W = H this is [-1, 1].
+    Plotly bifurcation diagram with selectable projection:
+      - "3d":   x=a_hat, y=r_norm, z=z_norm
+      - "2d_r": x=a_hat, y=r_norm
+      - "2d_z": x=a_hat, y=z_norm
     """
+    valid_modes = {"3d", "2d_r", "2d_z"}
+    if plot_mode not in valid_modes:
+        raise ValueError(f"Unsupported plot_mode '{plot_mode}'. Allowed: {sorted(valid_modes)}")
+
+    if go is None:
+        raise ImportError("plotly is required for this plot. Install with: pip install plotly")
+
+    if len(data) == 0:
+        print("No bifurcation data available to plot.")
+        return
+
     type_styles = {
-        "stable":       {"marker": "o", "color": "green",  "label": "Stable equilibrium"},
-        "unstable":     {"marker": "o", "color": "red",    "label": "Unstable equilibrium"},
-        "saddle":       {"marker": "X", "color": "orange", "label": "Saddle point"},
-        "unclassified": {"marker": "s", "color": "gray",   "label": "Unclassified"},
+        "stable":       {"symbol": "circle", "color": "green",  "label": "Stable equilibrium"},
+        "unstable":     {"symbol": "circle", "color": "red",    "label": "Unstable equilibrium"},
+        "saddle":       {"symbol": "circle", "color": "orange", "label": "Saddle point"},
+        "unclassified": {"symbol": "x",      "color": "gray",   "label": "Unclassified"},
     }
 
-    fig, ax = plt.subplots(figsize=(10, 6))
+    fig = go.Figure()
 
-    plotted_types = set()
-    for entry in data:
-        a_hat  = entry["a_hat"]
-        r_norm = entry["r_norm"]
-        eq_type = entry["type"]
+    for eq_type in ["stable", "unstable", "saddle", "unclassified"]:
+        points = [entry for entry in data if entry.get("type", "unclassified") == eq_type]
+        if len(points) == 0:
+            continue
 
         style = type_styles.get(eq_type, type_styles["unclassified"])
-        label = style["label"] if eq_type not in plotted_types else None
-        plotted_types.add(eq_type)
+        x_vals = [entry["a_hat"] for entry in points]
+        r_vals = [entry["r_norm"] for entry in points]
+        z_vals = [entry["z_norm"] for entry in points]
 
-        ax.scatter(
-            a_hat, r_norm,
-            color=style["color"], marker=style["marker"],
-            s=90, edgecolors="black", linewidths=0.8,
-            label=label, zorder=5,
-        )
+        if plot_mode == "3d":
+            fig.add_trace(go.Scatter3d(
+                x=x_vals,
+                y=r_vals,
+                z=z_vals,
+                mode="markers",
+                name=style["label"],
+                marker=dict(
+                    size=6,
+                    color=style["color"],
+                    symbol=style["symbol"],
+                    line=dict(color="black", width=1),
+                    opacity=0.9,
+                ),
+                hovertemplate=(
+                    "a/(H/2): %{x:.4f}<br>"
+                    "r/(H/2): %{y:.4f}<br>"
+                    "z/(H/2): %{z:.4f}<br>"
+                    f"type: {eq_type}<extra></extra>"
+                ),
+            ))
+        elif plot_mode == "2d_r":
+            fig.add_trace(go.Scatter(
+                x=x_vals,
+                y=r_vals,
+                mode="markers",
+                name=style["label"],
+                marker=dict(
+                    size=9,
+                    color=style["color"],
+                    symbol=style["symbol"],
+                    line=dict(color="black", width=1),
+                    opacity=0.9,
+                ),
+                hovertemplate=(
+                    "a/(H/2): %{x:.4f}<br>"
+                    "r/(H/2): %{y:.4f}<br>"
+                    f"type: {eq_type}<extra></extra>"
+                ),
+            ))
+        else:  # plot_mode == "2d_z"
+            fig.add_trace(go.Scatter(
+                x=x_vals,
+                y=z_vals,
+                mode="markers",
+                name=style["label"],
+                marker=dict(
+                    size=9,
+                    color=style["color"],
+                    symbol=style["symbol"],
+                    line=dict(color="black", width=1),
+                    opacity=0.9,
+                ),
+                hovertemplate=(
+                    "a/(H/2): %{x:.4f}<br>"
+                    "z/(H/2): %{y:.4f}<br>"
+                    f"type: {eq_type}<extra></extra>"
+                ),
+            ))
 
     W_hat = W / (H / 2)
-    ax.axhline(y= W_hat / 2, color="black", linestyle="--", linewidth=1.5, label="Channel wall (±W/2)")
-    ax.axhline(y=-W_hat / 2, color="black", linestyle="--", linewidth=1.5)
-    ax.axhline(y=0,           color="gray",  linestyle=":",  linewidth=1.0, alpha=0.5)
+    H_hat = H / (H / 2)
+    x_min = min(ALPHA_VALUES) - 0.005
+    x_max = max(ALPHA_VALUES) + 0.005
 
-    ax.set_xlabel(r"Relative particle size $\alpha = a\,/\,(H/2)$", fontsize=13)
-    ax.set_ylabel(r"Equilibrium position $r\,/\,(H/2)$",            fontsize=13)
-    ax.set_title("Bifurcation Diagram — equilibrium r-positions vs. particle size", fontsize=14)
+    if plot_mode == "3d":
+        fig.update_layout(
+            title="Bifurcation Diagram (3D): particle size vs equilibrium positions",
+            scene=dict(
+                xaxis_title="Relative particle size a/(H/2)",
+                yaxis_title="Equilibrium r/(H/2)",
+                zaxis_title="Equilibrium z/(H/2)",
+                xaxis=dict(range=[x_min, x_max]),
+                yaxis=dict(range=[-W_hat / 2, W_hat / 2]),
+                zaxis=dict(range=[-H_hat / 2, H_hat / 2]),
+            ),
+            legend=dict(x=0.01, y=0.99),
+            template="plotly_white",
+        )
+    elif plot_mode == "2d_r":
+        fig.add_hline(y=W_hat / 2, line_dash="dash", line_color="black")
+        fig.add_hline(y=-W_hat / 2, line_dash="dash", line_color="black")
+        fig.add_hline(y=0.0, line_dash="dot", line_color="gray")
+        fig.update_layout(
+            title="Bifurcation Diagram (2D projection on r-axis)",
+            xaxis_title="Relative particle size a/(H/2)",
+            yaxis_title="Equilibrium r/(H/2)",
+            xaxis=dict(range=[x_min, x_max]),
+            yaxis=dict(range=[-W_hat / 2, W_hat / 2]),
+            legend=dict(x=0.01, y=0.99),
+            template="plotly_white",
+        )
+    else:  # plot_mode == "2d_z"
+        fig.add_hline(y=H_hat / 2, line_dash="dash", line_color="black")
+        fig.add_hline(y=-H_hat / 2, line_dash="dash", line_color="black")
+        fig.add_hline(y=0.0, line_dash="dot", line_color="gray")
+        fig.update_layout(
+            title="Bifurcation Diagram (2D projection on z-axis)",
+            xaxis_title="Relative particle size a/(H/2)",
+            yaxis_title="Equilibrium z/(H/2)",
+            xaxis=dict(range=[x_min, x_max]),
+            yaxis=dict(range=[-H_hat / 2, H_hat / 2]),
+            legend=dict(x=0.01, y=0.99),
+            template="plotly_white",
+        )
 
-    ax.set_xlim(ALPHA_VALUES[0] - 0.005, ALPHA_VALUES[-1] + 0.005)
-    ax.set_xticks(ALPHA_VALUES)
-    ax.legend(loc="upper right", framealpha=1.0)
-    plt.tight_layout()
+    if save:
+        a_min = min(ALPHA_VALUES)
+        a_max = max(ALPHA_VALUES)
+        out_dir = "images"
+        os.makedirs(out_dir, exist_ok=True)
+        html_path = (
+            f"{out_dir}/Bifurcation_diagram_{plot_mode}_a_min={a_min:.3f}_a_max={a_max:.3f}"
+            f"_R={R:.0f}_W={W:.0f}_H={H:.0f}_N_grid={N_grid}.html"
+        )
+        fig.write_html(html_path)
+        print(f"Bifurcation diagram saved to {html_path}")
 
-    os.makedirs(os.path.dirname(output_file), exist_ok=True)
-    plt.savefig(output_file, dpi=150)
-    print(f"Bifurcation diagram saved to {output_file}")
-    plt.show()
+    if show:
+        fig.show()
 
 
 if __name__ == "__main__":
@@ -103,6 +212,9 @@ if __name__ == "__main__":
     # ------------------------------------------------------------------ #
     #  Phase 0: Load cached data if existent                             #
     # ------------------------------------------------------------------ #
+
+    os.makedirs("images", exist_ok=True)
+
     use_cache = False
     if rank == 0:
         use_cache = os.path.exists(RESULTS_FILE)
@@ -113,7 +225,7 @@ if __name__ == "__main__":
             print(f"Loading cached results from {RESULTS_FILE} ...")
             with open(RESULTS_FILE, "r") as f:
                 bifurcation_data = json.load(f)
-            plot_bifurcation_diagram(bifurcation_data)
+            plot_bifurcation_diagram(bifurcation_data, plot_mode=PLOT_MODE, save=True, show=True)
         comm.Barrier()
         sys.exit(0)
 
@@ -137,7 +249,7 @@ if __name__ == "__main__":
     (R_hat, H_hat, W_hat, L_c, U_c, Re, G_hat, U_m_hat) = scalar_bg
 
     # ------------------------------------------------------------------ #
-    #  Phase 2: sweep over alpha values                                   #
+    #  Phase 2: sweep over alpha values                                  #
     # ------------------------------------------------------------------ #
     bifurcation_data = []
 
@@ -184,7 +296,7 @@ if __name__ == "__main__":
         )
 
         grid_values = force_grid.compute_F_p_grid_ensemble(
-            N_r=10, N_z=10,
+            N_grid=N_grid,
             u_bg_data_np=u_hh_np,
             p_bg_data_np=p_hh_np,
         )
@@ -194,6 +306,8 @@ if __name__ == "__main__":
             r_vals, z_vals, phi, Fr_grid, Fz_grid = grid_values
             initial_guesses      = force_grid.generate_initial_guesses()
             classified_equilibria = force_grid.classify_equilibria_on_grid(initial_guesses)
+
+            force_grid.plot(L_c_p, L_c, classified_equilibria=classified_equilibria)
 
             print(f"  Found {len(classified_equilibria)} equilibrium/a.")
 
@@ -214,10 +328,10 @@ if __name__ == "__main__":
                 })
 
     # ------------------------------------------------------------------ #
-    #  Phase 3: save results and plot                                     #
+    #  Phase 3: save results and plot                                    #
     # ------------------------------------------------------------------ #
     if rank == 0:
         with open(RESULTS_FILE, "w") as f:
             json.dump(bifurcation_data, f, indent=2)
         print(f"\nResults saved to {RESULTS_FILE}")
-        plot_bifurcation_diagram(bifurcation_data)
+        plot_bifurcation_diagram(bifurcation_data, plot_mode=PLOT_MODE, save=True, show=True)

@@ -1,5 +1,4 @@
 from firedrake import *
-from app.background_flow import background_flow
 
 
 def first_nondimensionalisation(R, H, W, Q, rho, mu, print_values=False):
@@ -118,7 +117,7 @@ if __name__ == "__main__":
     fplt.triplot(mesh_hat_hat, axes=ax)
     ax.set_aspect("equal")
     ax.set_title("Overlay: mesh_hat + mesh_hat_hat")
-    # plt.show()
+    plt.show()
 
     mesh_hat_coordinates_np = mesh_hat.coordinates.dat.data_ro
     mesh_hat_hat_coordinates_np = mesh_hat_hat.coordinates.dat.data_ro

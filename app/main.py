@@ -5,7 +5,8 @@ import sys
 import warnings
 from mpi4py import MPI
 
-from config_lab_parameters import *
+from config_paper_parameters import *
+# from config_lab_parameters import *
 from nondimensionalization import *
 from find_equilbrium_points import *
 
@@ -82,7 +83,7 @@ if __name__ == "__main__":
                           global_maxh=0.2*min(H_hat_hat, W_hat_hat),
                           eps=0.2*a_hat_hat)
 
-    grid_values = force_grid.compute_F_p_grid_ensemble(N_r=10, N_z=10, u_bg_data_np=u_data_np, p_bg_data_np=p_data_np)
+    grid_values = force_grid.compute_F_p_grid_ensemble(N_grid=N_grid, u_bg_data_np=u_data_np, p_bg_data_np=p_data_np)
 
     if rank == 0:
         print("Finished parallel force grid calculation. Finding and classifying equilibria and visualizing...")

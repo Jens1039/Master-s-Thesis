@@ -41,7 +41,9 @@ class F_p_grid:
         self._current_z = None
 
 
-    def compute_F_p_grid_ensemble(self, N_r, N_z, u_bg_data_np, p_bg_data_np):
+    def compute_F_p_grid_ensemble(self, N_grid, u_bg_data_np, p_bg_data_np):
+
+        self.N_grid = N_grid
 
         ensemble = Ensemble(COMM_WORLD, 1)
         my_comm = ensemble.comm
@@ -60,12 +62,12 @@ class F_p_grid:
         u_bg_local.dat.data[:] = u_bg_data_np
         p_bg_local.dat.data[:] = p_bg_data_np
 
-        r_vals = np.linspace(self.r_min, self.r_max, N_r)
-        z_vals = np.linspace(self.z_min, self.z_max, N_z)
+        r_vals = np.linspace(self.r_min, self.r_max, N_grid)
+        z_vals = np.linspace(self.z_min, self.z_max, N_grid)
 
         all_tasks = []
-        for i in range(N_r):
-            for j in range(N_z):
+        for i in range(N_grid):
+            for j in range(N_grid):
                 all_tasks.append((i, j, r_vals[i], z_vals[j]))
 
         my_tasks = all_tasks[global_rank::global_size]
@@ -101,8 +103,8 @@ class F_p_grid:
 
 
         if global_rank == 0:
-            Fr_grid = np.zeros((N_r, N_z))
-            Fz_grid = np.zeros((N_r, N_z))
+            Fr_grid = np.zeros((N_grid, N_grid))
+            Fz_grid = np.zeros((N_grid, N_grid))
 
             for rank_result_list in all_data:
                 for (i, j, Fr, Fz) in rank_result_list:
@@ -305,9 +307,9 @@ class F_p_grid:
         H = (L_c_p/L_c) * self.H
         W = (L_c_p/L_c) * self.W
 
-        ax.set_title(f"Force_Map_a={a:.2f}_R={R:.0f}_W={W:.0f}_H={H:.0f}")
+        ax.set_title(f"Force_Map_a={a:.3f}_R={R:.0f}_W={W:.0f}_H={H:.0f}_N_grid={self.N_grid}")
         plt.tight_layout()
-        filename = f"images/Force_Map_a={a:.2f}_R={R:.0f}_W={W:.0f}_H={H:.0f}.png"
+        filename = f"images/Force_Map_a={a:.3f}_R={R:.0f}_W={W:.0f}_H={H:.0f}_N_grid={self.N_grid}.png"
         plt.savefig(filename)
         print(f"Plot saved to {filename}")
         plt.show()
