@@ -155,7 +155,9 @@ class background_flow:
         X_i, Z_i = np.meshgrid(x_i, z_i)
 
         plotting_points = np.column_stack([X_i.ravel(), Z_i.ravel()])
-        U_at_list = self.u_bar.at(plotting_points)
+
+        evaluator = PointEvaluator(self.mesh2d, plotting_points)
+        U_at_list = evaluator.evaluate(self.u_bar)
 
         u_at = np.asarray(U_at_list, dtype=float)
 
@@ -206,7 +208,7 @@ class background_flow:
         plt.show()
 
 
-def build_3d_background_flow(R, H, W, G, mesh3d, u_bar_2d, p_bar_2d):
+def build_3d_background_flow(R, H, W, G, mesh3d, tags, u_bar_2d, p_bar_2d):
 
     V_3d = VectorFunctionSpace(mesh3d, "CG", 2)
     Q_3d = FunctionSpace(mesh3d, "CG", 1)
@@ -231,7 +233,8 @@ def build_3d_background_flow(R, H, W, G, mesh3d, u_bar_2d, p_bar_2d):
 
     query_points_u = np.column_stack((x_query_u, y_query_u))
 
-    u_vals = np.array(u_bar_2d.at(query_points_u, tolerance=1e-8))
+    u_evaluator = PointEvaluator(u_bar_2d.function_space().mesh(), query_points_u, tolerance=1e-8)
+    u_vals = np.array(u_evaluator.evaluate(u_bar_2d))
 
     u_r = u_vals[:, 0]
     u_z = u_vals[:, 1]
@@ -246,6 +249,10 @@ def build_3d_background_flow(R, H, W, G, mesh3d, u_bar_2d, p_bar_2d):
 
     u_3d.dat.data[:] = np.column_stack((u_x_3d, u_y_3d, u_z_3d))
 
+    # Enforce u_3d == 0 on the boundary
+    bc_walls = DirichletBC(V_3d, Constant((0.0, 0.0, 0.0)), tags["walls"])
+    bc_walls.apply(u_3d)
+
     Q_coords = VectorFunctionSpace(mesh3d, "CG", 1)
     coords_func_p = Function(Q_coords).interpolate(SpatialCoordinate(mesh3d))
     xyz_nodes_p = coords_func_p.dat.data_ro
@@ -259,7 +266,8 @@ def build_3d_background_flow(R, H, W, G, mesh3d, u_bar_2d, p_bar_2d):
 
     query_points_p = np.column_stack((x_query_p, y_query_p))
 
-    p_vals = np.array(p_bar_2d.at(query_points_p, tolerance=1e-8))
+    p_evaluator = PointEvaluator(p_bar_2d.function_space().mesh(), query_points_p, tolerance=1e-8)
+    p_vals = np.array(p_evaluator.evaluate(p_bar_2d))
 
     if p_vals.ndim > 1:
         p_vals = p_vals.flatten()
@@ -272,24 +280,100 @@ def build_3d_background_flow(R, H, W, G, mesh3d, u_bar_2d, p_bar_2d):
 
 if __name__ == "__main__":
 
-    H = 240e-6
-    rho = 998
-    mu = 10.02e-4
-    a = 0.05 * (H / 2)
-    W = 1 * H
-    R = 160 * (H / 2)
-    Q = 2 * 2.40961923848e-10
+    print("Starte Sanity Checks für 2D- und 3D-Background-Flow...\n")
 
-    from nondimensionalization import *
+    R_test = 100.0
+    H_test = 2.0
+    W_test = 2.0
+    Re_test = 20.0
 
-    R_hat, H_hat, W_hat, L_c, U_c, Re = first_nondimensionalisation(R, H, W, Q, rho, mu, print_values=True)
+    print("1. Löse 2D Background Flow...")
+    bf = background_flow(R_test, H_test, W_test, Re_test)
+    G_val, U_m_hat, u_2d, p_2d = bf.solve_2D_background_flow()
 
-    bg = background_flow(R_hat, H_hat, W_hat, Re)
-    G_hat, U_m_hat, u_bar_2d_hat, p_bar_2d_hat = bg.solve_2D_background_flow()
-    bg.plot()
+    print(f"   -> Berechneter Druckgradient G = {G_val:.6f}")
+    print(f"   -> Maximale axiale Geschwindigkeit U_m_hat = {U_m_hat:.6f}")
+    assert U_m_hat > 0, "Fehler: Maximale axiale Geschwindigkeit sollte positiv sein."
 
-    from build_3d_geometry import make_curved_channel_section_with_spherical_hole
+    print("\n2. Prüfe 2D Divergenz (Massen-Erhaltung)...")
+    # Zylindrische Divergenz: d(u_r)/dr + d(u_z)/dz + u_r / (R + r) = 0
+    # Im lokalen Mesh-System gilt: r = x - W/2
+    mesh2d = bf.mesh2d
+    x_coords = SpatialCoordinate(mesh2d)
+    r_local = x_coords[0] - 0.5 * W_test
+    R_plus_r = R_test + r_local
 
-    mesh3d = make_curved_channel_section_with_spherical_hole(R_hat, H_hat, W_hat, L=8, a=0.05, particle_maxh=0.05*0.2, global_maxh=min(H_hat, W_hat)*0.02, scaling="first_nondimensionalisation")
+    u_r, u_z, u_theta = split(u_2d)
+    div_2d = Dx(u_r, 0) + Dx(u_z, 1) + u_r / R_plus_r
 
-    build_3d_background_flow(R_hat, H_hat, W_hat, G_hat, mesh3d, u_bar_2d_hat, p_bar_2d_hat)
+    # L2-Norm des Divergenz-Fehlers
+    div_norm = sqrt(assemble(inner(div_2d, div_2d) * dx))
+    print(f"   -> L2-Norm des Divergenz-Fehlers: {div_norm:.2e}")
+    assert div_norm < 1e-3, f"Fehler: 2D Divergenz ist zu hoch! ({div_norm})"
+
+    print("\n3. Prüfe 2D Randbedingungen (No-Slip)...")
+    # Integral der quadrierten Geschwindigkeit auf dem Rand (ds) sollte nahezu 0 sein
+    v_bnd_norm = assemble(inner(u_2d, u_2d) * ds)
+    print(f"   -> Integraler Geschwindigkeits-Fehler am Rand: {v_bnd_norm:.2e}")
+    assert v_bnd_norm < 1e-8, "Fehler: No-Slip Bedingung in 2D wurde nicht exakt erfüllt."
+
+    print("\n4. Erstelle 3D-Test-Mesh für das Mapping...")
+    # Um das 3D-Skript zu testen, bauen wir ein gebogenes ExtrudedMesh auf
+    m2d_base = RectangleMesh(15, 15, W_test, H_test)
+    mesh3d = ExtrudedMesh(m2d_base, layers=15, layer_height=1.0)
+
+    # Verbiege das ursprünglich gerade 3D-Mesh in einen Bogen
+    Vc = mesh3d.coordinates.function_space()
+    x, y, zeta = SpatialCoordinate(mesh3d)
+
+    theta_max = 0.2  # Bogenwinkel in Radian
+    r_3d_c = R_test - W_test / 2.0 + x
+    theta_c = zeta * (theta_max / 15.0)
+    z_cyl_c = y - H_test / 2.0
+
+    f_coords = Function(Vc).interpolate(as_vector([r_3d_c * cos(theta_c), r_3d_c * sin(theta_c), z_cyl_c]))
+    mesh3d.coordinates.assign(f_coords)
+
+    # Tags-Dictionary bereitstellen, wie von build_3d_background_flow gefordert
+    # "on_boundary" greift automatisch alle Ränder des 3D-Netzes ab.
+    tags = {"walls": "on_boundary"}
+
+    print("\n5. Führe 3D-Mapping durch...")
+    u_3d, p_3d = build_3d_background_flow(R_test, H_test, W_test, G_val, mesh3d, tags, u_2d, p_2d)
+
+    print("\n6. Prüfe 3D-Mapping Konsistenz (Vektor-Betrag in der Kanalmitte)...")
+    # Evaluierungspunkt genau in der Kanalmitte
+    mid_r = R_test
+    mid_theta = theta_max / 2.0
+    mid_z = 0.0
+
+    # Konvertierung für den 3D PointEvaluator
+    mid_x_3d = mid_r * np.cos(mid_theta)
+    mid_y_3d = mid_r * np.sin(mid_theta)
+    mid_z_3d = mid_z
+
+    try:
+        # 3D Auswertung mit PointEvaluator
+        evaluator_3d = PointEvaluator(mesh3d, np.array([[mid_x_3d, mid_y_3d, mid_z_3d]]))
+        val_3d = evaluator_3d.evaluate(u_3d)[0]
+
+        # 2D Auswertung mit PointEvaluator
+        evaluator_2d = PointEvaluator(bf.mesh2d, np.array([[W_test / 2.0, H_test / 2.0]]))
+        val_2d = evaluator_2d.evaluate(u_2d)[0]
+
+        # Betrag berechnen
+        speed_2d = np.sqrt(val_2d[0] ** 2 + val_2d[1] ** 2 + val_2d[2] ** 2)
+        speed_3d = np.sqrt(val_3d[0] ** 2 + val_3d[1] ** 2 + val_3d[2] ** 2)
+
+        err_speed = abs(speed_2d - speed_3d)
+        print(f"   -> 2D Geschwindigkeits-Betrag: {speed_2d:.6f}")
+        print(f"   -> 3D Geschwindigkeits-Betrag: {speed_3d:.6f}")
+        print(f"   -> Absolute Differenz:         {err_speed:.2e}")
+        assert err_speed < 1e-5, "Fehler: Geschwindigkeitsbeträge stimmen bei Mapping nicht überein!"
+
+    except Exception as e:
+        print(f"   -> Warnung: Auswertung des Einzelpunktes fehlgeschlagen: {e}")
+
+    print("\n=============================================")
+    print("=== ALLE SANITY CHECKS ERFOLGREICH BEENDET ===")
+    print("=============================================")

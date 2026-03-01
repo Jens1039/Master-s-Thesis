@@ -79,8 +79,8 @@ if __name__ == "__main__":
 
     force_grid = F_p_grid(R_hat_hat, H_hat_hat, W_hat_hat, a_hat_hat, G_hat_hat, Re_p,
                           L=4*max(H_hat_hat, W_hat_hat),
-                          particle_maxh=0.2*a_hat_hat,
-                          global_maxh=0.2*min(H_hat_hat, W_hat_hat),
+                          particle_maxh=particle_maxh_rel*a_hat_hat,
+                          global_maxh=global_maxh_rel*min(H_hat_hat, W_hat_hat),
                           eps=0.2*a_hat_hat)
 
     grid_values = force_grid.compute_F_p_grid_ensemble(N_grid=N_grid, u_bg_data_np=u_data_np, p_bg_data_np=p_data_np)

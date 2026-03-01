@@ -1,4 +1,5 @@
 import os
+
 os.environ["OMP_NUM_THREADS"] = "1"
 
 from firedrake import *
@@ -64,11 +65,21 @@ class perturbed_flow:
             A,
             nullspace=nullspace,
             solver_parameters={
-                "ksp_type": "preonly",
-                "pc_type": "lu",
-                "pc_factor_mat_solver_type": "mumps",
-                "mat_mumps_icntl_24": 1,
-                "mat_mumps_icntl_25": 0,
+                # old solver parameters, trying new ones for finer mesh resolution
+                # "ksp_type": "preonly",
+                # "pc_type": "lu",
+                # "pc_factor_mat_solver_type": "mumps",
+                # "mat_mumps_icntl_24": 1,
+                # "mat_mumps_icntl_25": 0,
+
+                "ksp_type": "minres",  # Iterativer Löser (ideal für symmetrische Stokes-Probleme)
+                "pc_type": "fieldsplit",  # Teilt das Problem in Geschwindigkeit und Druck auf
+                "pc_fieldsplit_type": "schur",  # Schur-Komplement
+                "pc_fieldsplit_schur_fact_type": "diag",
+                "fieldsplit_0_ksp_type": "cg",
+                "fieldsplit_0_pc_type": "hypre",  # Algebraisches Mehrgitterverfahren (AMG) für Geschwindigkeit
+                "fieldsplit_1_ksp_type": "cg",
+                "fieldsplit_1_pc_type": "jacobi",  # Simpler Jacobi für den Druck
             },
         )
 
@@ -254,138 +265,76 @@ class perturbed_flow:
         return F_p_x, F_p_z
 
 
-
 if __name__ == "__main__":
 
-    from mpi4py import MPI
+    print("Starte Sanity Checks für die Störströmung (Perturbed Flow)...\n")
 
-    MPI_rank = MPI.COMM_WORLD.rank
-    MPI_size = MPI.COMM_WORLD.size
-
+    R_test = 220
+    H_test = 2
+    W_test = 2
+    a_test = 0.05
+    Re = 1
+    Re_p_test = Re*(a_test**2)
     from build_3d_geometry import *
+    mesh3d, tags = make_curved_channel_section_with_spherical_hole(R_test, H_test, W_test,
+                                                                   L=8,
+                                                                   a=a_test,
+                                                                   particle_maxh=0.2*a_test,
+                                                                   global_maxh=0.2*min(H_test, W_test),
+                                                                   scaling="first_nondimensionalisation"
+                                                                   )
     from background_flow import *
+    bg = background_flow(R_test, H_test, W_test, Re)
+    G_val, U_m_hat, u_bar_2d, p_bar_tilde_2d = bg.solve_2D_background_flow()
+    u_bar_3d, p_bar_3d = build_3d_background_flow(R_test, H_test, W_test, G_val, mesh3d, tags, u_bar_2d, p_bar_tilde_2d)
+    pf = perturbed_flow(R_test, H_test, W_test, a_test, Re_p_test, mesh3d, tags, u_bar_3d, p_bar_3d)
 
-    # Parameters
-    W = 2.0
-    H = 2.0
-    R = 160.0
-    Re = 1.0
-    DL = 8.0  # 12.0
-    px = 0.0
-    py = 0.0  # always 0.0
-    pz = 0.0
-    pr = 0.05
-    a = pr
-    L = DL
+    try:
+        # Wenn 'pf' nicht definiert ist, brechen wir höflich ab
+        pf
+    except NameError:
+        print("Fehler: Das 'pf' Objekt wurde nicht gefunden.")
+        print("Bitte stelle sicher, dass du die Mesh-Generierung und den Background-Flow")
+        print("vor diesem Block ausführst und 'pf' instanziierst!")
+        exit(1)
 
-    bg = background_flow(R, H, W, Re, comm=MPI.COMM_SELF)
-    G, _, u_bar_2d, p_bar_2d = bg.solve_2D_background_flow()
+    # 1. Test: Randbedingungen des homogenisierten Stokes-Solvers
+    print("1. Prüfe Stokes-Solver Randbedingungen...")
+    u_hat_x, q_hat_x = pf.Stokes_solver_3d(pf.e_x_prime)
 
-    Re_p = Re * (a**2)
+    p_center = pf.tags["particle_center"]
+    # Wähle einen Punkt genau auf der Oberfläche des Partikels (z.B. in lokale +x Richtung verschoben)
+    # Wir verschieben auf der r-Achse (entspricht der x-Achse in den Mesh-Koordinaten)
+    eval_pt = [p_center[0] + pf.a, p_center[1], p_center[2]]
+    evaluator = PointEvaluator(pf.mesh3d, np.array([eval_pt]))
+    u_eval = evaluator.evaluate(u_hat_x)[0]
 
-    mesh3d, tags = make_curved_channel_section_with_spherical_hole(R, H, W, L, a, particle_maxh=0.2*a, global_maxh=0.2*H)
-    particle_marker = tags["particle"]
+    e_x_val = pf.e_x_prime.values()
+    diff = np.linalg.norm(u_eval - e_x_val)
+    print(f"   -> Abweichung der BC auf dem Partikel: {diff:.2e}")
+    assert diff < 1e-5, "Fehler: Randbedingungen auf dem Partikel werden nicht exakt erfüllt!"
 
-    n = FacetNormal(mesh3d)
-    Xp = Constant(np.array(tags["particle_center"], dtype=PETSc.ScalarType))
-    Xc = SpatialCoordinate(mesh3d)
+    # 2. Test: Physikalischer Widerstand (Stokes Drag F_minus_1)
+    print("\n2. Prüfe physikalischen Stokes Drag...")
+    F_drag = pf.F_minus_1(u_hat_x, q_hat_x, pf.mesh3d)
+    F_drag_x = float(np.dot(e_x_val, F_drag))
 
-    # Optionally, do various checks of the generated mesh geometry
-    if True:
-        # Check that the area of various tag surfaces is correct
-        for i in ["walls", "particle", "inlet", "outlet"]:
-            result = assemble(dot(n, n) * ds(tags[i]))
-            if MPI_size > 1:
-                result = MPI.COMM_WORLD.allreduce(result, MPI.SUM)
-            if MPI_rank == 0:
-                print("Calculated surface area of surface", i, "is:", result)
-        # Print the expected values for comparison
-        if MPI_rank == 0:
-            print("Expected inlet/outlet surface area:", W * H)
-            print("Expected side wall surface area approximately:", 2 * DL * (W + H))
-            print("Expected particle surface area:", 4 * np.pi * pr ** 2)
+    # Der klassische Stokes-Drag für eine Kugel im Freifeld (nicht-dimensionalisiert)
+    stokes_analytical = -6.0 * np.pi * pf.a
 
-    if True:
-        # Determine if the particle is placed correctly using surface integrals
-        c1 = assemble((Xc - Xp)[0] * ds(particle_marker)) / (4 * np.pi * pr ** 2)
-        c2 = assemble((Xc - Xp)[1] * ds(particle_marker)) / (4 * np.pi * pr ** 2)
-        c3 = assemble((Xc - Xp)[2] * ds(particle_marker)) / (4 * np.pi * pr ** 2)
-        if MPI_size > 1:
-            c1, c2, c3 = MPI.COMM_WORLD.allreduce(np.array([c1, c2, c3]), MPI.SUM)
-        if MPI_rank == 0:
-            print("Error in particle surface coordinate mean:", c1, c2, c3)
+    print(f"   -> Berechneter Kanal-Drag in x-Richtung: {F_drag_x:.4f}")
+    print(f"   -> Analytischer Freifeld-Drag (Referenz): {stokes_analytical:.4f}")
 
-    if False:
-        # Print the number of cells distributed to each MPI process
-        num_cells = mesh.topology.index_map(mesh.topology.dim).size_local
-        print("Number of cells on rank", MPI_rank, "is:", num_cells)
+    assert F_drag_x < 0, "Fehler: Der Drag muss negativ sein (der Bewegungsrichtung entgegenwirken)!"
+    assert F_drag_x < stokes_analytical, "Fehler: Wegen der Wände muss der Kanal-Drag betragsmäßig GRÖSSER (also negativer) sein als der Freifeld-Drag!"
 
-    u_bar_3d, p_bar_3d = build_3d_background_flow(R, H, W, G, mesh3d, u_bar_2d, p_bar_2d)
+    # 3. Test: Gesamte Kräfteberechnung F_p
+    print("\n3. Berechne resultierende Kräfte F_p...")
+    # Dies testet, ob die Matrix A regulär ist und die Volumenintegrale konvergieren
+    F_p_x, F_p_z = pf.F_p()
+    print(f"   -> Resultierende Kraft F_p_x: {F_p_x:.6e}")
+    print(f"   -> Resultierende Kraft F_p_z: {F_p_z:.6e}")
 
-    pf = perturbed_flow(R, H, W, a, Re_p, mesh3d, tags, u_bar_3d, p_bar_3d)
-
-    alpha = 0.5 * L / R  # = (1/2)*L/R
-    ca, sa = math.cos(alpha), math.sin(alpha)
-
-    Q = np.array([[ca, -sa, 0.0],
-                  [sa, ca, 0.0],
-                  [0.0, 0.0, 1.0]], dtype=float)
-
-
-    def to_global_3(v3):
-        return Q.T @ np.asarray(v3, dtype=float)
-
-
-    ex_g_mesh = Constant((ca, sa, 0.0))
-    ey_g_mesh = Constant((-sa, ca, 0.0))
-    ez_g_mesh = Constant((0.0, 0.0, 1.0))
-
-
-    def drag_torque_fd(v, q, mesh, tags, x_p, quad_degree=None):
-        n = FacetNormal(mesh)
-        sigma = -q * Identity(3) + (grad(v) + grad(v).T)
-        traction = dot(sigma, -n)
-
-        if quad_degree is None:
-            dS = ds(tags["particle"])
-        else:
-            dS = ds(tags["particle"], degree=quad_degree)
-
-        F_mesh = np.array([float(assemble(traction[i] * dS)) for i in range(3)], dtype=float)
-
-        x = SpatialCoordinate(mesh)
-        moment_density = cross(x - x_p, traction)
-        T_mesh = np.array([float(assemble(moment_density[i] * dS)) for i in range(3)], dtype=float)
-
-        F_glob = to_global_3(F_mesh)
-        T_glob = to_global_3(T_mesh)
-        return np.concatenate([F_glob, T_glob])
-
-
-    motions = [
-        ("U_x", ex_g_mesh),
-        ("U_y", ey_g_mesh),
-        ("U_z", ez_g_mesh),
-        ("Omega_x", cross(ex_g_mesh, Xc - Xp)),
-        ("Omega_y", cross(ey_g_mesh, Xc - Xp)),
-        ("Omega_z", cross(ez_g_mesh, Xc - Xp)),
-        ("U_bg", pf.u_bar),
-    ]
-
-    results = {}
-    for label, bc_expr in motions:
-        v, q = pf.Stokes_solver_3d(bc_expr)
-
-        quad = 8 if label == "U_bg" else None
-
-        results[label] = drag_torque_fd(v, q, pf.mesh3d, pf.tags, pf.x_p, quad_degree=quad)
-
-    if pf.mesh3d.comm.rank == 0:
-        # Brendan-style lines
-        print("U_x coefficients:", *results["U_x"])
-        print("U_y coefficients:", *results["U_y"])
-        print("U_z coefficients:", *results["U_z"])
-        print("Omega_x coefficients:", *results["Omega_x"])
-        print("Omega_y coefficients:", *results["Omega_y"])
-        print("Omega_z coefficients:", *results["Omega_z"])
-        print("Background flow induced force/torque:", *results["U_bg"])
+    print("\n=============================================")
+    print("=== ALLE SANITY CHECKS ERFOLGREICH BEENDET ===")
+    print("=============================================")

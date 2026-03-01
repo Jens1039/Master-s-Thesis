@@ -1,5 +1,8 @@
+import os
+os.environ["OMP_NUM_THREADS"] = "1"
+
 import math
-from firedrake import Mesh, COMM_SELF
+from firedrake import *
 from netgen.occ import *
 
 
@@ -80,3 +83,99 @@ def make_curved_channel_section_with_spherical_hole(R, H, W, L, a, particle_maxh
     }
 
     return mesh3d, tags
+
+
+if __name__ == "__main__":
+
+    TEST_R = 220.0
+    TEST_a = 0.1
+    TEST_H = 2.0
+    TEST_W = 2.0
+    TEST_L = 10.0
+    TEST_r_off = 0.5
+    TEST_z_off = 0.0
+
+    print("Generating mesh for sanity checks...")
+    mesh3d, tags = make_curved_channel_section_with_spherical_hole(
+        R=TEST_R, H=TEST_H, W=TEST_W, L=TEST_L, a=TEST_a,
+        particle_maxh=TEST_a / 3, global_maxh=1.0,
+        scaling="second_nondimensionalisation",
+        r_off=TEST_r_off, z_off=TEST_z_off, order=6
+    )
+
+    x, y, z = SpatialCoordinate(mesh3d)
+
+    print("\n" + "=" * 40)
+    print("=== STARTING SANITY CHECKS ===")
+    print("=" * 40)
+
+    # 1. Bounding Box & Aspect Ratio Check
+    # Verifies if H and W are swapped (common RectangleC orientation issue)
+    coords = mesh3d.coordinates.dat.data_ro
+    min_x, max_x = coords[:, 0].min(), coords[:, 0].max()
+    min_z, max_z = coords[:, 2].min(), coords[:, 2].max()
+
+    width_x = max_x - min_x
+    height_z = max_z - min_z
+
+    print("\n1. CHANNEL DIMENSIONS AND ORIENTATION")
+    print(f"   Radial extent (X-axis, expected ~W): {width_x:.4f}")
+    print(f"   Vertical extent (Z-axis, expected ~H): {height_z:.4f}")
+
+    if abs(width_x - TEST_H) < 1e-2 and abs(height_z - TEST_W) < 1e-2 and TEST_W != TEST_H:
+        print("   -> WARNING: X maps to H and Z maps to W! Your channel is likely rotated 90 degrees.")
+        print("   -> Suggestion: Change RectangleC(_H, _W) to RectangleC(_W, _H).")
+    elif abs(width_x - TEST_W) < 1e-2 and abs(height_z - TEST_H) < 1e-2:
+        print("   -> OK: Orientation appears correct.")
+
+    # 2. Boundary Surface Areas
+    print("\n2. SURFACE AREAS (Inlet / Outlet / Particle)")
+    expected_cross_section = TEST_W * TEST_H
+    inlet_area = assemble(1.0 * ds(tags["inlet"], domain=mesh3d))
+    outlet_area = assemble(1.0 * ds(tags["outlet"], domain=mesh3d))
+
+    print(f"   Inlet Area:  Expected {expected_cross_section:.4f}, Measured {inlet_area:.4f}")
+    print(f"   Outlet Area: Expected {expected_cross_section:.4f}, Measured {outlet_area:.4f}")
+
+    expected_particle_area = 4.0 * math.pi * TEST_a ** 2
+    actual_particle_area = assemble(1.0 * ds(tags["particle"], domain=mesh3d))
+    err_area = abs(expected_particle_area - actual_particle_area) / expected_particle_area
+    print(
+        f"   Particle Surface Area: Expected {expected_particle_area:.4f}, Measured {actual_particle_area:.4f} (Relative Error: {err_area:.2%})")
+
+    # 3. Total Mesh Volume
+    print("\n3. TOTAL VOLUME")
+    # Volume = (Cross-section * Arc Length L) - Sphere Volume
+    expected_vol = (TEST_W * TEST_H * TEST_L) - ((4.0 / 3.0) * math.pi * TEST_a ** 3)
+    actual_vol = assemble(1.0 * dx(domain=mesh3d))
+    err_vol = abs(expected_vol - actual_vol) / expected_vol
+    print(f"   Volume: Expected {expected_vol:.4f}, Measured {actual_vol:.4f} (Relative Error: {err_vol:.2%})")
+
+    # 4. Particle Centroid Position
+    print("\n4. PARTICLE CENTROID")
+    cx_mesh = assemble(x * ds(tags["particle"], domain=mesh3d)) / actual_particle_area
+    cy_mesh = assemble(y * ds(tags["particle"], domain=mesh3d)) / actual_particle_area
+    cz_mesh = assemble(z * ds(tags["particle"], domain=mesh3d)) / actual_particle_area
+    cx_exp, cy_exp, cz_exp = tags["particle_center"]
+
+    print(f"   Expected Center: ({cx_exp:.5f}, {cy_exp:.5f}, {cz_exp:.5f})")
+    print(f"   Measured Center: ({cx_mesh:.5f}, {cy_mesh:.5f}, {cz_mesh:.5f})")
+    err_center = math.sqrt((cx_exp - cx_mesh) ** 2 + (cy_exp - cy_mesh) ** 2 + (cz_exp - cz_mesh) ** 2)
+    print(f"   -> Absolute L2 distance error: {err_center:.2e}")
+
+    # 5. Geometric Boundary Integrity
+    print("\n5. BOUNDARY ALIGNMENT")
+    # Inlet should lie strictly on the plane where y = 0 (relative to local start)
+    y_inlet_mean = assemble(abs(y) * ds(tags["inlet"], domain=mesh3d)) / inlet_area
+    print(f"   Mean Y-deviation at Inlet (should be ~0): {y_inlet_mean:.2e}")
+
+    # Outlet should lie strictly on the plane defined by the arc angle theta
+    theta = tags["theta"]
+    # Plane equation for the outlet: x * sin(theta) - y * cos(theta) = 0
+    outlet_plane_dev = assemble(
+        abs(x * math.sin(theta) - y * math.cos(theta)) * ds(tags["outlet"], domain=mesh3d)) / outlet_area
+    print(f"   Mean plane-deviation at Outlet (should be ~0): {outlet_plane_dev:.2e}")
+
+    print("\n" + "=" * 40)
+    print("=== SANITY CHECKS COMPLETED ===")
+    print("=" * 40)

@@ -79,24 +79,18 @@ class F_p_grid:
         for task in tqdm(my_tasks, disable=(global_rank != 0)):
             (i, j, r_loc, z_loc) = task
 
-            try:
-                mesh3d, tags = make_curved_channel_section_with_spherical_hole(
+            mesh3d, tags = make_curved_channel_section_with_spherical_hole(
                     self.R, self.H, self.W, self.L, self.a,
                     self.particle_maxh, self.global_maxh,
                     r_off=r_loc, z_off=z_loc,
-                    comm=my_comm
-                )
+                    comm=my_comm)
 
-                u_3d, p_3d = build_3d_background_flow(self.R, self.H, self.W, self.G, mesh3d, u_bg_local, p_bg_local)
+            u_3d, p_3d = build_3d_background_flow(self.R, self.H, self.W, self.G, mesh3d, tags, u_bg_local, p_bg_local)
 
-                pf = perturbed_flow(self.R, self.H, self.W, self.a, self.Re_p, mesh3d, tags, u_3d, p_3d)
-                F_r, F_z = pf.F_p()
+            pf = perturbed_flow(self.R, self.H, self.W, self.a, self.Re_p, mesh3d, tags, u_3d, p_3d)
+            F_r, F_z = pf.F_p()
 
-                local_results.append((i, j, F_r, F_z))
-
-            except Exception as e:
-                print(f"[Rank {global_rank}] Error at {i},{j}: {e}")
-                local_results.append((i, j, np.nan, np.nan))
+            local_results.append((i, j, F_r, F_z))
 
 
         all_data = COMM_WORLD.gather(local_results, root=0)
@@ -110,6 +104,12 @@ class F_p_grid:
                 for (i, j, Fr, Fz) in rank_result_list:
                     Fr_grid[i, j] = Fr
                     Fz_grid[i, j] = Fz
+
+            # Since we know that the force field is symmetric w.r.t the z - axis, we enforce this:
+            # Fr_grid_sym = 0.5 * (Fr_grid + np.flip(Fr_grid, axis=1))
+            # Fz_grid_sym = 0.5 * (Fz_grid - np.flip(Fz_grid, axis=1))
+            # self.Fr_grid = Fr_grid_sym
+            # self.Fz_grid = Fz_grid_sym
 
             self.Fr_grid = Fr_grid
             self.Fz_grid = Fz_grid
@@ -125,7 +125,7 @@ class F_p_grid:
             return None, None, None, None, None
 
 
-    def generate_initial_guesses(self, n_grid_search=50, tol_unique=1e-4, tol_residual=1e-7):
+    def generate_initial_guesses(self, n_grid_search=100, tol_unique=1e-3, tol_residual=1e-9):
 
         self.interp_Fr = RectBivariateSpline(self.r_vals, self.z_vals, self.Fr_grid)
         self.interp_Fz = RectBivariateSpline(self.r_vals, self.z_vals, self.Fz_grid)
@@ -157,7 +157,7 @@ class F_p_grid:
             for z0 in z_starts:
 
                 # finds a root on the interpolated function. It uses a hybrid method between GD and newton and starts with (r0, z0).
-                solution = root(F, [r0, z0], jac=J, method="lm")
+                solution = root(F, [r0, z0], jac=J, method="hybr")
 
                 # returns a boolean expression depending on the success of the root search
                 if solution.success:
@@ -313,3 +313,74 @@ class F_p_grid:
         plt.savefig(filename)
         print(f"Plot saved to {filename}")
         plt.show()
+
+
+
+if __name__ == "__main__":
+    print("Starte Sanity Checks für das Force Grid und die Gleichgewichtspunkte...\n")
+
+    # Setze Parameter für einen schnellen Testlauf
+    R_test = 220.0
+    H_test = 2.0
+    W_test = 2.0
+    a_test = 0.1
+    Re_test = 1.0
+    Re_p_test = Re_test * (a_test ** 2)
+
+    # ACHTUNG: Für einen Sanity Check nehmen wir ein SEHR grobes Grid, um Rechenzeit zu sparen!
+    # Für produktive Plots (wie in Abb. 3 im Paper) solltest du N_grid auf 20-40 erhöhen.
+    N_grid_test = 5
+    eps_test = 0.05
+
+    # 1. Berechne 2D Background Flow
+    print("1. Berechne 2D Background Flow...")
+    bg = background_flow(R_test, H_test, W_test, Re_test)
+    G_val, U_m_hat, u_bar_2d, p_bar_tilde_2d = bg.solve_2D_background_flow()
+
+    # Extrahiere die numpy Arrays für die MPI Verteilung
+    u_bg_data = u_bar_2d.dat.data_ro
+    p_bg_data = p_bar_tilde_2d.dat.data_ro
+
+    print(f"\n2. Initialisiere Grid-Berechnung ({N_grid_test}x{N_grid_test} Punkte)...")
+    # Konstanten für Dummy-Skalierung im Plot
+    L_c = 1.0
+    L_c_p = 1.0
+
+    grid_solver = F_p_grid(R=R_test, H=H_test, W=W_test, a=a_test, G=G_val,
+                           Re_p=Re_p_test, L=8.0,
+                           particle_maxh=0.2 * a_test,
+                           global_maxh=0.2 * min(H_test, W_test),
+                           eps=eps_test)
+
+    # Starte die parallele Berechnung (hier im Test mit N_grid_test = 5)
+    r_vals, z_vals, phi, Fr_grid, Fz_grid = grid_solver.compute_F_p_grid_ensemble(N_grid_test, u_bg_data, p_bg_data)
+
+    # Die restlichen Sanity Checks laufen nur auf dem Root-Prozess (Rang 0),
+    # da nur dieser die gesammelten Daten (Gather) zurückbekommt.
+    if COMM_WORLD.rank == 0:
+        print("\n3. Prüfe Grid-Dimensionen...")
+        assert Fr_grid.shape == (N_grid_test, N_grid_test), "Fehler: Fr_grid hat die falsche Form!"
+        assert Fz_grid.shape == (N_grid_test, N_grid_test), "Fehler: Fz_grid hat die falsche Form!"
+        print("   -> Grid-Dimensionen sind korrekt.")
+
+        print("\n4. Suche Gleichgewichtspunkte (Roots)...")
+        # Bei einem 5x5 Grid sind Splines sehr ungenau, daher setzen wir n_grid_search klein an.
+        equilibria = grid_solver.generate_initial_guesses(n_grid_search=10, tol_unique=1e-3, tol_residual=1e-3)
+        print(f"   -> {len(equilibria)} potenzielle Gleichgewichtspunkte gefunden.")
+
+        print("\n5. Klassifiziere Gleichgewichtspunkte und überprüfe Residuen...")
+        classified = grid_solver.classify_equilibria_on_grid(equilibria)
+
+        for i, eq in enumerate(classified):
+            r_eq, z_eq = eq["x_eq"]
+            # Sanity Check: Ist die Kraft an diesem interpolierten Punkt wirklich (nahezu) null?
+            Fr_val = grid_solver.interp_Fr(r_eq, z_eq)[0, 0]
+            Fz_val = grid_solver.interp_Fz(r_eq, z_eq)[0, 0]
+            force_mag = np.sqrt(Fr_val ** 2 + Fz_val ** 2)
+
+            print(f"   Eq {i + 1}: r={r_eq:.3f}, z={z_eq:.3f} | Typ: {eq['type']} | Restkraft: {force_mag:.2e}")
+            assert force_mag < 1e-2, f"Fehler: Gefundener Punkt {i + 1} ist kein echtes Gleichgewicht (Restkraft zu hoch)!"
+
+        print("\n=============================================")
+        print("=== ALLE SANITY CHECKS ERFOLGREICH BEENDET ===")
+        print("=============================================")

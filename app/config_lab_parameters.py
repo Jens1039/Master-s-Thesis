@@ -22,7 +22,7 @@ mu  = 10.02e-4              # dyn. viscosity [Pa·s]
 # ---GEOMETRIC PARAMETERS (ADAPTABLE BASELINE)--------------------------
 H = 0.0001596                 # duct height [m]  # H = 240e-6
 W = H                       # duct width  [m]
-R = 700*(H/2)                # bend radius [m] # 23*(H/2)
+R = 23*(H/2)                # bend radius [m] # 23*(H/2)
 # ----------------------------------------------------------------------
 
 # ---OPERATIONAL PARAMETER (CONSTRAINED BY EXPERIMENTAL FEASIBILITY)----
@@ -33,5 +33,9 @@ Q = 2e-8                    # volumetric flow rate [m^3/s] (Re approx. 83)
 
 
 # ---GRID RESOLUTION----------------------------------------------------
-N_grid = 10
+N_grid = 14
+particle_maxh_rel = 0.08
+global_maxh_rel = 0.2
 # ----------------------------------------------------------------------
+
+print(a/(H/2))

@@ -7,10 +7,7 @@ import warnings
 import numpy as np
 import matplotlib.pyplot as plt
 from mpi4py import MPI
-try:
-    import plotly.graph_objects as go
-except ImportError:
-    go = None
+import plotly.graph_objects as go
 
 from config_paper_parameters import *
 from nondimensionalization import *
@@ -22,7 +19,7 @@ warnings.filterwarnings("ignore", message=".*import SLEPc.*", category=UserWarni
 comm = MPI.COMM_WORLD
 rank = comm.Get_rank()
 
-ALPHA_VALUES = np.round(np.arange(0.115, 0.117, 0.00025), 5)
+a_hat_values = np.round(np.arange(0.115, 0.117, 0.00025), 5)
 
 RESULTS_FILE = "images/bifurcation_results.json"
 PLOT_MODE = "3d"  # allowed: "3d", "2d_r", "2d_z"
@@ -145,8 +142,8 @@ def plot_bifurcation_diagram(data, plot_mode="3d", save=True, show=True):
 
     W_hat = W / (H / 2)
     H_hat = H / (H / 2)
-    x_min = min(ALPHA_VALUES) - 0.005
-    x_max = max(ALPHA_VALUES) + 0.005
+    x_min = min(a_hat_values) - 0.005
+    x_max = max(a_hat_values) + 0.005
 
     if plot_mode == "3d":
         fig.update_layout(
@@ -190,8 +187,8 @@ def plot_bifurcation_diagram(data, plot_mode="3d", save=True, show=True):
         )
 
     if save:
-        a_min = min(ALPHA_VALUES)
-        a_max = max(ALPHA_VALUES)
+        a_min = min(a_hat_values)
+        a_max = max(a_hat_values)
         out_dir = "images"
         os.makedirs(out_dir, exist_ok=True)
         html_path = (
@@ -209,12 +206,9 @@ if __name__ == "__main__":
 
     auto_start_mpi()
 
-    # ------------------------------------------------------------------ #
-    #  Phase 0: Load cached data if existent                             #
-    # ------------------------------------------------------------------ #
-
     os.makedirs("images", exist_ok=True)
 
+    # Load cached data if existent
     use_cache = False
     if rank == 0:
         use_cache = os.path.exists(RESULTS_FILE)
@@ -229,9 +223,6 @@ if __name__ == "__main__":
         comm.Barrier()
         sys.exit(0)
 
-    # ------------------------------------------------------------------ #
-    #  Phase 1: background flow (independent of a — compute once)        #
-    # ------------------------------------------------------------------ #
     if rank == 0:
         print("Computing background flow (shared across all particle sizes)...")
         R_hat, H_hat, W_hat, L_c, U_c, Re = first_nondimensionalisation(
@@ -248,20 +239,18 @@ if __name__ == "__main__":
     scalar_bg = comm.bcast(scalar_bg, root=0)
     (R_hat, H_hat, W_hat, L_c, U_c, Re, G_hat, U_m_hat) = scalar_bg
 
-    # ------------------------------------------------------------------ #
-    #  Phase 2: sweep over alpha values                                  #
-    # ------------------------------------------------------------------ #
+
+    #  sweep over a_hat values
     bifurcation_data = []
 
-    for alpha in ALPHA_VALUES:
+    for alpha in a_hat_values:
         a_phys = float(alpha) * (H / 2)
 
         if rank == 0:
             print(f"\n{'='*60}")
-            print(f"  alpha = {alpha:.2f}  |  a = {a_phys * 1e6:.2f} µm")
+            print(f"  alpha = {alpha:.5f}  |  a = {a_phys * 1e6:.2f} µm")
             print(f"{'='*60}")
 
-        # --- second nondimensionalisation on rank 0 (needs Firedrake objects) ---
         iter_params   = None
         u_hh_np = None
         p_hh_np = None
@@ -283,7 +272,6 @@ if __name__ == "__main__":
 
         (R_hh, H_hh, W_hh, a_hh, G_hh, L_c_p, Re_p) = iter_params
 
-        # --- force grid (parallel over all ranks) ---
         if rank == 0:
             print("  Computing force grid ...")
 
@@ -301,7 +289,6 @@ if __name__ == "__main__":
             p_bg_data_np=p_hh_np,
         )
 
-        # --- find & classify equilibria (rank 0 only) ---
         if rank == 0:
             r_vals, z_vals, phi, Fr_grid, Fz_grid = grid_values
             initial_guesses      = force_grid.generate_initial_guesses()
@@ -327,9 +314,6 @@ if __name__ == "__main__":
                     "color":  eq["color"],
                 })
 
-    # ------------------------------------------------------------------ #
-    #  Phase 3: save results and plot                                    #
-    # ------------------------------------------------------------------ #
     if rank == 0:
         with open(RESULTS_FILE, "w") as f:
             json.dump(bifurcation_data, f, indent=2)
