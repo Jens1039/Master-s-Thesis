@@ -65,21 +65,11 @@ class perturbed_flow:
             A,
             nullspace=nullspace,
             solver_parameters={
-                # old solver parameters, trying new ones for finer mesh resolution
-                # "ksp_type": "preonly",
-                # "pc_type": "lu",
-                # "pc_factor_mat_solver_type": "mumps",
-                # "mat_mumps_icntl_24": 1,
-                # "mat_mumps_icntl_25": 0,
-
-                "ksp_type": "minres",  # Iterativer Löser (ideal für symmetrische Stokes-Probleme)
-                "pc_type": "fieldsplit",  # Teilt das Problem in Geschwindigkeit und Druck auf
-                "pc_fieldsplit_type": "schur",  # Schur-Komplement
-                "pc_fieldsplit_schur_fact_type": "diag",
-                "fieldsplit_0_ksp_type": "cg",
-                "fieldsplit_0_pc_type": "hypre",  # Algebraisches Mehrgitterverfahren (AMG) für Geschwindigkeit
-                "fieldsplit_1_ksp_type": "cg",
-                "fieldsplit_1_pc_type": "jacobi",  # Simpler Jacobi für den Druck
+                "ksp_type": "preonly",
+                "pc_type": "lu",
+                "pc_factor_mat_solver_type": "mumps",
+                "mat_mumps_icntl_24": 1,
+                "mat_mumps_icntl_25": 0,
             },
         )
 
@@ -275,7 +265,7 @@ if __name__ == "__main__":
     a_test = 0.05
     Re = 1
     Re_p_test = Re*(a_test**2)
-    from build_3d_geometry import *
+    from build_3d_geometry_netgen import *
     mesh3d, tags = make_curved_channel_section_with_spherical_hole(R_test, H_test, W_test,
                                                                    L=8,
                                                                    a=a_test,

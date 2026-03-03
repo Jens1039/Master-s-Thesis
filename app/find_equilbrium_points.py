@@ -3,9 +3,10 @@ import matplotlib.patches as patches
 from scipy.interpolate import RectBivariateSpline
 from scipy.optimize import root
 import numpy as np
+import gc
 
 from background_flow import *
-from build_3d_geometry import *
+from build_3d_geometry_gmsh import *
 from perturbed_flow import *
 
 
@@ -85,12 +86,20 @@ class F_p_grid:
                     r_off=r_loc, z_off=z_loc,
                     comm=my_comm)
 
+            # print(f"Number of cells: {mesh3d.num_cells()}")
+            # print(f"Number of vertices: {mesh3d.num_vertices()}")
+
             u_3d, p_3d = build_3d_background_flow(self.R, self.H, self.W, self.G, mesh3d, tags, u_bg_local, p_bg_local)
 
             pf = perturbed_flow(self.R, self.H, self.W, self.a, self.Re_p, mesh3d, tags, u_3d, p_3d)
+
             F_r, F_z = pf.F_p()
 
             local_results.append((i, j, F_r, F_z))
+
+            # fix memory leakage
+            del pf, mesh3d, tags, u_3d, p_3d
+            gc.collect()
 
 
         all_data = COMM_WORLD.gather(local_results, root=0)
@@ -104,12 +113,6 @@ class F_p_grid:
                 for (i, j, Fr, Fz) in rank_result_list:
                     Fr_grid[i, j] = Fr
                     Fz_grid[i, j] = Fz
-
-            # Since we know that the force field is symmetric w.r.t the z - axis, we enforce this:
-            # Fr_grid_sym = 0.5 * (Fr_grid + np.flip(Fr_grid, axis=1))
-            # Fz_grid_sym = 0.5 * (Fz_grid - np.flip(Fz_grid, axis=1))
-            # self.Fr_grid = Fr_grid_sym
-            # self.Fz_grid = Fz_grid_sym
 
             self.Fr_grid = Fr_grid
             self.Fz_grid = Fz_grid
@@ -125,10 +128,10 @@ class F_p_grid:
             return None, None, None, None, None
 
 
-    def generate_initial_guesses(self, n_grid_search=100, tol_unique=1e-3, tol_residual=1e-9):
+    def generate_initial_guesses(self, n_grid_search=100, tol_unique=1e-3, tol_residual=1e-14):
 
-        self.interp_Fr = RectBivariateSpline(self.r_vals, self.z_vals, self.Fr_grid)
-        self.interp_Fz = RectBivariateSpline(self.r_vals, self.z_vals, self.Fz_grid)
+        self.interp_Fr = RectBivariateSpline(self.r_vals, self.z_vals, self.Fr_grid, kx=3, ky=3)
+        self.interp_Fz = RectBivariateSpline(self.r_vals, self.z_vals, self.Fz_grid, kx=3, ky=3)
 
         def F(x):
             r, z = x
@@ -307,9 +310,9 @@ class F_p_grid:
         H = (L_c_p/L_c) * self.H
         W = (L_c_p/L_c) * self.W
 
-        ax.set_title(f"Force_Map_a={a:.3f}_R={R:.0f}_W={W:.0f}_H={H:.0f}_N_grid={self.N_grid}")
+        ax.set_title(f"Force_Map_a={a:.3f}_R={R:.0f}_W={W:.0f}_H={H:.0f}_Re{self.Re_p/(a**2)}_N_grid={self.N_grid}")
         plt.tight_layout()
-        filename = f"images/Force_Map_a={a:.3f}_R={R:.0f}_W={W:.0f}_H={H:.0f}_N_grid={self.N_grid}.png"
+        filename = f"images/Force_Map_a={a:.3f}_R={R:.0f}_W={W:.0f}_H={H:.0f}_Re{self.Re_p/(a**2)}_N_grid={self.N_grid}.png"
         plt.savefig(filename)
         print(f"Plot saved to {filename}")
         plt.show()

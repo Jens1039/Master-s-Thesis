@@ -5,7 +5,7 @@ import sys
 import warnings
 from mpi4py import MPI
 
-from config_paper_parameters import *
+from config_lab_parameters import *
 # from config_lab_parameters import *
 from nondimensionalization import *
 from find_equilbrium_points import *
@@ -43,7 +43,7 @@ def auto_start_mpi(n_procs=5):
 
 if __name__ == "__main__":
 
-    auto_start_mpi()
+    auto_start_mpi(7)
 
     params = None
     u_bar_2d_hat_hat_np = None
@@ -81,7 +81,7 @@ if __name__ == "__main__":
                           L=4*max(H_hat_hat, W_hat_hat),
                           particle_maxh=particle_maxh_rel*a_hat_hat,
                           global_maxh=global_maxh_rel*min(H_hat_hat, W_hat_hat),
-                          eps=0.2*a_hat_hat)
+                          eps=eps_rel*a_hat_hat)
 
     grid_values = force_grid.compute_F_p_grid_ensemble(N_grid=N_grid, u_bg_data_np=u_data_np, p_bg_data_np=p_data_np)
 
@@ -89,5 +89,9 @@ if __name__ == "__main__":
         print("Finished parallel force grid calculation. Finding and classifying equilibria and visualizing...")
         r_vals, z_vals, phi, Fr_grid, Fz_grid = grid_values
         initial_guesses = force_grid.generate_initial_guesses()
+
+        # print("Refining equilibria using exact PDE and deflation...")
+        # exact_roots = force_grid.generate_exact_roots(initial_guesses, u_data_np, p_data_np)
+
         classified_equilibria = force_grid.classify_equilibria_on_grid(initial_guesses)
         force_grid.plot(L_c_p, L_c, classified_equilibria=classified_equilibria)

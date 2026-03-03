@@ -19,9 +19,9 @@ warnings.filterwarnings("ignore", message=".*import SLEPc.*", category=UserWarni
 comm = MPI.COMM_WORLD
 rank = comm.Get_rank()
 
-a_hat_values = np.round(np.arange(0.115, 0.117, 0.00025), 5)
+a_hat_values = np.round(np.arange(0.01, 0.16, 0.01), 5)
 
-RESULTS_FILE = "images/bifurcation_results.json"
+RESULTS_FILE = "app/bifurcation_results.json"
 PLOT_MODE = "3d"  # allowed: "3d", "2d_r", "2d_z"
 
 def auto_start_mpi(n_procs=5):
@@ -278,8 +278,8 @@ if __name__ == "__main__":
         force_grid = F_p_grid(
             R_hh, H_hh, W_hh, a_hh, G_hh, Re_p,
             L=4 * max(H_hh, W_hh),
-            particle_maxh=0.2 * a_hh,
-            global_maxh=0.2 * min(H_hh, W_hh),
+            particle_maxh=particle_maxh_rel * a_hh,
+            global_maxh=global_maxh_rel * min(H_hh, W_hh),
             eps=0.2 * a_hh,
         )
 
