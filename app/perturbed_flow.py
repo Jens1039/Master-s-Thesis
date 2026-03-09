@@ -256,75 +256,67 @@ class perturbed_flow:
 
 
 if __name__ == "__main__":
+    from build_3d_geometry_netgen import *
+    from background_flow import *
 
-    print("Starte Sanity Checks für die Störströmung (Perturbed Flow)...\n")
+    print("Starting sanity checks for the perturbed flow...\n")
 
     R_test = 220
     H_test = 2
     W_test = 2
     a_test = 0.05
     Re = 1
-    Re_p_test = Re*(a_test**2)
-    from build_3d_geometry_netgen import *
+    Re_p_test = Re * (a_test ** 2)
+
     mesh3d, tags = make_curved_channel_section_with_spherical_hole(R_test, H_test, W_test,
                                                                    L=8,
                                                                    a=a_test,
-                                                                   particle_maxh=0.2*a_test,
-                                                                   global_maxh=0.2*min(H_test, W_test),
+                                                                   particle_maxh=0.2 * a_test,
+                                                                   global_maxh=0.2 * min(H_test, W_test),
                                                                    scaling="first_nondimensionalisation"
                                                                    )
-    from background_flow import *
+
     bg = background_flow(R_test, H_test, W_test, Re)
     G_val, U_m_hat, u_bar_2d, p_bar_tilde_2d = bg.solve_2D_background_flow()
     u_bar_3d, p_bar_3d = build_3d_background_flow(R_test, H_test, W_test, G_val, mesh3d, tags, u_bar_2d, p_bar_tilde_2d)
     pf = perturbed_flow(R_test, H_test, W_test, a_test, Re_p_test, mesh3d, tags, u_bar_3d, p_bar_3d)
 
-    try:
-        # Wenn 'pf' nicht definiert ist, brechen wir höflich ab
-        pf
-    except NameError:
-        print("Fehler: Das 'pf' Objekt wurde nicht gefunden.")
-        print("Bitte stelle sicher, dass du die Mesh-Generierung und den Background-Flow")
-        print("vor diesem Block ausführst und 'pf' instanziierst!")
-        exit(1)
-
-    # 1. Test: Randbedingungen des homogenisierten Stokes-Solvers
-    print("1. Prüfe Stokes-Solver Randbedingungen...")
+    print("1. Checking Stokes solver boundary conditions...")
     u_hat_x, q_hat_x = pf.Stokes_solver_3d(pf.e_x_prime)
 
     p_center = pf.tags["particle_center"]
-    # Wähle einen Punkt genau auf der Oberfläche des Partikels (z.B. in lokale +x Richtung verschoben)
-    # Wir verschieben auf der r-Achse (entspricht der x-Achse in den Mesh-Koordinaten)
+    # Select a point exactly on the particle surface (e.g., shifted in local +x direction)
+    # We shift along the r-axis (corresponds to the x-axis in mesh coordinates)
     eval_pt = [p_center[0] + pf.a, p_center[1], p_center[2]]
     evaluator = PointEvaluator(pf.mesh3d, np.array([eval_pt]))
     u_eval = evaluator.evaluate(u_hat_x)[0]
 
     e_x_val = pf.e_x_prime.values()
     diff = np.linalg.norm(u_eval - e_x_val)
-    print(f"   -> Abweichung der BC auf dem Partikel: {diff:.2e}")
-    assert diff < 1e-5, "Fehler: Randbedingungen auf dem Partikel werden nicht exakt erfüllt!"
+    print(f"   -> BC deviation on the particle: {diff:.2e}")
+    assert diff < 1e-5, "Error: Boundary conditions on the particle are not exactly met!"
 
-    # 2. Test: Physikalischer Widerstand (Stokes Drag F_minus_1)
-    print("\n2. Prüfe physikalischen Stokes Drag...")
+    # 2. Test: Physical Drag (Stokes Drag F_minus_1)
+    print("\n2. Checking physical Stokes Drag...")
     F_drag = pf.F_minus_1(u_hat_x, q_hat_x, pf.mesh3d)
     F_drag_x = float(np.dot(e_x_val, F_drag))
 
-    # Der klassische Stokes-Drag für eine Kugel im Freifeld (nicht-dimensionalisiert)
+    # Classical Stokes drag for a sphere in free-field (non-dimensionalized)
     stokes_analytical = -6.0 * np.pi * pf.a
 
-    print(f"   -> Berechneter Kanal-Drag in x-Richtung: {F_drag_x:.4f}")
-    print(f"   -> Analytischer Freifeld-Drag (Referenz): {stokes_analytical:.4f}")
+    print(f"   -> Calculated channel drag in x-direction: {F_drag_x:.4f}")
+    print(f"   -> Analytical free-field drag (reference): {stokes_analytical:.4f}")
 
-    assert F_drag_x < 0, "Fehler: Der Drag muss negativ sein (der Bewegungsrichtung entgegenwirken)!"
-    assert F_drag_x < stokes_analytical, "Fehler: Wegen der Wände muss der Kanal-Drag betragsmäßig GRÖSSER (also negativer) sein als der Freifeld-Drag!"
+    assert F_drag_x < 0, "Error: Drag must be negative (opposing the direction of motion)!"
+    assert F_drag_x < stokes_analytical, "Error: Due to wall effects, channel drag must be GREATER in magnitude (more negative) than free-field drag!"
 
-    # 3. Test: Gesamte Kräfteberechnung F_p
-    print("\n3. Berechne resultierende Kräfte F_p...")
-    # Dies testet, ob die Matrix A regulär ist und die Volumenintegrale konvergieren
+    # 3. Test: Total force calculation F_p
+    print("\n3. Calculating resulting forces F_p...")
+    # This tests if matrix A is regular and volume integrals converge
     F_p_x, F_p_z = pf.F_p()
-    print(f"   -> Resultierende Kraft F_p_x: {F_p_x:.6e}")
-    print(f"   -> Resultierende Kraft F_p_z: {F_p_z:.6e}")
+    print(f"   -> Resulting force F_p_x: {F_p_x:.6e}")
+    print(f"   -> Resulting force F_p_z: {F_p_z:.6e}")
 
     print("\n=============================================")
-    print("=== ALLE SANITY CHECKS ERFOLGREICH BEENDET ===")
+    print("=== ALL SANITY CHECKS COMPLETED SUCCESSFULLY ===")
     print("=============================================")

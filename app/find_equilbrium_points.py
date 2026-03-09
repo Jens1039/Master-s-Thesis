@@ -2,9 +2,14 @@ from tqdm import tqdm
 import matplotlib.patches as patches
 from scipy.interpolate import RectBivariateSpline
 from scipy.optimize import root
+import os
+import pickle
+from mpi4py import MPI
 import numpy as np
 import gc
+import sys
 
+from nondimensionalization import *
 from background_flow import *
 from build_3d_geometry_gmsh import *
 from perturbed_flow import *
@@ -86,10 +91,8 @@ class F_p_grid:
                     r_off=r_loc, z_off=z_loc,
                     comm=my_comm)
 
-            # print(f"Number of cells: {mesh3d.num_cells()}")
-            # print(f"Number of vertices: {mesh3d.num_vertices()}")
-
-            u_3d, p_3d = build_3d_background_flow(self.R, self.H, self.W, self.G, mesh3d, tags, u_bg_local, p_bg_local)
+            u_3d, p_3d = build_3d_background_flow(
+                self.R, self.H, self.W, self.G, mesh3d, tags, u_bg_local, p_bg_local)
 
             pf = perturbed_flow(self.R, self.H, self.W, self.a, self.Re_p, mesh3d, tags, u_3d, p_3d)
 
@@ -318,72 +321,177 @@ class F_p_grid:
         plt.show()
 
 
+def force_grid(R, H, W, Q, rho, mu, a, N_grid, particle_maxh_rel, global_maxh_rel, eps_rel):
+
+    comm = MPI.COMM_WORLD
+    rank = comm.Get_rank()
+
+    cache_dir = "cache"
+    Re = (rho*Q/(W*H)*(H/2))/mu
+    cache_filename = f"{cache_dir}/force_grid_R{R:.1f}_H{H:.1f}_W{W:.1f}_a{a:.3f}_Re{Re:.1f}_N{N_grid}.pkl"
+
+    cache_exists = False
+    if rank == 0:
+        os.makedirs(cache_dir, exist_ok=True)
+        if os.path.exists(cache_filename):
+            cache_exists = True
+
+    cache_exists = comm.bcast(cache_exists, root=0)
+
+    # ==========================================
+    # PATH A: cache gets read
+    # ==========================================
+    if cache_exists:
+        if rank == 0:
+            print(f"Load raw data from cache {cache_filename}...")
+            with open(cache_filename, 'rb') as f:
+                cached_data = pickle.load(f)
+
+            # Rohdaten und Parameter entpacken
+            params = cached_data['params']
+            r_vals = cached_data['r_vals']
+            z_vals = cached_data['z_vals']
+            Fr_grid = cached_data['Fr_grid']
+            Fz_grid = cached_data['Fz_grid']
+            phi = cached_data['phi']
+
+        else:
+            return None
+
+    # ==========================================
+    # PATH B: data needs to be computed
+    # ==========================================
+    else:
+        if rank == 0:
+            print("Calculating 2D background flow...")
+            R_hat, H_hat, W_hat, L_c, U_c, Re_calc = first_nondimensionalisation(R, H, W, Q, rho, mu, print_values=True)
+
+            bg = background_flow(R_hat, H_hat, W_hat, Re_calc, comm=MPI.COMM_SELF)
+            G_hat, U_m_hat, u_bar_2d_hat, p_bar_2d_hat = bg.solve_2D_background_flow()
+
+            R_hat_hat, H_hat_hat, W_hat_hat, a_hat_hat, G_hat_hat, L_c_p, U_c_p, u_bar_2d_hat_hat, p_bar_2d_hat_hat, Re_p = second_nondimensionalisation(
+                R_hat, H_hat, W_hat, a, L_c, U_c, G_hat, Re_calc, u_bar_2d_hat, p_bar_2d_hat, U_m_hat)
+
+            u_bar_2d_hat_hat_np = u_bar_2d_hat_hat.dat.data_ro.copy()
+            p_bar_2d_hat_hat_np = p_bar_2d_hat_hat.dat.data_ro.copy()
+
+            # Alle Parameter speichern, damit wir F_p_grid später aus dem Cache aufbauen können
+            params = {
+                'R_hat_hat': R_hat_hat, 'H_hat_hat': H_hat_hat, 'W_hat_hat': W_hat_hat,
+                'a_hat_hat': a_hat_hat, 'G_hat_hat': G_hat_hat, 'Re_p': Re_p,
+                'L_c': L_c, 'L_c_p': L_c_p,
+                'L': 4 * max(H_hat_hat, W_hat_hat),
+                'particle_maxh': particle_maxh_rel * a_hat_hat,
+                'global_maxh': global_maxh_rel * min(H_hat_hat, W_hat_hat),
+                'eps': eps_rel * a_hat_hat
+            }
+            print("Background flow calculation done. Broadcasting data...")
+        else:
+            params = None
+            u_bar_2d_hat_hat_np = None
+            p_bar_2d_hat_hat_np = None
+
+        params = comm.bcast(params, root=0)
+        u_data_np = comm.bcast(u_bar_2d_hat_hat_np, root=0)
+        p_data_np = comm.bcast(p_bar_2d_hat_hat_np, root=0)
+
+        if rank == 0:
+            print("Starting parallel force grid calculation...")
+
+        # F_p_grid für die echte Berechnung instanziieren
+        f_grid_calc = F_p_grid(
+            params['R_hat_hat'], params['H_hat_hat'], params['W_hat_hat'],
+            params['a_hat_hat'], params['G_hat_hat'], params['Re_p'],
+            params['L'], params['particle_maxh'], params['global_maxh'], params['eps']
+        )
+
+        grid_values = f_grid_calc.compute_F_p_grid_ensemble(N_grid=N_grid, u_bg_data_np=u_data_np,
+                                                            p_bg_data_np=p_data_np)
+
+        if rank == 0:
+            r_vals, z_vals, phi, Fr_grid, Fz_grid = grid_values
+
+            # NUR Rohdaten in den Cache legen
+            data_to_save = {
+                'params': params,
+                'r_vals': r_vals,
+                'z_vals': z_vals,
+                'Fr_grid': Fr_grid,
+                'Fz_grid': Fz_grid,
+                'phi': phi
+            }
+
+            with open(cache_filename, 'wb') as f:
+                pickle.dump(data_to_save, f)
+
+            print(f"Parallel computation finished. Raw data saved to {cache_filename}")
+        else:
+            return None
+
+    # ==========================================
+    # POST-PROCESSING (Rank 0 only)
+    # ==========================================
+    if rank == 0:
+        print("Running analysis (interpolation, equilibria, plot)...")
+
+        f_grid = F_p_grid(
+            params['R_hat_hat'], params['H_hat_hat'], params['W_hat_hat'],
+            params['a_hat_hat'], params['G_hat_hat'], params['Re_p'],
+            params['L'], params['particle_maxh'], params['global_maxh'], params['eps']
+        )
+
+        f_grid.N_grid = N_grid
+        f_grid.r_vals = r_vals
+        f_grid.z_vals = z_vals
+        f_grid.Fr_grid = Fr_grid
+        f_grid.Fz_grid = Fz_grid
+        f_grid.phi = phi
+
+        initial_guesses = f_grid.generate_initial_guesses()
+        classified_equilibria = f_grid.classify_equilibria_on_grid(initial_guesses)
+
+        f_grid.plot(params['L_c_p'], params['L_c'],
+                    classified_equilibria=classified_equilibria)
+
+        R_grid, Z_grid = np.meshgrid(r_vals, z_vals, indexing='ij')
+
+        print("Analysis complete. Returning requested objects.")
+
+        return {
+            "grid_points": {"R": R_grid, "Z": Z_grid},
+            "F_grid": {"Fr": Fr_grid, "Fz": Fz_grid},
+            "interpolators": {"interp_Fr": f_grid.interp_Fr, "interp_Fz": f_grid.interp_Fz},
+            "equilibria": classified_equilibria
+        }
+
+
+def auto_start_mpi(n_procs=5):
+    """
+        Restart the script using mpiexec if not already running under MPI.
+        Convenience function for local execution.
+    """
+    os.environ["PATH"] = "/opt/homebrew/bin:" + os.environ.get("PATH", "")
+    os.environ["MPICC"] = "/opt/homebrew/bin/mpicc"
+    os.environ["MPICXX"] = "/opt/homebrew/bin/mpicxx"
+    os.environ["CC"] = "/opt/homebrew/bin/mpicc"
+    os.environ["CXX"] = "/opt/homebrew/bin/mpicxx"
+
+    is_mpi = "OMPI_COMM_WORLD_RANK" in os.environ or \
+             "PMI_RANK" in os.environ or \
+             "SLURM_PROCID" in os.environ
+
+    if not is_mpi:
+
+        cmd = ["mpiexec", "-n", str(n_procs), sys.executable, "-u"] + sys.argv
+        print(f"Executing: {' '.join(cmd)}\n")
+
+        os.execv("/opt/homebrew/bin/mpiexec", ["/opt/homebrew/bin/mpiexec"] + cmd[1:])
+
 
 if __name__ == "__main__":
-    print("Starte Sanity Checks für das Force Grid und die Gleichgewichtspunkte...\n")
 
-    # Setze Parameter für einen schnellen Testlauf
-    R_test = 220.0
-    H_test = 2.0
-    W_test = 2.0
-    a_test = 0.1
-    Re_test = 1.0
-    Re_p_test = Re_test * (a_test ** 2)
+    auto_start_mpi()
 
-    # ACHTUNG: Für einen Sanity Check nehmen wir ein SEHR grobes Grid, um Rechenzeit zu sparen!
-    # Für produktive Plots (wie in Abb. 3 im Paper) solltest du N_grid auf 20-40 erhöhen.
-    N_grid_test = 5
-    eps_test = 0.05
+    from config_paper_parameters import *
 
-    # 1. Berechne 2D Background Flow
-    print("1. Berechne 2D Background Flow...")
-    bg = background_flow(R_test, H_test, W_test, Re_test)
-    G_val, U_m_hat, u_bar_2d, p_bar_tilde_2d = bg.solve_2D_background_flow()
-
-    # Extrahiere die numpy Arrays für die MPI Verteilung
-    u_bg_data = u_bar_2d.dat.data_ro
-    p_bg_data = p_bar_tilde_2d.dat.data_ro
-
-    print(f"\n2. Initialisiere Grid-Berechnung ({N_grid_test}x{N_grid_test} Punkte)...")
-    # Konstanten für Dummy-Skalierung im Plot
-    L_c = 1.0
-    L_c_p = 1.0
-
-    grid_solver = F_p_grid(R=R_test, H=H_test, W=W_test, a=a_test, G=G_val,
-                           Re_p=Re_p_test, L=8.0,
-                           particle_maxh=0.2 * a_test,
-                           global_maxh=0.2 * min(H_test, W_test),
-                           eps=eps_test)
-
-    # Starte die parallele Berechnung (hier im Test mit N_grid_test = 5)
-    r_vals, z_vals, phi, Fr_grid, Fz_grid = grid_solver.compute_F_p_grid_ensemble(N_grid_test, u_bg_data, p_bg_data)
-
-    # Die restlichen Sanity Checks laufen nur auf dem Root-Prozess (Rang 0),
-    # da nur dieser die gesammelten Daten (Gather) zurückbekommt.
-    if COMM_WORLD.rank == 0:
-        print("\n3. Prüfe Grid-Dimensionen...")
-        assert Fr_grid.shape == (N_grid_test, N_grid_test), "Fehler: Fr_grid hat die falsche Form!"
-        assert Fz_grid.shape == (N_grid_test, N_grid_test), "Fehler: Fz_grid hat die falsche Form!"
-        print("   -> Grid-Dimensionen sind korrekt.")
-
-        print("\n4. Suche Gleichgewichtspunkte (Roots)...")
-        # Bei einem 5x5 Grid sind Splines sehr ungenau, daher setzen wir n_grid_search klein an.
-        equilibria = grid_solver.generate_initial_guesses(n_grid_search=10, tol_unique=1e-3, tol_residual=1e-3)
-        print(f"   -> {len(equilibria)} potenzielle Gleichgewichtspunkte gefunden.")
-
-        print("\n5. Klassifiziere Gleichgewichtspunkte und überprüfe Residuen...")
-        classified = grid_solver.classify_equilibria_on_grid(equilibria)
-
-        for i, eq in enumerate(classified):
-            r_eq, z_eq = eq["x_eq"]
-            # Sanity Check: Ist die Kraft an diesem interpolierten Punkt wirklich (nahezu) null?
-            Fr_val = grid_solver.interp_Fr(r_eq, z_eq)[0, 0]
-            Fz_val = grid_solver.interp_Fz(r_eq, z_eq)[0, 0]
-            force_mag = np.sqrt(Fr_val ** 2 + Fz_val ** 2)
-
-            print(f"   Eq {i + 1}: r={r_eq:.3f}, z={z_eq:.3f} | Typ: {eq['type']} | Restkraft: {force_mag:.2e}")
-            assert force_mag < 1e-2, f"Fehler: Gefundener Punkt {i + 1} ist kein echtes Gleichgewicht (Restkraft zu hoch)!"
-
-        print("\n=============================================")
-        print("=== ALLE SANITY CHECKS ERFOLGREICH BEENDET ===")
-        print("=============================================")
+    force_grid(R, H, W, Q, rho, mu, a, N_grid, particle_maxh_rel, global_maxh_rel, eps_rel)

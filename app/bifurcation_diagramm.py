@@ -19,9 +19,9 @@ warnings.filterwarnings("ignore", message=".*import SLEPc.*", category=UserWarni
 comm = MPI.COMM_WORLD
 rank = comm.Get_rank()
 
-a_hat_values = np.round(np.arange(0.01, 0.16, 0.01), 5)
+a_hat_values = np.round(np.arange(0.01, 0.16, 0.0025), 5)
 
-RESULTS_FILE = "app/bifurcation_results.json"
+RESULTS_FILE = "images/Sweep_a=0.01_to_0.15_R=500_H=W=2/bifurcation_results.json"
 PLOT_MODE = "3d"  # allowed: "3d", "2d_r", "2d_z"
 
 def auto_start_mpi(n_procs=5):
