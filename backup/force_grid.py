@@ -43,7 +43,7 @@ def auto_start_mpi(n_procs=5):
 
 if __name__ == "__main__":
 
-    auto_start_mpi(7)
+    auto_start_mpi(5)
 
     params = None
     u_bar_2d_hat_hat_np = None

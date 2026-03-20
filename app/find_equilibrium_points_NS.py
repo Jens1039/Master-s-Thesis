@@ -2,31 +2,23 @@ from tqdm import tqdm
 import matplotlib.patches as patches
 from scipy.interpolate import RectBivariateSpline
 from scipy.optimize import root
-import os
 import pickle
 from mpi4py import MPI
-import numpy as np
 import gc
-import sys
 
 from nondimensionalization import *
-from background_flow import *
-from build_3d_geometry_gmsh import *
-from perturbed_flow import *
+from app.perturbed_flow_full_navier_stokes import *
 
 
+class F_p_grid_NS:
 
-
-class F_p_grid:
-
-    def __init__(self, R, H, W, a, G, Re_p, L, particle_maxh, global_maxh, eps):
+    def __init__(self, R, H, W, a, Re, L, particle_maxh, global_maxh, eps):
 
         self.R = R
         self.H = H
         self.W = W
         self.a = a
-        self.G = G
-        self.Re_p = Re_p
+        self.Re = Re
         self.L = L
 
         self.particle_maxh = particle_maxh
@@ -38,16 +30,8 @@ class F_p_grid:
         self.z_min = -H / 2 + a + eps
         self.z_max = H / 2 - a - eps
 
-        self.mesh_nx = 120
-        self.mesh_ny = 120
 
-        self._current_mesh = None
-        self._original_coords = None
-        self._current_r = None
-        self._current_z = None
-
-
-    def compute_F_p_grid_ensemble(self, N_grid, u_bg_data_np, p_bg_data_np):
+    def compute_F_p_grid_ensemble(self, N_grid):
 
         self.N_grid = N_grid
 
@@ -56,17 +40,6 @@ class F_p_grid:
 
         global_rank = COMM_WORLD.rank
         global_size = COMM_WORLD.size
-
-        mesh2d_local = RectangleMesh(self.mesh_nx, self.mesh_ny, self.W, self.H, quadrilateral=False, comm=my_comm)
-
-        V_local = VectorFunctionSpace(mesh2d_local, "CG", 2, dim=3)
-        Q_local = FunctionSpace(mesh2d_local, "CG", 1)
-
-        u_bg_local = Function(V_local)
-        p_bg_local = Function(Q_local)
-
-        u_bg_local.dat.data[:] = u_bg_data_np
-        p_bg_local.dat.data[:] = p_bg_data_np
 
         r_vals = np.linspace(self.r_min, self.r_max, N_grid)
         z_vals = np.linspace(self.z_min, self.z_max, N_grid)
@@ -80,28 +53,24 @@ class F_p_grid:
         local_results = []
 
         if global_rank == 0:
-            print(f"Start ensemble grid: {len(all_tasks)} points on {global_size} cores.")
+            print(f"Start NS ensemble grid: {len(all_tasks)} points on {global_size} cores.")
 
         for task in tqdm(my_tasks, disable=(global_rank != 0)):
             (i, j, r_loc, z_loc) = task
 
-            mesh3d, tags = make_curved_channel_section_with_spherical_hole(
+            mesh3d, tags = make_curved_channel_section_with_spherical_hole_periodic(
                     self.R, self.H, self.W, self.L, self.a,
                     self.particle_maxh, self.global_maxh,
                     r_off=r_loc, z_off=z_loc,
                     comm=my_comm)
 
-            u_3d, p_3d = build_3d_background_flow(
-                self.R, self.H, self.W, self.G, mesh3d, tags, u_bg_local, p_bg_local)
-
-            pf = perturbed_flow(self.R, self.H, self.W, self.L, self.a, self.Re_p, mesh3d, tags, u_3d, p_3d)
-
-            F_r, F_z = pf.F_p()
+            ns = FullNavierStokesSolver(self.R, self.H, self.W, self.L, self.a, self.Re, mesh3d, tags)
+            ns.solve_flow()
+            F_r, F_theta, F_z = ns.compute_particle_force()
 
             local_results.append((i, j, F_r, F_z))
 
-            # fix memory leakage
-            del pf, mesh3d, tags, u_3d, p_3d
+            del ns, mesh3d, tags
             gc.collect()
 
 
@@ -162,10 +131,8 @@ class F_p_grid:
         for r0 in r_starts:
             for z0 in z_starts:
 
-                # finds a root on the interpolated function. It uses a hybrid method between GD and newton and starts with (r0, z0).
                 solution = root(F, [r0, z0], jac=J, method="hybr")
 
-                # returns a boolean expression depending on the success of the root search
                 if solution.success:
                     r_sol, z_sol = solution.x
 
@@ -234,7 +201,7 @@ class F_p_grid:
         return classified_equilibria
 
 
-    def plot(self, L_c_p, L_c, initial_guesses=None, classified_equilibria=None):
+    def plot(self, L_c, initial_guesses=None, classified_equilibria=None):
 
         R_grid, Z_grid = np.meshgrid(self.r_vals, self.z_vals, indexing='ij')
 
@@ -307,15 +274,15 @@ class F_p_grid:
         ax.set_xlabel("r")
         ax.set_ylabel("z")
 
-        # Just for visualisation purposes
-        a = (L_c_p/L_c) * self.a
-        R = (L_c_p/L_c) * self.R
-        H = (L_c_p/L_c) * self.H
-        W = (L_c_p/L_c) * self.W
+        a_display = self.a
+        R_display = self.R
+        H_display = self.H
+        W_display = self.W
 
-        ax.set_title(f"Force_Map_a={a:.3f}_R={R:.0f}_W={W:.0f}_H={H:.0f}_Re{self.Re_p/(a**2)}_N_grid={self.N_grid}")
+        ax.set_title(f"Force_Map_NS_a={a_display:.3f}_R={R_display:.0f}_W={W_display:.0f}_H={H_display:.0f}_Re{self.Re:.1f}_N_grid={self.N_grid}")
         plt.tight_layout()
-        filename = f"images/Force_Map_a={a:.3f}_R={R:.0f}_W={W:.0f}_H={H:.0f}_Re{self.Re_p/(a**2)}_N_grid={self.N_grid}.png"
+        os.makedirs("../app/images", exist_ok=True)
+        filename = f"images/Force_Map_NS_a={a_display:.3f}_R={R_display:.0f}_W={W_display:.0f}_H={H_display:.0f}_Re{self.Re:.1f}_N_grid={self.N_grid}.png"
         plt.savefig(filename)
         print(f"Plot saved to {filename}")
         plt.show()
@@ -328,7 +295,7 @@ def force_grid(R, H, W, Q, rho, mu, a, N_grid, particle_maxh_rel, global_maxh_re
 
     cache_dir = "cache"
     Re = (rho*Q/(W*H)*(H/2))/mu
-    cache_filename = f"{cache_dir}/force_grid_R{R:.1f}_H{H:.1f}_W{W:.1f}_a{a:.3f}_Re{Re:.1f}_N{N_grid}.pkl"
+    cache_filename = f"{cache_dir}/force_grid_NS_R{R:.1f}_H{H:.1f}_W{W:.1f}_a{a:.3f}_Re{Re:.1f}_N{N_grid}.pkl"
 
     cache_exists = False
     if rank == 0:
@@ -347,7 +314,6 @@ def force_grid(R, H, W, Q, rho, mu, a, N_grid, particle_maxh_rel, global_maxh_re
             with open(cache_filename, 'rb') as f:
                 cached_data = pickle.load(f)
 
-            # Rohdaten und Parameter entpacken
             params = cached_data['params']
             r_vals = cached_data['r_vals']
             z_vals = cached_data['z_vals']
@@ -363,55 +329,40 @@ def force_grid(R, H, W, Q, rho, mu, a, N_grid, particle_maxh_rel, global_maxh_re
     # ==========================================
     else:
         if rank == 0:
-            print("Calculating 2D background flow...")
+            print("Computing nondimensionalized parameters for NS solver...")
             R_hat, H_hat, W_hat, L_c, U_c, Re_calc = first_nondimensionalisation(R, H, W, Q, rho, mu, print_values=True)
 
-            bg = background_flow(R_hat, H_hat, W_hat, Re_calc, comm=MPI.COMM_SELF)
-            G_hat, U_m_hat, u_bar_2d_hat, p_bar_2d_hat = bg.solve_2D_background_flow()
+            a_hat = a / L_c
 
-            R_hat_hat, H_hat_hat, W_hat_hat, a_hat_hat, G_hat_hat, L_c_p, U_c_p, u_bar_2d_hat_hat, p_bar_2d_hat_hat, Re_p = second_nondimensionalisation(
-                R_hat, H_hat, W_hat, a, L_c, U_c, G_hat, Re_calc, u_bar_2d_hat, p_bar_2d_hat, U_m_hat)
-
-            u_bar_2d_hat_hat_np = u_bar_2d_hat_hat.dat.data_ro.copy()
-            p_bar_2d_hat_hat_np = p_bar_2d_hat_hat.dat.data_ro.copy()
-
-            # Alle Parameter speichern, damit wir F_p_grid später aus dem Cache aufbauen können
             params = {
-                'R_hat_hat': R_hat_hat, 'H_hat_hat': H_hat_hat, 'W_hat_hat': W_hat_hat,
-                'a_hat_hat': a_hat_hat, 'G_hat_hat': G_hat_hat, 'Re_p': Re_p,
-                'L_c': L_c, 'L_c_p': L_c_p,
-                'L': 4 * max(H_hat_hat, W_hat_hat),
-                'particle_maxh': particle_maxh_rel * a_hat_hat,
-                'global_maxh': global_maxh_rel * min(H_hat_hat, W_hat_hat),
-                'eps': eps_rel * a_hat_hat
+                'R_hat': R_hat, 'H_hat': H_hat, 'W_hat': W_hat,
+                'a_hat': a_hat, 'Re': Re_calc,
+                'L_c': L_c,
+                'L': 30 * max(H_hat, W_hat),
+                'particle_maxh': particle_maxh_rel * a_hat,
+                'global_maxh': global_maxh_rel * min(H_hat, W_hat),
+                'eps': eps_rel * a_hat
             }
-            print("Background flow calculation done. Broadcasting data...")
+            print("Parameter computation done. Broadcasting data...")
         else:
             params = None
-            u_bar_2d_hat_hat_np = None
-            p_bar_2d_hat_hat_np = None
 
         params = comm.bcast(params, root=0)
-        u_data_np = comm.bcast(u_bar_2d_hat_hat_np, root=0)
-        p_data_np = comm.bcast(p_bar_2d_hat_hat_np, root=0)
 
         if rank == 0:
-            print("Starting parallel force grid calculation...")
+            print("Starting parallel NS force grid calculation...")
 
-        # F_p_grid für die echte Berechnung instanziieren
-        f_grid_calc = F_p_grid(
-            params['R_hat_hat'], params['H_hat_hat'], params['W_hat_hat'],
-            params['a_hat_hat'], params['G_hat_hat'], params['Re_p'],
+        f_grid_calc = F_p_grid_NS(
+            params['R_hat'], params['H_hat'], params['W_hat'],
+            params['a_hat'], params['Re'],
             params['L'], params['particle_maxh'], params['global_maxh'], params['eps']
         )
 
-        grid_values = f_grid_calc.compute_F_p_grid_ensemble(N_grid=N_grid, u_bg_data_np=u_data_np,
-                                                            p_bg_data_np=p_data_np)
+        grid_values = f_grid_calc.compute_F_p_grid_ensemble(N_grid=N_grid)
 
         if rank == 0:
             r_vals, z_vals, phi, Fr_grid, Fz_grid = grid_values
 
-            # NUR Rohdaten in den Cache legen
             data_to_save = {
                 'params': params,
                 'r_vals': r_vals,
@@ -434,9 +385,9 @@ def force_grid(R, H, W, Q, rho, mu, a, N_grid, particle_maxh_rel, global_maxh_re
     if rank == 0:
         print("Running analysis (interpolation, equilibria, plot)...")
 
-        f_grid = F_p_grid(
-            params['R_hat_hat'], params['H_hat_hat'], params['W_hat_hat'],
-            params['a_hat_hat'], params['G_hat_hat'], params['Re_p'],
+        f_grid = F_p_grid_NS(
+            params['R_hat'], params['H_hat'], params['W_hat'],
+            params['a_hat'], params['Re'],
             params['L'], params['particle_maxh'], params['global_maxh'], params['eps']
         )
 
@@ -450,7 +401,7 @@ def force_grid(R, H, W, Q, rho, mu, a, N_grid, particle_maxh_rel, global_maxh_re
         initial_guesses = f_grid.generate_initial_guesses()
         classified_equilibria = f_grid.classify_equilibria_on_grid(initial_guesses)
 
-        f_grid.plot(params['L_c_p'], params['L_c'],
+        f_grid.plot(params['L_c'],
                     classified_equilibria=classified_equilibria)
 
         R_grid, Z_grid = np.meshgrid(r_vals, z_vals, indexing='ij')
@@ -466,10 +417,6 @@ def force_grid(R, H, W, Q, rho, mu, a, N_grid, particle_maxh_rel, global_maxh_re
 
 
 def auto_start_mpi(n_procs=5):
-    """
-        Restart the script using mpiexec if not already running under MPI.
-        Convenience function for local execution.
-    """
     os.environ["PATH"] = "/opt/homebrew/bin:" + os.environ.get("PATH", "")
     os.environ["MPICC"] = "/opt/homebrew/bin/mpicc"
     os.environ["MPICXX"] = "/opt/homebrew/bin/mpicxx"

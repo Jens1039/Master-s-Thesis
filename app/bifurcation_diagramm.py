@@ -9,7 +9,7 @@ import matplotlib.pyplot as plt
 from mpi4py import MPI
 import plotly.graph_objects as go
 
-from config_paper_parameters import *
+
 from nondimensionalization import *
 from find_equilbrium_points import *
 
@@ -19,9 +19,9 @@ warnings.filterwarnings("ignore", message=".*import SLEPc.*", category=UserWarni
 comm = MPI.COMM_WORLD
 rank = comm.Get_rank()
 
-a_hat_values = np.round(np.arange(0.01, 0.16, 0.0025), 5)
+a_hat_values = np.round(np.arange(0.01, 0.2, 0.005), 5)
 
-RESULTS_FILE = "images/Sweep_a=0.01_to_0.15_R=500_H=W=2/bifurcation_results.json"
+RESULTS_FILE = "bifurcation_results.json"
 PLOT_MODE = "3d"  # allowed: "3d", "2d_r", "2d_z"
 
 def auto_start_mpi(n_procs=5):
@@ -204,6 +204,8 @@ def plot_bifurcation_diagram(data, plot_mode="3d", save=True, show=True):
 
 if __name__ == "__main__":
 
+    from config_paper_parameters import *
+
     auto_start_mpi()
 
     os.makedirs("images", exist_ok=True)
@@ -243,12 +245,12 @@ if __name__ == "__main__":
     #  sweep over a_hat values
     bifurcation_data = []
 
-    for alpha in a_hat_values:
-        a_phys = float(alpha) * (H / 2)
+    for a_hat in a_hat_values:
+        a_phys = float(a_hat) * (H / 2)
 
         if rank == 0:
             print(f"\n{'='*60}")
-            print(f"  alpha = {alpha:.5f}  |  a = {a_phys * 1e6:.2f} µm")
+            print(f"  a_hat = {a_hat:.5f}  |  a = {a_phys * 1e6:.2f} µm")
             print(f"{'='*60}")
 
         iter_params   = None
@@ -305,7 +307,7 @@ if __name__ == "__main__":
                 z_norm = float(z_eq) * (L_c_p / L_c)
 
                 bifurcation_data.append({
-                    "a_hat":  float(alpha),
+                    "a_hat":  float(a_hat),
                     "r_raw":  float(r_eq),
                     "z_raw":  float(z_eq),
                     "r_norm": r_norm,

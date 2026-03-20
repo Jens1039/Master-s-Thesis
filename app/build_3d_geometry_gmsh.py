@@ -9,7 +9,6 @@ from firedrake import *
 
 
 def make_curved_channel_section_with_spherical_hole(R, H, W, L, a, particle_maxh, global_maxh,
-                                                     scaling="second_nondimensionalisation",
                                                      r_off=0.0, z_off=0.0, order=2, comm=COMM_SELF):
     """
     Gmsh-based drop-in replacement for the Netgen version in build_3d_geometry_netgen.py.
@@ -35,7 +34,6 @@ def make_curved_channel_section_with_spherical_hole(R, H, W, L, a, particle_maxh
     gmsh.option.setNumber("General.Terminal", 0)
     gmsh.option.setNumber("Mesh.MeshSizeMax", global_maxh)
 
-    # --- Geometry ---
     # Cross-section at angle 0 in the x-z plane (y = 0), centred at (R, 0, 0)
     p1 = gmsh.model.occ.addPoint(R - W / 2, 0, -H / 2)
     p2 = gmsh.model.occ.addPoint(R + W / 2, 0, -H / 2)
@@ -65,13 +63,11 @@ def make_curved_channel_section_with_spherical_hole(R, H, W, L, a, particle_maxh
     gmsh.model.occ.cut([(3, duct_tag)], [(3, particle_sphere)])
     gmsh.model.occ.synchronize()
 
-    # --- Label the fluid volume ---
     volumes = gmsh.model.getEntities(dim=3)
     assert len(volumes) == 1, f"Expected 1 volume, found {len(volumes)}"
     gmsh.model.addPhysicalGroup(3, [volumes[0][1]], FLUID_VOL)
     gmsh.model.setPhysicalName(3, FLUID_VOL, "Fluid volume")
 
-    # --- Identify and label boundary surfaces ---
     surfaces = gmsh.model.occ.getEntities(dim=2)
     wall_tags = []
     particle_tags = []
@@ -97,6 +93,18 @@ def make_curved_channel_section_with_spherical_hole(R, H, W, L, a, particle_maxh
         else:
             wall_tags.append(surface[1])
 
+    def _debug_surfaces(surfaces, inlet_com, outlet_com, particle_com, cross_area):
+        """Print diagnostic information when surface identification fails."""
+        print("\n=== SURFACE IDENTIFICATION DEBUG ===")
+        print(f"Expected inlet  CoM: {inlet_com},   area: {cross_area:.6f}")
+        print(f"Expected outlet CoM: {outlet_com},  area: {cross_area:.6f}")
+        print(f"Expected particle CoM: {particle_com}")
+        for surface in surfaces:
+            com = gmsh.model.occ.getCenterOfMass(surface[0], surface[1])
+            area = gmsh.model.occ.getMass(surface[0], surface[1])
+            print(f"  Surface {surface}: CoM={np.array(com)}, area={area:.6f}")
+        print("====================================\n")
+
     if inlet_tag is None or outlet_tag is None or len(particle_tags) == 0:
         _debug_surfaces(surfaces, inlet_com_exp, outlet_com_exp, particle_com_exp, cross_area)
     assert inlet_tag is not None, "Could not identify inlet surface"
@@ -114,7 +122,7 @@ def make_curved_channel_section_with_spherical_hole(R, H, W, L, a, particle_maxh
     gmsh.model.setPhysicalName(2, PARTICLE, "particle")
 
     # --- Mesh refinement near particle (Brendan's strategy) ---
-    # Brendan uses an internal meshsize derived from the channel geometry, NOT the
+    # Brendan uses an internal meshsize derived from the channel geometry, not the
     # user-provided global_maxh.  The user's global_maxh still acts as a hard cap
     # via MeshSizeMax (set above), so the far-field never exceeds it.
     meshsize = min(W, H) / 2.5
@@ -140,7 +148,6 @@ def make_curved_channel_section_with_spherical_hole(R, H, W, L, a, particle_maxh
     gmsh.model.mesh.field.setNumbers(min_field, "FieldsList", [thresh_fine, thresh_mid])
     gmsh.model.mesh.field.setAsBackgroundMesh(min_field)
 
-    # --- Generate and optimise the mesh ---
     gmsh.model.mesh.generate(3)
 
     if order > 1:
@@ -154,7 +161,6 @@ def make_curved_channel_section_with_spherical_hole(R, H, W, L, a, particle_maxh
     except Exception:
         gmsh.model.mesh.optimize()
 
-    # --- Write to a temporary .msh file (format 2.2 for Firedrake) ---
     fd, tmp_path = tempfile.mkstemp(suffix=".msh")
     os.close(fd)
     gmsh.option.setNumber("Mesh.MshFileVersion", 2.2)
@@ -180,19 +186,6 @@ def make_curved_channel_section_with_spherical_hole(R, H, W, L, a, particle_maxh
     return mesh3d, tags
 
 
-def _debug_surfaces(surfaces, inlet_com, outlet_com, particle_com, cross_area):
-    """Print diagnostic information when surface identification fails."""
-    print("\n=== SURFACE IDENTIFICATION DEBUG ===")
-    print(f"Expected inlet  CoM: {inlet_com},   area: {cross_area:.6f}")
-    print(f"Expected outlet CoM: {outlet_com},  area: {cross_area:.6f}")
-    print(f"Expected particle CoM: {particle_com}")
-    for surface in surfaces:
-        com = gmsh.model.occ.getCenterOfMass(surface[0], surface[1])
-        area = gmsh.model.occ.getMass(surface[0], surface[1])
-        print(f"  Surface {surface}: CoM={np.array(com)}, area={area:.6f}")
-    print("====================================\n")
-
-
 if __name__ == "__main__":
 
     TEST_R = 220.0
@@ -207,7 +200,6 @@ if __name__ == "__main__":
     mesh3d, tags = make_curved_channel_section_with_spherical_hole(
         R=TEST_R, H=TEST_H, W=TEST_W, L=TEST_L, a=TEST_a,
         particle_maxh=TEST_a / 3, global_maxh=1.0,
-        scaling="second_nondimensionalisation",
         r_off=TEST_r_off, z_off=TEST_z_off, order=2
     )
 

@@ -1,297 +1,285 @@
-import json
 import os
-import numpy as np
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+
 from scipy.optimize import root
-from scipy.interpolate import RectBivariateSpline, RegularGridInterpolator
 
-from background_flow import background_flow
-from find_equilbrium_points import F_p_grid
-from nondimensionalization import *
-from config_paper_parameters import *
+from firedrake.adjoint import *
 
-RESULTS_DIR = "optimization_results"
+from app.perturbed_flow_full_navier_stokes import *
+
+
+def apply_ale_deformation(mesh3d, tags, a_tilde, dr, dz, a_new):
+
+    V_def = VectorFunctionSpace(mesh3d, "CG", 1)
+    disp = TrialFunction(V_def)
+    v = TestFunction(V_def)
+
+    a_form = inner(grad(disp), grad(v)) * dx
+    L_form = inner(Constant((0.0, 0.0, 0.0)), v) * dx
+
+    x = SpatialCoordinate(mesh3d)
+    x_p = Constant(tags["particle_center"])
+
+    scale_factor = a_new / Constant(a_tilde) - 1.0
+
+    disp_particle_expr = scale_factor * (x - x_p) + as_vector([dr, 0.0, dz])
+    disp_particle = Function(V_def)
+    trial_d = TrialFunction(V_def)
+    test_d = TestFunction(V_def)
+
+    solve(
+        inner(trial_d, test_d) * dx == inner(disp_particle_expr, test_d) * dx,
+        disp_particle,
+        solver_parameters={"ksp_type": "cg", "pc_type": "jacobi"}
+    )
+
+    bcs = [
+        DirichletBC(V_def, Constant((0.0, 0.0, 0.0)), tags["walls"]),
+        DirichletBC(V_def, disp_particle, tags["particle"])
+    ]
+
+    displacement = Function(V_def)
+    solve(a_form == L_form, displacement, bcs=bcs)
+
+    mesh3d.coordinates.assign(mesh3d.coordinates + displacement)
+    return displacement
+
+
+def evaluate_exact_forces(mesh3d, tags, params, dr_val, dz_val, a_val):
+
+    apply_ale_deformation(mesh3d, tags, params['a_tilde'], dr_val, dz_val, a_val)
+
+    updated_tags = tags.copy()
+    updated_tags["particle_center"] = (
+        tags["particle_center"][0] + dr_val,
+        tags["particle_center"][1],
+        tags["particle_center"][2] + dz_val
+    )
+
+    NS = FullNavierStokesSolver(
+        params['R_hat'], params['H_hat'], params['W_hat'],
+        params['L_hat'], a_val, params['Re'], mesh3d, updated_tags
+    )
+    NS.solve_flow()
+    F_total_r, _, F_total_z = NS.compute_particle_force()
+
+    return F_total_r, F_total_z
+
+
+def setup_adjoint_tape(mesh3d, tags, params):
+
+    R_space = FunctionSpace(mesh3d, "R", 0)
+
+    dr_ctrl = Function(R_space).assign(0.0)
+    dz_ctrl = Function(R_space).assign(0.0)
+    a_ctrl = Function(R_space).assign(params['a_tilde'])
+
+    F_r_0, F_z_0 = evaluate_exact_forces(mesh3d, tags, params, dr_ctrl, dz_ctrl, a_ctrl)
+
+    controls = [Control(dr_ctrl), Control(dz_ctrl), Control(a_ctrl)]
+    F_x = ReducedFunctional(F_r_0, controls)
+    F_z = ReducedFunctional(F_z_0, controls)
+
+    return F_x, F_z, R_space
+
+
+def evaluate_force_data(J_Fr, J_Fz, R_space, dr, dz, a):
+
+    def make_scalar_control(value):
+        ctrl = Function(R_space)
+        ctrl.assign(float(value))
+        return ctrl
+
+    eval_ctrls = [make_scalar_control(dr), make_scalar_control(dz), make_scalar_control(a)]
+
+    F_r_val = float(J_Fr(eval_ctrls))
+    F_z_val = float(J_Fz(eval_ctrls))
+
+    dFr_d = J_Fr.derivative()
+    grad_Fr = np.array([comp.dat.data[0] for comp in dFr_d], dtype=float)
+
+    dFz_d = J_Fz.derivative()
+    grad_Fz = np.array([comp.dat.data[0] for comp in dFz_d], dtype=float)
+
+    F_u = np.array([
+        [grad_Fr[0], grad_Fr[1]],
+        [grad_Fz[0], grad_Fz[1]]
+    ], dtype=float)
+
+    return F_r_val, F_z_val, grad_Fr, grad_Fz, F_u
+
 
 if __name__ == '__main__':
-    from mpi4py import MPI
-    comm = MPI.COMM_WORLD
-    rank = comm.Get_rank()
 
-    # ---Input-------------------------------------------------------------
+    continue_annotation()
 
-    # Initial domain:
-    r_min = -W / 2 + a + eps_rel*a
-    r_max = W / 2 - a - eps_rel*a
-    z_min = -H / 2 + a + eps_rel*a
-    z_max = H / 2 - a - eps_rel*a
-    r_vals = np.linspace(r_min, r_max, N_grid)
-    z_vals = np.linspace(z_min, z_max, N_grid)
+    # =========================================================================
+    # --- INPUT
+    # =========================================================================
 
-    # Initial guess:
-    r_tilde = 0.6
-    z_tilde = 0.0016
-    a_tilde = 0.133
+    R_hat = 500.0
+    H_hat = 2.0
+    W_hat = 2.0
+    L_hat = 30 * max(H_hat, W_hat)
+    Re = 1.0
 
-    # Target bifurcation parameter:
+    # -------------------------------------------------------------------------
+
+    # Initial guess (from the bifurcation diagram)
+    r_tilde = 0.61
+    z_tilde = 0.0
+    a_tilde = 0.135
+
+    # Initial domain
+    mesh3d, tags = make_curved_channel_section_with_spherical_hole_periodic(
+        R_hat, H_hat, W_hat, L=L_hat, a=a_tilde,
+        particle_maxh=0.2 * a_tilde,
+        global_maxh=0.2 * min(H_hat, W_hat),
+        r_off=r_tilde, z_off=z_tilde
+    )
+
+    # target bifurcation parameter
     a_star = 0.08
 
-    # Tolerance
-    epsilon = None
+    # tolerance
+    epsilon = 1e-6
 
+    # =========================================================================
+    # --- 1.  Solve the eigenvalue problem to generate initial guesses
+    # =========================================================================
 
-    # Numerical Parameter:
-    a_vals = [a_tilde - 0.01, a_tilde ,a_tilde + 0.01]
-
-    # ---------------------------------------------------------------------
-
-
-    # ---1. Solve the eigenvalue problem to generate n initial guesses-----
-
-    from find_equilbrium_points import force_grid
-    force_grid_dict = force_grid(R, H, W, Q, rho, mu, a, N_grid, particle_maxh_rel, global_maxh_rel, eps_rel)
-
-    '''
-    {
-        "grid_points": {"R": R_grid, "Z": Z_grid},
-        "F_grid": {"Fr": Fr_grid, "Fz": Fz_grid},
-        "interpolators": {"interp_Fr": f_grid.interp_Fr, "interp_Fz": f_grid.interp_Fz},
-        "equilibria": classified_equilibria
+    params = {
+        'R_hat': R_hat,
+        'H_hat': H_hat,
+        'W_hat': W_hat,
+        'L_hat': L_hat,
+        'Re': Re,
+        'r_tilde': r_tilde,
+        'z_tilde': z_tilde,
+        'a_tilde': a_tilde,
+        'a_star': a_star,
+        'epsilon': epsilon
     }
-    '''
 
-    def Solve_the_eigenvalue_problem_to_generate_initial_guesses(r_tilde, z_tilde, a_tilde, interp_Fr, interp_Fz):
-        """
-        Löst das Eigenwertproblem Fu(u_tilde, lambda_tilde) * phi = mu * phi nach
-        Algorithmus 4.1 (Boullé et al.) und gibt alle (hier maximal 2) Eigenpaare zurück.
+    F_x, F_z, R_space = setup_adjoint_tape(mesh3d, tags, params)
 
-        Returns:
-            Eine Liste mit Dictionaries, die jeweils (u_tilde, lambda_tilde, mu, phi) enthalten.
-        """
-        # 1. Berechne die Jacobi-Matrix Fu am Punkt (r_tilde, z_tilde)
-        dFr_dr = interp_Fr(r_tilde, z_tilde, dx=1, dy=0)[0, 0]
-        dFr_dz = interp_Fr(r_tilde, z_tilde, dx=0, dy=1)[0, 0]
-        dFz_dr = interp_Fz(r_tilde, z_tilde, dx=1, dy=0)[0, 0]
-        dFz_dz = interp_Fz(r_tilde, z_tilde, dx=0, dy=1)[0, 0]
+    F_r_val, F_z_val, grad_Fr, grad_Fz, F_u_matrix = evaluate_force_data(F_x, F_z, R_space,
+                                                                         params['r_tilde'], params['z_tilde'], params['a_tilde'])
 
-        Fu = np.array([
-            [dFr_dr, dFr_dz],
-            [dFz_dr, dFz_dz]
-        ])
+    eigenvalues, eigenvectors = np.linalg.eig(F_u_matrix)
 
-        # 2. Löse das Eigenwertproblem Fu * phi = mu * phi
-        eigenvalues, eigenvectors = np.linalg.eig(Fu)
+    initial_guesses = []
 
-        # 3. Sammle beide Eigenpaare in einer Liste
-        initial_guesses = []
+    for i in range(len(eigenvalues)):
 
-        # Da es eine 2x2 Matrix ist, gibt es exakt 2 Eigenwerte/Eigenvektoren
-        for i in range(len(eigenvalues)):
-            mu = eigenvalues[i]
-            phi = eigenvectors[:, i]
+        phi_norm = eigenvectors[:, i] / np.linalg.norm(eigenvectors[:, i])
 
-            # Normiere den Eigenvektor (sehr wichtig für die Stabilität von Moore-Spence)
-            phi = phi / np.linalg.norm(phi)
+        guess_tuple = (
+            np.array([params['r_tilde'], params['z_tilde']]),
+            params['a_tilde'],
+            phi_norm
+        )
+        initial_guesses.append(guess_tuple)
 
-            # Speichere den Guess in der Liste
-            initial_guesses.append({
-                'u_tilde': np.array([r_tilde, z_tilde]),
-                'lambda_tilde': a_tilde,  # Der Bifurkationsparameter a
-                'mu': mu,  # Der Eigenwert
-                'phi': phi  # Der zugehörige normierte Eigenvektor
-            })
-
-        return initial_guesses
+    print(f"\nGenerated initial guesses (n={len(initial_guesses)}):")
+    for idx, guess in enumerate(initial_guesses):
+        print(f"  Guess {idx + 1}: u_tilde={guess[0]}, lambda_tilde={guess[1]}, phi={guess[2]}")
 
 
-    initial_guesses = Solve_the_eigenvalue_problem_to_generate_initial_guesses(r_tilde, z_tilde, a_tilde,
-                                                             force_grid_dict["interpolators"["interp_Fr"]],
-                                                             force_grid_dict["interpolators"["interp_Fz"]]
-                                                             )
+    # =========================================================================
+    # --- 2 - 4.  Solve the Moore–Spence system to obtain a solution ((r_i_bar, z_i_bar), a_i_bar, phi_i_bar)
+    # =========================================================================
 
-    # ---------------------------------------------------------------------
+    def moore_spence_residual(vars_array):
+        moore_spence_residual.eval_count += 1
+        dr, dz, a, phi_1, phi_2 = vars_array
+        phi_vec = np.array([phi_1, phi_2])
 
+        # 1. Daten über das Tape auswerten
+        F_r_val, F_z_val, _, _, F_u_matrix = evaluate_force_data(F_x, F_z, R_space, dr, dz, a)
 
-    # ---2 - 4. Solve the Moore–Spence system to obtain a solution---------
+        # 2. Rohe Teil-Residuen berechnen
+        res_state_raw = np.array([F_r_val, F_z_val])
+        res_eigen_raw = F_u_matrix @ phi_vec
+        res_norm_raw = np.array([np.dot(phi_vec, phi_vec) - 1.0])
 
-    def solve_moore_spence(guess_dict, interp_Fr_3d, interp_Fz_3d):
-        """
-        Löst das erweiterte Moore-Spence System H(y) = 0.
-        y ist der 5-dimensionale Vektor: [r, z, a, phi_r, phi_z]
-        """
-        # Startwerte aus dem Initial Guess entpacken
-        r0, z0 = guess_dict['u_tilde']
-        a0 = guess_dict['lambda_tilde']
-        phi0 = guess_dict['phi']
+        # 3. DYNAMISCHE SKALIERUNG (nur beim allerersten Aufruf pro Guess berechnen)
+        if moore_spence_residual.eval_count == 1:
+            norm_state = np.linalg.norm(res_state_raw)
+            norm_eigen = np.linalg.norm(res_eigen_raw)
 
-        # Der Vektor l für die Normierungsbedingung (l^T * phi = 1).
-        # Wir nehmen den initialen Eigenvektor als Referenzrichtung.
-        l_vec = phi0 / np.linalg.norm(phi0)
+            # Wir berechnen Faktoren, die den initialen Fehler auf ~1.0 normieren.
+            # max(..., 1e-8) schützt vor Division durch Null, falls wir perfekt starten.
+            moore_spence_residual.scale_state = 1.0 / max(norm_state, 1e-8)
+            moore_spence_residual.scale_eigen = 1.0 / max(norm_eigen, 1e-8)
 
-        # Initialer Vektor für den Solver
-        y0 = np.array([r0, z0, a0, phi0[0], phi0[1]])
+            # Die Normierungsbedingung (phi^2 - 1) liegt mathematisch ohnehin
+            # in der Größenordnung 1.0, daher braucht sie keine Skalierung.
+            moore_spence_residual.scale_norm = 1.0
 
-        def H(y):
-            r, z, a = y[0], y[1], y[2]
-            phi = np.array([y[3], y[4]])
+        # 4. Skalierung auf die aktuellen Residuen anwenden
+        res_state = res_state_raw * moore_spence_residual.scale_state
+        res_eigen = res_eigen_raw * moore_spence_residual.scale_eigen
+        res_norm = res_norm_raw * moore_spence_residual.scale_norm
 
-            pt = np.array([r, z, a])
+        # 5. Fehlerkomponenten für den Monitor berechnen
+        err_state = np.linalg.norm(res_state)
+        err_eigen = np.linalg.norm(res_eigen)
+        err_norm = np.linalg.norm(res_norm)
+        total_error = np.sqrt(err_state ** 2 + err_eigen ** 2 + err_norm ** 2)
 
-            # 1. Kraftfeld F(u, lambda)
-            F_r = interp_Fr_3d(pt)[0]
-            F_z = interp_Fz_3d(pt)[0]
+        print(f"    Eval {moore_spence_residual.eval_count:2d} | "
+              f"dr: {dr:8.5f}, dz: {dz:8.5f}, a: {a:8.5f} | "
+              f"Err: {total_error:7.1e} (F: {err_state:7.1e}, Eig: {err_eigen:7.1e}, Nrm: {err_norm:7.1e})")
 
-            # 2. Jacobi-Matrix Fu numerisch auf dem 3D-Spline bilden
-            eps = 1e-5
-            dFr_dr = (interp_Fr_3d(np.array([r + eps, z, a]))[0] - interp_Fr_3d(np.array([r - eps, z, a]))[0]) / (
-                        2 * eps)
-            dFr_dz = (interp_Fr_3d(np.array([r, z + eps, a]))[0] - interp_Fr_3d(np.array([r, z - eps, a]))[0]) / (
-                        2 * eps)
-            dFz_dr = (interp_Fz_3d(np.array([r + eps, z, a]))[0] - interp_Fz_3d(np.array([r - eps, z, a]))[0]) / (
-                        2 * eps)
-            dFz_dz = (interp_Fz_3d(np.array([r, z + eps, a]))[0] - interp_Fz_3d(np.array([r, z - eps, a]))[0]) / (
-                        2 * eps)
+        return np.concatenate([res_state, res_eigen, res_norm])
 
-            Fu = np.array([
-                [dFr_dr, dFr_dz],
-                [dFz_dr, dFz_dz]
-            ])
+    valid_solutions = []
 
-            # Singularitätsbedingung: Fu(u, lambda) * phi
-            Fu_phi = Fu @ phi
+    for i, guess in enumerate(initial_guesses):
+        print(f"\nStarte Newton-Löser für Guess {i + 1}...")
 
-            # 3. Normierungsbedingung: l^T * phi - 1
-            norm_eq = np.dot(l_vec, phi) - 1.0
+        moore_spence_residual.eval_count = 0
 
-            # Gebe das 5D-Residuum zurück
-            return np.array([F_r, F_z, Fu_phi[0], Fu_phi[1], norm_eq])
+        u_guess, a_guess, phi_guess = guess
+        x0 = np.concatenate([u_guess, [a_guess], phi_guess])
 
-        # Das System mit scipy's hybriden Newton-Verfahren lösen
-        solution = root(H, y0, method='hybr')
+        sol = root(
+            moore_spence_residual,
+            x0,
+            method='lm',
+            options={'xtol': 1e-4, 'maxiter': 100, 'eps': 1e-5}
+        )
 
-        if solution.success:
-            bif_u = solution.x[0:2]
-            bif_a = solution.x[2]
-            bif_phi = solution.x[3:5]
-            return True, bif_u, bif_a, bif_phi
+        if sol.success:
+            print(f"\n  >> Lösung für Guess {i + 1} gefunden in {moore_spence_residual.eval_count} Auswertungen!")
+            dr_sol, dz_sol, a_sol, phi_1_sol, phi_2_sol = sol.x
+            print(f"  Bifurkationspunkt (dr, dz): ({dr_sol:.5f}, {dz_sol:.5f}), a*: {a_sol:.5f}")
+            valid_solutions.append((dr_sol, dz_sol, a_sol))
         else:
-            return False, None, None, None
+            print(f"\n  >> Löser für Guess {i + 1} fehlgeschlagen.")
+            print(f"  Grund: {sol.message}")
 
+    # =========================================================================
+    # --- 5. Select the initial solution (u^0, a^0, phi^0)
+    # =========================================================================
 
-    def build_local_3d_interpolators(R, H, W, Q, rho, mu, N_grid, particle_maxh_rel, global_maxh_rel, eps_rel, r_vals,
-                                     z_vals, a_vals):
-        """
-        Kapselt die Berechnung mehrerer 2D-Kraftfelder für verschiedene a-Werte
-        und baut daraus direkt die 3D-Interpolatoren.
-        """
-        comm = MPI.COMM_WORLD
-        rank = comm.Get_rank()
+    best_sol = None
+    min_dist = float('inf')
+    for sol in valid_solutions:
+        dr_s, dz_s, _ = sol
+        u_s = np.array([dr_s, dz_s])
+        u_tilde = np.array([params['r_tilde'], params['z_tilde']])
+        dist = np.linalg.norm(u_s - u_tilde)
 
-        Fr_grid_list = []
-        Fz_grid_list = []
+        if dist < min_dist:
+            min_dist = dist
+            best_sol = sol
 
-        # Alle Ranks müssen durch diese Schleife gehen, da force_grid MPI nutzt!
-        for current_a in a_vals:
-            if rank == 0:
-                print(f"Berechne CFD-Kraftfeld für a = {current_a:.4f}...")
-
-            # Paralleler Aufruf von force_grid für das aktuelle 'current_a'
-            current_grid_dict = force_grid(R, H, W, Q, rho, mu, current_a, N_grid, particle_maxh_rel, global_maxh_rel,
-                                           eps_rel)
-
-            # Nur Rank 0 sammelt die Matrizen ein
-            if rank == 0 and current_grid_dict is not None:
-                Fr_grid_list.append(current_grid_dict["F_grid"]["Fr"])
-                Fz_grid_list.append(current_grid_dict["F_grid"]["Fz"])
-
-        # Nur Rank 0 baut am Ende die 3D-Splines auf
-        if rank == 0:
-            # Staple die 2D-Arrays entlang einer neuen 3. Achse (Parameter a)
-            Fr_3d_array = np.stack(Fr_grid_list, axis=-1)
-            Fz_3d_array = np.stack(Fz_grid_list, axis=-1)
-
-            # Erstelle die 3D-Interpolator-Objekte
-            interp_Fr_3d = RegularGridInterpolator((r_vals, z_vals, a_vals), Fr_3d_array, bounds_error=False,
-                                                   fill_value=None)
-            interp_Fz_3d = RegularGridInterpolator((r_vals, z_vals, a_vals), Fz_3d_array, bounds_error=False,
-                                                   fill_value=None)
-
-            return interp_Fr_3d, interp_Fz_3d
-        else:
-            # Worker-Ranks brauchen die Interpolatoren nicht
-            return None, None
-
-
-    interp_Fr_3d, interp_Fz_3d = build_local_3d_interpolators(R, H, W, Q, rho, mu,
-                                                              N_grid, particle_maxh_rel, global_maxh_rel, eps_rel,
-                                                              r_vals, z_vals, a_vals)
-
-    if rank == 0:
-
-        valid_solutions = []
-
-        for i, guess in enumerate(initial_guesses):
-            success, bif_u, bif_a, bif_phi = solve_moore_spence(guess, interp_Fr_3d, interp_Fz_3d)
-
-            if success:
-                valid_solutions.append({
-                    'u': bif_u,
-                    'a': bif_a,
-                    'phi': bif_phi
-                })
-                print(f"  Guess {i} konvergierte zu Bifurkation bei: r,z = {bif_u}, a = {bif_a}")
-            else:
-                print(f"  Guess {i} ist nicht konvergiert.")
-
-    # ---------------------------------------------------------------------
-
-
-    # ---5: Select the initial solution minimizing ||(r_tilde, z_tilde) - u_bar|| ---
-    if rank == 0:
-        if valid_solutions:
-            # Unser ursprünglicher Startpunkt als Vektor
-            u_tilde_vec = np.array([r_tilde, z_tilde])
-
-            best_solution = None
-            min_distance = float('inf')  # Setze den kleinsten Abstand initial auf unendlich
-
-            # Finde die Lösung mit dem minimalen Abstand zu u_tilde
-            for sol in valid_solutions:
-                dist = np.linalg.norm(sol['u'] - u_tilde_vec)
-                if dist < min_distance:
-                    min_distance = dist
-                    best_solution = sol
-
-            # Das ist nun unser initialer Bifurkationspunkt (u_0, lambda_0, phi_0)
-            u_0 = best_solution['u']
-            a_0 = best_solution['a']
-            phi_0 = best_solution['phi']
-
-            print("\n--- Bester Bifurkationspunkt (Step 5) ---")
-            print(f"Abstand zum Initial Guess: {min_distance:.6f}")
-            print(f"u_0 (r, z): {u_0}")
-            print(f"lambda_0 (a): {a_0}")
-
-            # Du kannst dir diesen Punkt nun z.B. speichern oder direkt an
-            # find_branch_point oder den Continuation-Algorithmus übergeben.
-
-        else:
-            print("\nWARNING: Kein Moore-Spence Guess ist konvergiert!")
-
-    # ---------------------------------------------------------------------
-
-
-    # ---6. a_0 = a_0------------------------------------------------------
-    k = 1
-    # ---------------------------------------------------------------------
-
-
-    #---7. while (a - a_star)^2 > epsilon----------------------------------
-    while (a - a_star)**2 > epsilon:
-        pass
-
-        #---8. Evaluate the shape functional J(Omega) and compute shape update
-
-
-
+    print(f"\n--- Bester gefundener Branch Point (Schritt 5) ---")
+    print(f"  dr_0 = {best_sol[0]:.5f}")
+    print(f"  dz_0 = {best_sol[1]:.5f}")
+    print(f"  a_0 = {best_sol[2]:.5f}")
 
 
 

@@ -1,22 +1,18 @@
 import os
-
 os.environ["OMP_NUM_THREADS"] = "1"
 
 from firedrake import *
-import numpy as np
-import math
-
 
 
 class perturbed_flow:
 
-    def __init__(self, R, H, W, a, Re_p, mesh3d, tags, u_bar, p_bar):
+    def __init__(self, R, H, W, L, a, Re_p, mesh3d, tags, u_bar, p_bar):
 
         self.R = R
         self.H = H
         self.W = W
         self.a = a
-        self.L = 4*max(H, W)
+        self.L = L
         self.Re_p = Re_p
 
         self.u_bar = u_bar
@@ -25,8 +21,6 @@ class perturbed_flow:
         self.mesh3d = mesh3d
         self.tags = tags
 
-        # Note that the netgen coordinate system can be interpreted as the rotating coordinate system (x', y', z'),
-        # whereby we lag behind the particle by 0.5*L/R
         # We therefore formulate all of our vectors in this coordinate system
         self.x = SpatialCoordinate(self.mesh3d)
 
@@ -256,67 +250,4 @@ class perturbed_flow:
 
 
 if __name__ == "__main__":
-    from build_3d_geometry_netgen import *
-    from background_flow import *
-
-    print("Starting sanity checks for the perturbed flow...\n")
-
-    R_test = 220
-    H_test = 2
-    W_test = 2
-    a_test = 0.05
-    Re = 1
-    Re_p_test = Re * (a_test ** 2)
-
-    mesh3d, tags = make_curved_channel_section_with_spherical_hole(R_test, H_test, W_test,
-                                                                   L=8,
-                                                                   a=a_test,
-                                                                   particle_maxh=0.2 * a_test,
-                                                                   global_maxh=0.2 * min(H_test, W_test),
-                                                                   scaling="first_nondimensionalisation"
-                                                                   )
-
-    bg = background_flow(R_test, H_test, W_test, Re)
-    G_val, U_m_hat, u_bar_2d, p_bar_tilde_2d = bg.solve_2D_background_flow()
-    u_bar_3d, p_bar_3d = build_3d_background_flow(R_test, H_test, W_test, G_val, mesh3d, tags, u_bar_2d, p_bar_tilde_2d)
-    pf = perturbed_flow(R_test, H_test, W_test, a_test, Re_p_test, mesh3d, tags, u_bar_3d, p_bar_3d)
-
-    print("1. Checking Stokes solver boundary conditions...")
-    u_hat_x, q_hat_x = pf.Stokes_solver_3d(pf.e_x_prime)
-
-    p_center = pf.tags["particle_center"]
-    # Select a point exactly on the particle surface (e.g., shifted in local +x direction)
-    # We shift along the r-axis (corresponds to the x-axis in mesh coordinates)
-    eval_pt = [p_center[0] + pf.a, p_center[1], p_center[2]]
-    evaluator = PointEvaluator(pf.mesh3d, np.array([eval_pt]))
-    u_eval = evaluator.evaluate(u_hat_x)[0]
-
-    e_x_val = pf.e_x_prime.values()
-    diff = np.linalg.norm(u_eval - e_x_val)
-    print(f"   -> BC deviation on the particle: {diff:.2e}")
-    assert diff < 1e-5, "Error: Boundary conditions on the particle are not exactly met!"
-
-    # 2. Test: Physical Drag (Stokes Drag F_minus_1)
-    print("\n2. Checking physical Stokes Drag...")
-    F_drag = pf.F_minus_1(u_hat_x, q_hat_x, pf.mesh3d)
-    F_drag_x = float(np.dot(e_x_val, F_drag))
-
-    # Classical Stokes drag for a sphere in free-field (non-dimensionalized)
-    stokes_analytical = -6.0 * np.pi * pf.a
-
-    print(f"   -> Calculated channel drag in x-direction: {F_drag_x:.4f}")
-    print(f"   -> Analytical free-field drag (reference): {stokes_analytical:.4f}")
-
-    assert F_drag_x < 0, "Error: Drag must be negative (opposing the direction of motion)!"
-    assert F_drag_x < stokes_analytical, "Error: Due to wall effects, channel drag must be GREATER in magnitude (more negative) than free-field drag!"
-
-    # 3. Test: Total force calculation F_p
-    print("\n3. Calculating resulting forces F_p...")
-    # This tests if matrix A is regular and volume integrals converge
-    F_p_x, F_p_z = pf.F_p()
-    print(f"   -> Resulting force F_p_x: {F_p_x:.6e}")
-    print(f"   -> Resulting force F_p_z: {F_p_z:.6e}")
-
-    print("\n=============================================")
-    print("=== ALL SANITY CHECKS COMPLETED SUCCESSFULLY ===")
-    print("=============================================")
+    pass

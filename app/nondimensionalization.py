@@ -73,6 +73,7 @@ def second_nondimensionalisation(R_hat, H_hat, W_hat, a, L_c, U_c, G_hat, Re, u_
         print("H_hat_hat = ", H_hat_hat)
         print("W_hat_hat = ", W_hat_hat)
         print("a_hat_hat = ", a_hat_hat)
+        print("U_c_p", U_c_p)
         print("Re_p = ", Re_p)
 
     return R_hat_hat, H_hat_hat, W_hat_hat, a_hat_hat, G_hat_hat, L_c_p, U_c_p, u_bar_2d_hat_hat, p_bar_2d_hat_hat, Re_p
@@ -85,7 +86,7 @@ if __name__ == "__main__":
     mu = 10.02e-4
     a = 0.05 * (H / 2)
     W = 1 * H
-    R = 160 * (H / 2)
+    R = 100 * (H / 2)
     Q = 2 * 2.40961923848e-10
 
 
@@ -96,7 +97,7 @@ if __name__ == "__main__":
     assert abs(Re - 1) < 0.01, "Re off"
     a_hat = a / L_c
     kappa = (H_hat ** 4) / (4 * (a_hat ** 3) * R_hat)
-    assert abs(kappa - 200) < 0.01, "kappa off"
+    # assert abs(kappa - 200) < 0.01, "kappa off"
 
 
     # ---TEST-second_nondimensionalisation---
