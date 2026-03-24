@@ -36,8 +36,8 @@ class FullNavierStokesSolver:
         self.e_theta_prime = as_vector(
             [- self.x[1] / sqrt(self.x[0] ** 2 + self.x[1] ** 2), self.x[0] / sqrt(self.x[0] ** 2 + self.x[1] ** 2), 0])
 
-        self.V = VectorFunctionSpace(self.mesh3d, "CG", 2)
-        self.Q = FunctionSpace(self.mesh3d, "CG", 1)
+        self.V = VectorFunctionSpace(self.mesh3d, "CG", 4)
+        self.Q = FunctionSpace(self.mesh3d, "CG", 3)
         self.R_space = FunctionSpace(self.mesh3d, "R", 0)
 
         # Alle 7 Felder (inklusive G) bleiben drin für das lückenlose AD-Tape!

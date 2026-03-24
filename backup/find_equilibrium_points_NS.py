@@ -7,7 +7,7 @@ from mpi4py import MPI
 import gc
 
 from nondimensionalization import *
-from app.perturbed_flow_full_navier_stokes import *
+from perturbed_flow_full_navier_stokes import *
 
 
 class F_p_grid_NS:

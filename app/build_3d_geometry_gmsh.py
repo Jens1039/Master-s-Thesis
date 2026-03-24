@@ -188,12 +188,12 @@ def make_curved_channel_section_with_spherical_hole(R, H, W, L, a, particle_maxh
 
 if __name__ == "__main__":
 
-    TEST_R = 220.0
-    TEST_a = 0.1
+    TEST_R = 160.0
+    TEST_a = 0.05
     TEST_H = 2.0
     TEST_W = 2.0
     TEST_L = 10.0
-    TEST_r_off = 0.5
+    TEST_r_off = 0.0
     TEST_z_off = 0.0
 
     print("Generating gmsh mesh for sanity checks...")
@@ -203,6 +203,11 @@ if __name__ == "__main__":
         r_off=TEST_r_off, z_off=TEST_z_off, order=2
     )
 
+    V = FunctionSpace(mesh3d, "CG", 1)
+    dummy = Function(V, name="Mesh_Visualization").assign(1.0)
+
+    VTKFile("correct_channel.pvd").write(dummy)
+    exit()
     x, y, z = SpatialCoordinate(mesh3d)
 
     print("\n" + "=" * 40)

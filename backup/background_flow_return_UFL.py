@@ -294,8 +294,6 @@ if __name__ == "__main__":
 
     bg.solve_2D_background_flow()
 
-    bg.plot()
-
     print("1. Solving 2D background flow...")
     bf = background_flow(R_test, H_test, W_test, Re_test)
     G_val, U_m_hat, u_2d, p_2d = bf.solve_2D_background_flow()
@@ -384,6 +382,3 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"   -> Warning: Single point evaluation failed: {e}")
 
-    print("\n=============================================")
-    print("=== ALL SANITY CHECKS COMPLETED SUCCESSFULLY ===")
-    print("=============================================")
