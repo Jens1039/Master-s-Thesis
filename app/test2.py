@@ -76,12 +76,6 @@ class background_flow:
              W_mixed.sub(2)],
         )
 
-        print("F coefficients:", F.coefficients())
-        print("Re is fd.Constant?", isinstance(self.Re, fd.Constant))
-        print("Re id:", id(self.Re))
-        for c in F.coefficients():
-            print(f"  coeff: {type(c).__name__}, id={id(c)}, shape={c.ufl_shape}")
-
         problem = fd.NonlinearVariationalProblem(F, w, bcs=[no_slip])
         solver  = fd.NonlinearVariationalSolver(
             problem, nullspace=nullspace,
@@ -139,25 +133,12 @@ class VOMTransferBlock(Block):
         return output
 
     def evaluate_adj_component(self, inputs, adj_inputs,
-                               block_variable, idx, prepared=None):
-        with stop_annotating():
-            # adjoint of permutation: scatter back to VOM ordering
-            adj_vom = fd.Function(self.V_vom)
-            adj_vom.dat.data[:] = adj_inputs[0].dat.data_ro[self.perm]
-
-            # adjoint of VOM interpolation via Interpolator transpose
-            V_2d = inputs[0].function_space()
-            interpolator = fd.Interpolator(fd.TrialFunction(V_2d), self.V_vom)
-            adj_2d = interpolator.interpolate(adj_vom, transpose=True)
-        return adj_2d
-    '''
-    def evaluate_adj_component(self, inputs, adj_inputs,
                                 block_variable, idx, prepared=None):
         with stop_annotating():
             adj_vom = fd.Function(self.V_vom)
             adj_vom.dat.data[:] = adj_inputs[0].dat.data_ro[self.perm]
         return adj_vom
-    '''
+
     def evaluate_tlm_component(self, inputs, tlm_inputs,
                                 block_variable, idx, prepared=None):
         tlm_in = tlm_inputs[0]
@@ -317,10 +298,6 @@ def build_3d_background_flow_differentiable(R, H, W, G, mesh3d, tags,
     return u_bar_3d, p_bar_3d
 
 
-import inspect, pyadjoint
-print(inspect.getsource(pyadjoint.Block.__init__))
-
-
 if __name__ == "__main__":
 
     R_hat = 500
@@ -328,81 +305,158 @@ if __name__ == "__main__":
     W_hat = 2
     L_hat = 4 * max(H_hat, W_hat)
     a_hat = 0.05
+    Re = 1.0
+
+    particle_maxh = 0.2 * a_hat
+    global_maxh = 0.2 * min(H_hat, W_hat)
+
+    # ------------------------------------------------------------------------------------------------------------------
 
     set_working_tape(Tape())
     while not annotate_tape():
         continue_annotation()
 
-    Re = 1.0
+    with stop_annotating():
+        mesh3d, tags = make_curved_channel_section_with_spherical_hole(
+            R_hat, H_hat, W_hat, L_hat, a_hat,
+            particle_maxh, global_maxh, r_off=0.0, z_off=0.0)
 
-    print(hasattr(Re, 'block_variable'))
+    set_working_tape(Tape())
+    while not annotate_tape():
+        continue_annotation()
 
-    particle_maxh = 0.2 * a_hat
-    global_maxh = 0.2 * min(H_hat, W_hat)
+    # ===== MINIMAL TEST: Laplace-Solve weglassen =====
+    R_space = fd.FunctionSpace(mesh3d, "R", 0)
+    delta_r = fd.Function(R_space, name="delta_r").assign(0.0)
+
+    V_def = fd.VectorFunctionSpace(mesh3d, "CG", 1)
+
+    import math
+
+    theta_half = tags["theta"] / 2.0
+    cos_th = math.cos(theta_half)
+    sin_th = math.sin(theta_half)
+
+    with stop_annotating():
+        X_ref = fd.Function(V_def, name="X_ref")
+        X_ref.interpolate(fd.SpatialCoordinate(mesh3d))
+
+    xi = fd.Function(V_def, name="xi")
+    xi.interpolate(fd.as_vector([
+        delta_r * cos_th,
+        delta_r * sin_th,
+        fd.Constant(0.0),
+    ]))
+
+    mesh3d.coordinates.assign(X_ref + xi)
+
+    x3d = fd.SpatialCoordinate(mesh3d)
+    J_test = fd.assemble(x3d[0] ** 2 * fd.dx)
+    print(f"J_test (volume) = {J_test}")
+
+    c_r = Control(delta_r)
+    J_hat_test = ReducedFunctional(J_test, c_r)
+
+    tape = get_working_tape()
+    print(f"\n=== TAPE: {len(tape.get_blocks())} blocks ===")
+    for i, block in enumerate(tape.get_blocks()):
+        deps = [
+            f"{type(d.output).__name__}(name={getattr(d.output, 'name', lambda: '?')() if callable(getattr(d.output, 'name', None)) else getattr(d.output, 'name', '?')})"
+            for d in block.get_dependencies()]
+        print(f"  Block {i}: {type(block).__name__} deps={deps}")
+
+    # Taylor-Test
+    h_r = fd.Function(R_space).assign(0.1)
+    taylor_test(J_hat_test, [fd.Function(R_space).assign(0.0)], [h_r])
+    exit()
+
+    R_space = fd.FunctionSpace(mesh3d, "R", 0)
+    delta_r = fd.Function(R_space, name="delta_r").assign(0.0)
+    delta_z = fd.Function(R_space, name="delta_z").assign(0.0)
+
+    V_def = fd.VectorFunctionSpace(mesh3d, "CG", 1)
+    xi = fd.Function(V_def, name="mesh_displacement")
+    eta = fd.TestFunction(V_def)
+
+    a_form = fd.inner(fd.grad(xi), fd.grad(eta)) * fd.dx
+    L_form = fd.inner(fd.Constant((0, 0, 0)), eta) * fd.dx
+
+    import math
+
+    theta_half = tags["theta"] / 2.0
+    cos_th = math.cos(theta_half)
+    sin_th = math.sin(theta_half)
+
+    bc_particle = fd.DirichletBC(V_def, fd.as_vector([
+        delta_r * cos_th,
+        delta_r * sin_th,
+        delta_z,
+    ]), tags["particle"])
+
+    bc_walls = fd.DirichletBC(V_def, fd.Constant((0, 0, 0)), tags["walls"][0])
+    bc_inlet = fd.DirichletBC(V_def, fd.Constant((0, 0, 0)), tags["inlet"])
+    bc_outlet = fd.DirichletBC(V_def, fd.Constant((0, 0, 0)), tags["outlet"])
+
+    F_mesh = fd.inner(fd.grad(xi), fd.grad(eta)) * fd.dx
+
+    problem = fd.NonlinearVariationalProblem(
+        F_mesh, xi,
+        bcs=[bc_particle, bc_walls, bc_inlet, bc_outlet])
+
+    solver = fd.NonlinearVariationalSolver(
+        problem,
+        solver_parameters={
+            "snes_type": "ksponly",
+            "ksp_type": "cg",
+            "pc_type": "gamg",
+        })
+
+    X_ref = fd.Function(V_def, name="X_ref")
+    X_ref.interpolate(fd.SpatialCoordinate(mesh3d))
+
+    solver.solve()
+    print(f"||xi|| = {fd.norm(xi)}")
+
+    mesh3d.coordinates.assign(X_ref + xi)
 
     bg = background_flow(R_hat, H_hat, W_hat, Re)
     G_val, U_m_hat, u_bar, p_bar_tilde = bg.solve_2D_background_flow()
-
-    mesh3d, tags = make_curved_channel_section_with_spherical_hole(R_hat, H_hat, W_hat, L_hat,
-                                                                   a_hat, particle_maxh, global_maxh)
 
     u_bar_3d, p_bar_3d = build_3d_background_flow_differentiable(R_hat, H_hat, W_hat, G_val, mesh3d, tags,
                                              u_bar, p_bar_tilde)
 
     J = fd.assemble(fd.inner(u_bar_3d, u_bar_3d) * fd.dx)
 
-    print(f"annotate_tape() = {annotate_tape()}")
-    print(f"type(J) = {type(J)}")
+    c_r = Control(delta_r)
+    c_z = Control(delta_z)
 
-    J_hat = ReducedFunctional(J, Control(bg.Re))
+    J_hat = ReducedFunctional(J, [c_r, c_z])
 
-    m_0 = fd.Constant(float(Re))
-    d_m_0 = fd.Constant(float(m_0) * 0.1)
+    dJ = J_hat.derivative()
 
-    tape = get_working_tape()
-    tape.visualise("mein_tape.pdf")
+    h_r = fd.Function(R_space).assign(0.01)
+    h_z = fd.Function(R_space).assign(0.01)
 
-    Re_fn = lambda val: fd.Function(fd.FunctionSpace(bg.mesh2d, "R", 0)).assign(val)
-    J0 = float(J_hat(Re_fn(1.0)))
-    J1 = float(J_hat(Re_fn(1.1)))
-    print(f"J0={J0}, J1={J1}, diff={J1 - J0}")
+    # Statt des ganzen 2D-Solve + VOM-Transfer, teste NUR die Mesh-Deformation:
+    J_test = fd.assemble(fd.Constant(1.0) * fd.dx(domain=mesh3d))
+    print(f"J_test (volume) = {J_test}")
+
+    c_r = Control(delta_r)
+    J_hat_test = ReducedFunctional(J_test, c_r)
+    dJ_test = J_hat_test.derivative()
+    print(f"dJ_test/d(delta_r) = {float(dJ_test)}")
 
     tape = get_working_tape()
     for i, block in enumerate(tape.get_blocks()):
-        name = type(block).__name__
-        dep_ids = [id(d.output) for d in block._dependencies]
-        print(f"Block {i}: {name}")
-        if "Solve" in name or "solve" in name.lower():
-            print(f"  Re id = {id(Re)}")
-            print(f"  Re in deps? {id(Re) in [id(d.output) for d in block._dependencies]}")
-            for j, d in enumerate(block._dependencies):
-                print(f"  dep[{j}]: {type(d.output).__name__}, id={id(d.output)}")
-        if "VOMInterpolate" in name:
-            for j, d in enumerate(block._dependencies):
-                print(f"  dep[{j}]: {type(d.output).__name__}, id={id(d.output)}, "
-                      f"bv_id={id(d)}")
+        print(f"Block {i}: {type(block).__name__}, "
+              f"deps={[str(d) for d in block.get_dependencies()]}")
 
-    # ===== DIAGNOSE 2: Wird recompute tatsächlich aufgerufen? =====
-    # Patch recompute_component temporär:
-    orig_recompute = VOMInterpolateTransferBlock.recompute_component
+    taylor_test(J_hat,
+                [fd.Function(R_space).assign(0.0),
+                 fd.Function(R_space).assign(0.0)],
+                [h_r, h_z])
 
 
-    def debug_recompute(self, inputs, block_variable, idx, prepared):
-        val_before = np.linalg.norm(inputs[0].dat.data_ro)
-        result = orig_recompute(self, inputs, block_variable, idx, prepared)
-        val_after = np.linalg.norm(result.dat.data_ro)
-        print(f"  VOMBlock recompute: ||input|| = {val_before:.6e}, ||output|| = {val_after:.6e}")
-        return result
 
 
-    VOMInterpolateTransferBlock.recompute_component = debug_recompute
 
-    # ===== DIAGNOSE 3: Ändert sich u_bar nach Replay? =====
-    print(f"\n||u_bar|| vor replay = {np.linalg.norm(u_bar.dat.data_ro):.6e}")
-
-    # Taylor test:
-    m_0 = Re_fn(1.0)
-    d_m_0 = Re_fn(0.1)
-
-    rates = taylor_test(J_hat, m_0, d_m_0)
-    print(f"dJ/dRe: Convergence rates = {rates}")
