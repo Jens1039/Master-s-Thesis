@@ -4,6 +4,7 @@ from copy import deepcopy
 os.environ["OMP_NUM_THREADS"] = "1"
 
 import numpy as np
+import math
 import matplotlib.pyplot as plt
 from scipy.spatial import cKDTree
 
@@ -312,6 +313,10 @@ if __name__ == "__main__":
 
     # ------------------------------------------------------------------------------------------------------------------
 
+    # ==========================================================================
+    # 1. Referenznetz erzeugen (außerhalb des Tapes)
+    # ==========================================================================
+
     set_working_tape(Tape())
     while not annotate_tape():
         continue_annotation()
@@ -321,140 +326,131 @@ if __name__ == "__main__":
             R_hat, H_hat, W_hat, L_hat, a_hat,
             particle_maxh, global_maxh, r_off=0.0, z_off=0.0)
 
+    # ==========================================================================
+    # 2. Frisches Tape starten
+    # ==========================================================================
     set_working_tape(Tape())
     while not annotate_tape():
         continue_annotation()
 
-    # ===== MINIMAL TEST: Laplace-Solve weglassen =====
+    # ==========================================================================
+    # 3. Design-Variablen auf "R"-Raum (skalare Functions)
+    # ==========================================================================
     R_space = fd.FunctionSpace(mesh3d, "R", 0)
     delta_r = fd.Function(R_space, name="delta_r").assign(0.0)
+    delta_z = fd.Function(R_space, name="delta_z").assign(0.0)
 
+    # ==========================================================================
+    # 4. Referenzkoordinaten speichern (OFF tape)
+    # ==========================================================================
     V_def = fd.VectorFunctionSpace(mesh3d, "CG", 1)
-
-    import math
-
-    theta_half = tags["theta"] / 2.0
-    cos_th = math.cos(theta_half)
-    sin_th = math.sin(theta_half)
 
     with stop_annotating():
         X_ref = fd.Function(V_def, name="X_ref")
         X_ref.interpolate(fd.SpatialCoordinate(mesh3d))
 
-    xi = fd.Function(V_def, name="xi")
-    xi.interpolate(fd.as_vector([
-        delta_r * cos_th,
-        delta_r * sin_th,
-        fd.Constant(0.0),
-    ]))
-
-    mesh3d.coordinates.assign(X_ref + xi)
-
+    # ==========================================================================
+    # 5. Bump-basiertes Displacement (ON tape, differenzierbar)
+    #    - Wert 1 am Partikelzentrum, klingt linear auf 0 ab bei r_cut
+    #    - Kanalwände bleiben unberührt
+    # ==========================================================================
+    cx, cy, cz = tags["particle_center"]
     x3d = fd.SpatialCoordinate(mesh3d)
-    J_test = fd.assemble(x3d[0] ** 2 * fd.dx)
-    print(f"J_test (volume) = {J_test}")
+    dist = fd.sqrt((x3d[0] - cx) ** 2 + (x3d[1] - cy) ** 2 + (x3d[2] - cz) ** 2)
 
-    c_r = Control(delta_r)
-    J_hat_test = ReducedFunctional(J_test, c_r)
-
-    tape = get_working_tape()
-    print(f"\n=== TAPE: {len(tape.get_blocks())} blocks ===")
-    for i, block in enumerate(tape.get_blocks()):
-        deps = [
-            f"{type(d.output).__name__}(name={getattr(d.output, 'name', lambda: '?')() if callable(getattr(d.output, 'name', None)) else getattr(d.output, 'name', '?')})"
-            for d in block.get_dependencies()]
-        print(f"  Block {i}: {type(block).__name__} deps={deps}")
-
-    # Taylor-Test
-    h_r = fd.Function(R_space).assign(0.1)
-    taylor_test(J_hat_test, [fd.Function(R_space).assign(0.0)], [h_r])
-    exit()
-
-    R_space = fd.FunctionSpace(mesh3d, "R", 0)
-    delta_r = fd.Function(R_space, name="delta_r").assign(0.0)
-    delta_z = fd.Function(R_space, name="delta_z").assign(0.0)
-
-    V_def = fd.VectorFunctionSpace(mesh3d, "CG", 1)
-    xi = fd.Function(V_def, name="mesh_displacement")
-    eta = fd.TestFunction(V_def)
-
-    a_form = fd.inner(fd.grad(xi), fd.grad(eta)) * fd.dx
-    L_form = fd.inner(fd.Constant((0, 0, 0)), eta) * fd.dx
-
-    import math
+    r_cut = fd.Constant(0.5 * min(H_hat, W_hat))
+    bump = fd.max_value(fd.Constant(0.0), 1.0 - dist / r_cut)
 
     theta_half = tags["theta"] / 2.0
     cos_th = math.cos(theta_half)
     sin_th = math.sin(theta_half)
 
-    bc_particle = fd.DirichletBC(V_def, fd.as_vector([
-        delta_r * cos_th,
-        delta_r * sin_th,
-        delta_z,
-    ]), tags["particle"])
+    xi = fd.Function(V_def, name="xi")
+    xi.interpolate(fd.as_vector([
+        delta_r * cos_th * bump,
+        delta_r * sin_th * bump,
+        delta_z * bump,
+    ]))
 
-    bc_walls = fd.DirichletBC(V_def, fd.Constant((0, 0, 0)), tags["walls"][0])
-    bc_inlet = fd.DirichletBC(V_def, fd.Constant((0, 0, 0)), tags["inlet"])
-    bc_outlet = fd.DirichletBC(V_def, fd.Constant((0, 0, 0)), tags["outlet"])
-
-    F_mesh = fd.inner(fd.grad(xi), fd.grad(eta)) * fd.dx
-
-    problem = fd.NonlinearVariationalProblem(
-        F_mesh, xi,
-        bcs=[bc_particle, bc_walls, bc_inlet, bc_outlet])
-
-    solver = fd.NonlinearVariationalSolver(
-        problem,
-        solver_parameters={
-            "snes_type": "ksponly",
-            "ksp_type": "cg",
-            "pc_type": "gamg",
-        })
-
-    X_ref = fd.Function(V_def, name="X_ref")
-    X_ref.interpolate(fd.SpatialCoordinate(mesh3d))
-
-    solver.solve()
-    print(f"||xi|| = {fd.norm(xi)}")
-
+    # ==========================================================================
+    # 6. Netzkoordinaten deformieren (ON tape)
+    # ==========================================================================
     mesh3d.coordinates.assign(X_ref + xi)
 
+    # ==========================================================================
+    # 7. 2D-Hintergrundströmung lösen (ON tape)
+    # ==========================================================================
     bg = background_flow(R_hat, H_hat, W_hat, Re)
     G_val, U_m_hat, u_bar, p_bar_tilde = bg.solve_2D_background_flow()
 
-    u_bar_3d, p_bar_3d = build_3d_background_flow_differentiable(R_hat, H_hat, W_hat, G_val, mesh3d, tags,
-                                             u_bar, p_bar_tilde)
+    # ==========================================================================
+    # 8. 3D-Hintergrundströmung aufbauen (teilweise ON tape via VOM-Blocks)
+    # ==========================================================================
+    u_bar_3d, p_bar_3d = build_3d_background_flow_differentiable(
+        R_hat, H_hat, W_hat, G_val, mesh3d, tags,
+        u_bar, p_bar_tilde)
 
+    # ==========================================================================
+    # 9. Funktional
+    # ==========================================================================
     J = fd.assemble(fd.inner(u_bar_3d, u_bar_3d) * fd.dx)
+    print(f"J = {J}")
 
+    # ==========================================================================
+    # 10. Controls und ReducedFunctional
+    # ==========================================================================
     c_r = Control(delta_r)
     c_z = Control(delta_z)
-
     J_hat = ReducedFunctional(J, [c_r, c_z])
 
-    dJ = J_hat.derivative()
-
-    h_r = fd.Function(R_space).assign(0.01)
-    h_z = fd.Function(R_space).assign(0.01)
-
-    # Statt des ganzen 2D-Solve + VOM-Transfer, teste NUR die Mesh-Deformation:
-    J_test = fd.assemble(fd.Constant(1.0) * fd.dx(domain=mesh3d))
-    print(f"J_test (volume) = {J_test}")
-
-    c_r = Control(delta_r)
-    J_hat_test = ReducedFunctional(J_test, c_r)
-    dJ_test = J_hat_test.derivative()
-    print(f"dJ_test/d(delta_r) = {float(dJ_test)}")
-
+    # ==========================================================================
+    # 11. Tape inspizieren
+    # ==========================================================================
     tape = get_working_tape()
+    print(f"\n=== TAPE: {len(tape.get_blocks())} blocks ===")
     for i, block in enumerate(tape.get_blocks()):
-        print(f"Block {i}: {type(block).__name__}, "
-              f"deps={[str(d) for d in block.get_dependencies()]}")
+        deps = []
+        for d in block.get_dependencies():
+            out = d.output
+            name = getattr(out, 'name', '?')
+            if callable(name):
+                name = name()
+            deps.append(f"{type(out).__name__}({name})")
+        print(f"  Block {i}: {type(block).__name__} deps={deps}")
 
-    taylor_test(J_hat,
-                [fd.Function(R_space).assign(0.0),
-                 fd.Function(R_space).assign(0.0)],
-                [h_r, h_z])
+    # ==========================================================================
+    # 12. Gradient
+    # ==========================================================================
+    print("\n=== Computing derivative ===")
+    dJ = J_hat.derivative()
+    print(f"dJ/d(delta_r) type: {type(dJ[0])}")
+    print(f"dJ/d(delta_z) type: {type(dJ[1])}")
+
+    # Für Function auf "R"-Raum: Wert extrahieren
+    try:
+        print(f"dJ/d(delta_r) = {float(dJ[0])}")
+        print(f"dJ/d(delta_z) = {float(dJ[1])}")
+    except Exception as e:
+        print(f"Could not convert to float: {e}")
+        # Falls Cofunction: assemble mit Eins-Funktion
+        ones_r = fd.Function(R_space).assign(1.0)
+        print(f"dJ/d(delta_r) = {fd.assemble(fd.action(dJ[0], ones_r))}")
+        print(f"dJ/d(delta_z) = {fd.assemble(fd.action(dJ[1], ones_r))}")
+
+    # ==========================================================================
+    # 13. Taylor-Test
+    # ==========================================================================
+    print("\n=== Taylor test ===")
+    h_r = fd.Function(R_space).assign(0.1)
+    h_z = fd.Function(R_space).assign(0.1)
+
+    conv_rate = taylor_test(
+        J_hat,
+        [fd.Function(R_space).assign(0.0),
+         fd.Function(R_space).assign(0.0)],
+        [h_r, h_z])
+
+    print(f"Minimum convergence rate: {conv_rate}")
 
 
 
