@@ -437,15 +437,21 @@ if __name__ == "__main__":
         print(f"dJ/d(delta_r) = {fd.assemble(fd.action(dJ[0], ones_r))}")
         print(f"dJ/d(delta_z) = {fd.assemble(fd.action(dJ[1], ones_r))}")
 
-
-    h_r = fd.Function(R_space).assign(0.01)
-    h_z = fd.Function(R_space).assign(0.01)
+    # ==========================================================================
+    # 13. Taylor-Test
+    # ==========================================================================
+    print("\n=== Taylor test ===")
+    h_r = fd.Function(R_space).assign(0.1)
+    h_z = fd.Function(R_space).assign(0.1)
 
     conv_rate = taylor_test(
         J_hat,
         [fd.Function(R_space).assign(0.0),
          fd.Function(R_space).assign(0.0)],
         [h_r, h_z])
+
+    print(f"Minimum convergence rate: {conv_rate}")
+
 
 
 

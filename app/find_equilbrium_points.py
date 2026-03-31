@@ -85,14 +85,12 @@ class F_p_grid:
         for task in tqdm(my_tasks, disable=(global_rank != 0)):
             (i, j, r_loc, z_loc) = task
 
-            mesh3d, tags = make_curved_channel_section_with_spherical_hole(
-                    self.R, self.H, self.W, self.L, self.a,
-                    self.particle_maxh, self.global_maxh,
-                    r_off=r_loc, z_off=z_loc,
-                    comm=my_comm)
+            mesh3d, tags = make_curved_channel_section_with_spherical_hole(self.R, self.H, self.W, self.L, self.a,
+                                                                           self.particle_maxh, self.global_maxh,
+                                                                           r_off=r_loc, z_off=z_loc,
+                                                                           comm=my_comm)
 
-            u_3d, p_3d = build_3d_background_flow(
-                self.R, self.H, self.W, self.G, mesh3d, tags, u_bg_local, p_bg_local)
+            u_3d, p_3d = build_3d_background_flow(self.R, self.H, self.W, self.G, mesh3d, tags, u_bg_local, p_bg_local)
 
             pf = perturbed_flow(self.R, self.H, self.W, self.L, self.a, self.Re_p, mesh3d, tags, u_3d, p_3d)
 

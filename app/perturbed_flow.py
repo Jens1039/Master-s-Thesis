@@ -250,4 +250,40 @@ class perturbed_flow:
 
 
 if __name__ == "__main__":
-    pass
+
+    R_hat = 500
+    H_hat = 2
+    W_hat = 2
+    a_hat = 0.05
+    Re = 1.0
+    L_c = H_hat / 2
+    U_c = 0.008366733466944444
+
+    from nondimensionalization import *
+    from background_flow import *
+    from build_3d_geometry_gmsh import make_curved_channel_section_with_spherical_hole
+
+    bg = background_flow(R_hat, H_hat, W_hat, Re)
+    G_val, U_m_hat, u_bar, p_bar_tilde = bg.solve_2D_background_flow()
+
+    R_hat_hat, H_hat_hat, W_hat_hat, a_hat_hat, G_hat_hat, L_c_p, U_c_p, u_bar_2d_hat_hat, p_bar_2d_hat_hat, Re_p = second_nondimensionalisation(
+        R_hat, H_hat, W_hat, a_hat, L_c, U_c, G_val, Re, u_bar, p_bar_tilde, U_m_hat, print_values=True)
+
+    L_hat_hat = 4 * max(H_hat_hat, W_hat_hat)
+    particle_maxh_hat_hat = 0.2 * a_hat_hat
+    global_maxh_hat_hat = 0.2 * min(H_hat_hat, W_hat_hat)
+
+    mesh3d, tags = make_curved_channel_section_with_spherical_hole(
+        R_hat_hat, H_hat_hat, W_hat_hat, L_hat_hat, a_hat_hat,
+        particle_maxh_hat_hat, global_maxh_hat_hat, r_off=0.0, z_off=0.0)
+
+    u_bar_3d, p_bar_3d = build_3d_background_flow(
+        R_hat_hat, H_hat_hat, W_hat_hat, G_hat_hat, mesh3d, tags, u_bar_2d_hat_hat, p_bar_2d_hat_hat)
+
+    pf = perturbed_flow(R_hat_hat, H_hat_hat, W_hat_hat, L_hat_hat, a_hat_hat, Re_p, mesh3d, tags, u_bar_3d, p_bar_3d)
+
+    F_p_x, F_p_z = pf.F_p()
+    print(f"F_p_x = {float(F_p_x)}")
+    print(f"F_p_z = {float(F_p_z)}")
+
+

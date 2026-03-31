@@ -207,7 +207,7 @@ if __name__ == "__main__":
     dummy = Function(V, name="Mesh_Visualization").assign(1.0)
 
     VTKFile("correct_channel.pvd").write(dummy)
-    exit()
+
     x, y, z = SpatialCoordinate(mesh3d)
 
     print("\n" + "=" * 40)
