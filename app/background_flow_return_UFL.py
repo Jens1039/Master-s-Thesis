@@ -120,6 +120,7 @@ class background_flow_differentiable:
 class VOMTransferBlock(Block):
 
     def __init__(self, u_vom, u_out, inv_perm, V_vom):
+
         super().__init__()
         self.add_dependency(u_vom)
         self.add_output(u_out.create_block_variable())
@@ -127,21 +128,25 @@ class VOMTransferBlock(Block):
         self.perm     = np.argsort(inv_perm)
         self.V_vom    = V_vom
 
+
     def recompute_component(self, inputs, block_variable, idx, prepared):
+
         out = block_variable.output
         with stop_annotating():
             out.dat.data[:] = inputs[0].dat.data_ro[self.inv_perm]
         return out
 
-    def evaluate_adj_component(self, inputs, adj_inputs,
-                                block_variable, idx, prepared=None):
+
+    def evaluate_adj_component(self, inputs, adj_inputs, block_variable, idx, prepared=None):
+
         with stop_annotating():
             adj = Function(self.V_vom)
             adj.dat.data[:] = adj_inputs[0].dat.data_ro[self.perm]
         return adj
 
-    def evaluate_tlm_component(self, inputs, tlm_inputs,
-                                block_variable, idx, prepared=None):
+
+    def evaluate_tlm_component(self, inputs, tlm_inputs, block_variable, idx, prepared=None):
+
         if tlm_inputs[0] is None:
             return None
         with stop_annotating():
@@ -151,7 +156,7 @@ class VOMTransferBlock(Block):
 
 
 def vom_transfer(u_vom, V_target, inv_perm, V_vom):
-    """Permutiert VOM-Function ins 3D-DOF-Ordering. Legt Block aufs Tape."""
+
     u_out = Function(V_target)
     with stop_annotating():
         u_out.dat.data[:] = u_vom.dat.data_ro[inv_perm]
@@ -169,10 +174,6 @@ def _compute_inv_perm(vom, query_pts):
 
 
 class WallBCBlock(Block):
-    """
-    Setzt DOFs an Wand-Knoten auf Null.  Das ist eine lineare Projektion
-    P (P² = P, P^T = P), daher ist Adjoint = TLM = dieselbe Projektion.
-    """
 
     def __init__(self, u_in, u_out, bc_node_indices, V):
         super().__init__()
@@ -182,7 +183,7 @@ class WallBCBlock(Block):
         self.V = V
 
     def _apply_projection(self, data_in):
-        """Kopiert data_in und setzt Wand-DOFs auf 0."""
+
         out = data_in.copy()
         out[self.bc_nodes] = 0.0
         return out
@@ -228,15 +229,20 @@ def apply_wall_bc_on_tape(u_fn, V, wall_tag):
     return u_out
 
 
-def build_3d_background_flow_differentiable(R, H, W, G_val, mesh3d, tags,
-                                            u_bar_2d, p_bar_2d):
+def build_3d_background_flow_differentiable(R, H, W, G_val, mesh3d, tags, u_bar_2d, p_bar_2d):
 
     V_3d = VectorFunctionSpace(mesh3d, "CG", 2)
     Q_3d = FunctionSpace(mesh3d, "CG", 1)
 
+    x3d = SpatialCoordinate(mesh3d)
+    r_xy = sqrt(x3d[0] ** 2 + x3d[1] ** 2)
+    cos_ufl = x3d[0] / r_xy
+    sin_ufl = x3d[1] / r_xy
+
+    theta_ufl = atan2(x3d[1], x3d[0])
+
     with stop_annotating():
 
-        # ── Velocity DOF positions (CG2) ──
         V_coords = VectorFunctionSpace(mesh3d, "CG", 2)
         coords_func_u = Function(V_coords).interpolate(SpatialCoordinate(mesh3d))
         xyz_nodes_u = coords_func_u.dat.data_ro.copy()
@@ -253,12 +259,11 @@ def build_3d_background_flow_differentiable(R, H, W, G_val, mesh3d, tags,
         V_vom_u    = VectorFunctionSpace(vom_u, "DG", 0, dim=3)
         inv_perm_u = _compute_inv_perm(vom_u, qu)
 
-        cos_fn = Function(FunctionSpace(mesh3d, "CG", 2))
-        sin_fn = Function(FunctionSpace(mesh3d, "CG", 2))
-        cos_fn.dat.data[:] = xyz_nodes_u[:, 0] / r_3d
-        sin_fn.dat.data[:] = xyz_nodes_u[:, 1] / r_3d
+        # cos_fn = Function(FunctionSpace(mesh3d, "CG", 2))
+        # sin_fn = Function(FunctionSpace(mesh3d, "CG", 2))
+        # cos_fn.dat.data[:] = xyz_nodes_u[:, 0] / r_3d
+        # sin_fn.dat.data[:] = xyz_nodes_u[:, 1] / r_3d
 
-        # ── Pressure DOF positions (CG1) ──
         cp = Function(VectorFunctionSpace(mesh3d, "CG", 1))
         cp.interpolate(SpatialCoordinate(mesh3d))
         xyz_p = cp.dat.data_ro.copy()
@@ -272,20 +277,26 @@ def build_3d_background_flow_differentiable(R, H, W, G_val, mesh3d, tags,
         V_vom_p    = FunctionSpace(vom_p, "DG", 0)
         inv_perm_p = _compute_inv_perm(vom_p, qp)
 
-        theta_fn = Function(Q_3d)
-        theta_fn.dat.data[:] = np.arctan2(xyz_p[:, 1], xyz_p[:, 0])
+        # theta_fn = Function(Q_3d)
+        # theta_fn.dat.data[:] = np.arctan2(xyz_p[:, 1], xyz_p[:, 0])
 
-    # ── VOM-Interpolation (tape-safe) ──
     u_vom    = Function(V_vom_u).interpolate(u_bar_2d)
     u_cyl_3d = vom_transfer(u_vom, V_3d, inv_perm_u, V_vom_u)
 
     p_vom    = Function(V_vom_p).interpolate(p_bar_2d)
     p_cyl_3d = vom_transfer(p_vom, Q_3d, inv_perm_p, V_vom_p)
 
-    # ── NEU: Wand-BC auf zylindrische Geschwindigkeit erzwingen ──
     u_cyl_3d = apply_wall_bc_on_tape(u_cyl_3d, V_3d, tags["walls"])
 
-    # ── Rotation + Druckkorrektur (bleibt auf dem Tape) ──
+    u_bar_3d = as_vector([
+        cos_ufl * u_cyl_3d[0] - sin_ufl * u_cyl_3d[2],
+        sin_ufl * u_cyl_3d[0] + cos_ufl * u_cyl_3d[2],
+        u_cyl_3d[1],
+    ])
+
+    p_bar_3d = p_cyl_3d - Constant(G_val * R) * theta_ufl
+
+    '''
     u_bar_3d = as_vector([
         cos_fn * u_cyl_3d[0] - sin_fn * u_cyl_3d[2],
         sin_fn * u_cyl_3d[0] + cos_fn * u_cyl_3d[2],
@@ -293,6 +304,7 @@ def build_3d_background_flow_differentiable(R, H, W, G_val, mesh3d, tags,
     ])
 
     p_bar_3d = p_cyl_3d - Constant(G_val * R) * theta_fn
+    '''
 
     return u_bar_3d, p_bar_3d, u_cyl_3d
 
@@ -312,8 +324,7 @@ if __name__ == "__main__":
     set_working_tape(Tape())
     continue_annotation()
 
-    mesh3d, tags = make_curved_channel_section_with_spherical_hole(
-            R_hat, H_hat, W_hat, L_hat, a_hat,
+    mesh3d, tags = make_curved_channel_section_with_spherical_hole(R_hat, H_hat, W_hat, L_hat, a_hat,
             particle_maxh, global_maxh, r_off=0.0, z_off=0.0)
 
     R_space = FunctionSpace(mesh3d, "R", 0)

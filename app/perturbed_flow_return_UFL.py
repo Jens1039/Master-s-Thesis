@@ -421,7 +421,7 @@ if __name__ == "__main__":
 
     mesh3d, tags = make_curved_channel_section_with_spherical_hole(
             R_hat_hat, H_hat_hat, W_hat_hat, L_hat_hat, a_hat_hat,
-            particle_maxh_hat_hat, global_maxh_hat_hat, r_off=2, z_off=2)
+            particle_maxh_hat_hat, global_maxh_hat_hat, r_off=-4, z_off=2)
 
     R_space = FunctionSpace(mesh3d, "R", 0)
     delta_r = Function(R_space, name="delta_r").assign(0.0)
@@ -457,8 +457,8 @@ if __name__ == "__main__":
 
     c_r = Control(delta_r)
     c_z = Control(delta_z)
-    h_r = Function(R_space).assign(0.1)
-    h_z = Function(R_space).assign(0.1)
+    h_r = Function(R_space).assign(0.01)
+    h_z = Function(R_space).assign(0.01)
     h = [h_r, h_z]
     m0 = [Function(R_space).assign(0.0), Function(R_space).assign(0.0)]
 

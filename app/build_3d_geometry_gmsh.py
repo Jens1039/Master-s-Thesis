@@ -8,8 +8,7 @@ import gmsh
 from firedrake import *
 
 
-def make_curved_channel_section_with_spherical_hole(R, H, W, L, a, particle_maxh, global_maxh,
-                                                     r_off=0.0, z_off=0.0, order=2, comm=COMM_SELF):
+def make_curved_channel_section_with_spherical_hole(R, H, W, L, a, particle_maxh, global_maxh, r_off=0.0, z_off=0.0, order=2, comm=COMM_SELF):
     """
     Gmsh-based drop-in replacement for the Netgen version in build_3d_geometry_netgen.py.
 
