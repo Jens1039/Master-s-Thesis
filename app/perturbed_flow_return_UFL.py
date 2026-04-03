@@ -1,7 +1,6 @@
 import os
 os.environ["OMP_NUM_THREADS"] = "1"
 
-import numpy as np
 import math
 
 from firedrake import *
@@ -9,7 +8,7 @@ from firedrake.adjoint import stop_annotating, annotate_tape, taylor_test
 from pyadjoint import Block, AdjFloat, get_working_tape, ReducedFunctional, Control, Tape, set_working_tape, continue_annotation
 
 from nondimensionalization import second_nondimensionalisation
-from background_flow_return_UFL import background_flow_differentiable, build_3d_background_flow_differentiable
+from backup.background_flow_return_UFL import background_flow_differentiable, build_3d_background_flow_differentiable
 from build_3d_geometry_gmsh import make_curved_channel_section_with_spherical_hole
 
 

@@ -86,7 +86,8 @@ def evaluate_forces(delta_r_hh, delta_z_hh, mesh_data, compute_jacobian=True):
 
     u_bar_3d, p_bar_3d, u_cyl_3d = build_3d_background_flow_differentiable(
         md['R_hh'], md['H_hh'], md['W_hh'], md['G_hh'],
-        mesh3d, md['tags'], md['u_2d_hh'], md['p_2d_hh'])
+        mesh3d, md['tags'], md['u_2d_hh'], md['p_2d_hh'],
+        X_ref=md['X_ref'], xi=xi)
 
     pf = perturbed_flow_differentiable(
         md['R_hh'], md['H_hh'], md['W_hh'], md['L_hh'],
