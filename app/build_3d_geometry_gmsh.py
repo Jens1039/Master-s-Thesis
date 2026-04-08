@@ -9,17 +9,6 @@ from firedrake import *
 
 
 def make_curved_channel_section_with_spherical_hole(R, H, W, L, a, particle_maxh, global_maxh, r_off=0.0, z_off=0.0, order=2, comm=COMM_SELF):
-    """
-    Gmsh-based drop-in replacement for the Netgen version in build_3d_geometry_netgen.py.
-
-    Coordinate system (identical to the Netgen version):
-      - Arc center at the origin
-      - Channel sweeps from angle 0 to theta = L/R around the z-axis
-      - Cross-section: width W (radial / x), height H (vertical / z)
-      - Particle at ((R+r_off)*cos(theta/2), (R+r_off)*sin(theta/2), z_off)
-
-    The 'scaling' parameter is accepted for API compatibility but not needed by gmsh.
-    """
 
     theta = L / R
 

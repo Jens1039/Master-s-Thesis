@@ -19,7 +19,7 @@ warnings.filterwarnings("ignore", message=".*import SLEPc.*", category=UserWarni
 comm = MPI.COMM_WORLD
 rank = comm.Get_rank()
 
-a_hat_values = np.round(np.arange(0.01, 0.2, 0.005), 5)
+a_hat_values = np.round(np.arange(0.01, 0.2, 0.0025), 5)
 
 RESULTS_FILE = "bifurcation_results.json"
 PLOT_MODE = "3d"  # allowed: "3d", "2d_r", "2d_z"

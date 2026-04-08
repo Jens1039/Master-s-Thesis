@@ -239,18 +239,15 @@ def _build_CG1_to_CG2_map(mesh3d):
 
     V1 = FunctionSpace(mesh3d, "CG", 1)
     V2 = FunctionSpace(mesh3d, "CG", 2)
-    # The dofs are here all the nodes of the net as well as the points in between the nodes, which fix
-    # polynomials of higher degree (here 2)
     n1 = V1.dof_count
     n2 = V2.dof_count
 
-    # V1.cell_node_map().values returns a list of lists which contains the global indices of dofs with each tetraeder being one list
     cmap1 = V1.cell_node_map().values
     cmap2 = V2.cell_node_map().values
     dpc1  = cmap1.shape[1]
     dpc2  = cmap2.shape[1]
     n_cells = cmap1.shape[0]
-    # HIER ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
     with stop_annotating():
         src = Function(V1)
         dst = Function(V2)
@@ -271,7 +268,7 @@ def _build_CG1_to_CG2_map(mesh3d):
     cols = cmap1[:, nz_j].ravel()
     vals = np.tile(nz_vals, n_cells)
 
-    M_sum = coo_matrix((vals, (rows, cols)), shape=(n2, n1)).tocsr()
+    M_sum = coo_matrix((vals,             (rows, cols)), shape=(n2, n1)).tocsr()
     M_cnt = coo_matrix((np.ones_like(vals), (rows, cols)), shape=(n2, n1)).tocsr()
     M = M_sum.copy()
     M.data /= M_cnt.data
@@ -475,7 +472,7 @@ def build_3d_background_flow_differentiable(R, H, W, G_val, mesh3d, tags, u_bar_
     mesh2d = u_bar_2d.function_space().mesh()
 
     if X_ref is not None and xi is not None:
-
+        # HIER---------------------------------------------------------------------------------------------------------
         V_def = xi.function_space()
         M = _build_CG1_to_CG2_map(mesh3d)
         u_cyl_3d = differentiable_field_eval(xi, X_ref, u_bar_2d, R, W, H, V_def, V_3d, 3, M)
@@ -527,72 +524,3 @@ def build_3d_background_flow_differentiable(R, H, W, G_val, mesh3d, tags, u_bar_
     p_bar_3d = p_cyl_3d - Constant(G_val * R) * theta_ufl
 
     return u_bar_3d, p_bar_3d, u_cyl_3d
-
-
-if __name__ == "__main__":
-
-    R_hat = 500
-    H_hat = 2
-    W_hat = 2
-    a_hat = 0.05
-    Re = 1.0
-
-    L_hat = 4 * max(H_hat, W_hat)
-    particle_maxh = 0.2 * a_hat
-    global_maxh = 0.2 * min(H_hat, W_hat)
-
-    set_working_tape(Tape())
-    continue_annotation()
-
-    mesh3d, tags = make_curved_channel_section_with_spherical_hole(R_hat, H_hat, W_hat, L_hat, a_hat,
-                                                                   particle_maxh, global_maxh, r_off=0.0, z_off=0.0)
-
-    R_space = FunctionSpace(mesh3d, "R", 0)
-    delta_r = Function(R_space, name="delta_r").assign(0.0)
-    delta_z = Function(R_space, name="delta_z").assign(0.0)
-
-    # This is the function space, we later use for our deformation function xi
-    # This function needs to live in the same place as the coordinate function, which is constructed on the simplicial complex
-    V_def = VectorFunctionSpace(mesh3d, "CG", 1)
-
-    with stop_annotating():
-        X = Function(V_def, name="X_ref")
-        X.interpolate(SpatialCoordinate(mesh3d))
-
-    # bump is the function, which computes how much displacement we want for every node
-    particle_x, particle_y, particle_z = tags["particle_center"]
-    dist = sqrt((X[0] - particle_x) ** 2 + (X[1] - particle_y) ** 2 + (X[2] - particle_z) ** 2)
-    r_cut = min(np.abs(particle_x - X[0]), np.abs(particle_z - X[2]))
-    bump = max_value(Constant(0.0), 1.0 - dist / r_cut)
-    cos_th = math.cos(tags["theta"] / 2.0)
-    sin_th = math.sin(tags["theta"] / 2.0)
-    # Define the deformation function xi(X) (with X being the coordinates of the mesh, that we want to deform)
-    xi = Function(V_def, name="xi")
-    xi.interpolate(as_vector([delta_r * cos_th * bump, delta_r * sin_th * bump, delta_z * bump]))
-
-    mesh3d.coordinates.assign(X + xi)
-
-    bg = background_flow_differentiable(R_hat, H_hat, W_hat, Re)
-    G_val, U_m_hat, u_bar, p_bar_tilde = bg.solve_2D_background_flow()
-
-    u_bar_3d, p_bar_3d, _ = build_3d_background_flow_differentiable(R_hat, H_hat, W_hat, G_val, mesh3d, tags, u_bar, p_bar_tilde,
-                                                                    X_ref=X, xi=xi)
-
-    V_3d = VectorFunctionSpace(mesh3d, "CG", 2)
-    u_bar_3d_acc = Function(V_3d).interpolate(u_bar_3d)
-
-    J = assemble(inner(u_bar_3d_acc, u_bar_3d_acc) * dx)
-
-    c_r = Control(delta_r)
-    c_z = Control(delta_z)
-
-    h_r = Function(R_space).assign(1.0)
-    h_z = Function(R_space).assign(1.0)
-
-    Jhat_r = ReducedFunctional(J, c_r)
-    Jhat_z = ReducedFunctional(J, c_z)
-
-    print("Taylor test w.r.t. delta_r")
-    taylor_test(Jhat_r, delta_r, h_r)
-    print("\nTaylor test w.r.t. delta_z")
-    taylor_test(Jhat_z, delta_z, h_z)
