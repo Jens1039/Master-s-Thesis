@@ -8,16 +8,47 @@ from copy import deepcopy
 
 from firedrake import *
 from firedrake.adjoint import (
-    stop_annotating, continue_annotation,
+    stop_annotating, continue_annotation, annotate_tape,
     ReducedFunctional, Control,
 )
-from pyadjoint import set_working_tape, get_working_tape, Tape
+from pyadjoint import set_working_tape, get_working_tape, Tape, Block, AdjFloat
+from pyadjoint.adjfloat import AdjFloatExprBlock
 
 from firedrake import JacobianDeterminant
 
+# ---------------------------------------------------------------------------
+#  Monkey-patch: fix AdjFloatExprBlock.evaluate_hessian_component
+# ---------------------------------------------------------------------------
+#  The cross-term ``codegen(diff=(idx, idx1))(*inputs) * adj_input * tlm_input``
+#  crashes when adj_input is None (adjoint seed did not reach this block).
+#  Similarly the linear term ``codegen(diff=(idx,))(*inputs) * hessian_input``
+#  crashes when hessian_input is None.  Both must be guarded.
+# ---------------------------------------------------------------------------
+def _patched_adjfloat_expr_hessian(self, inputs, hessian_inputs, adj_inputs,
+                                    block_variable, idx, relevant_dependencies,
+                                    prepared=None):
+    hessian_input, = hessian_inputs
+    adj_input, = adj_inputs
+
+    if hessian_input is not None:
+        val = self._operator.codegen(diff=(idx,))(*inputs) * hessian_input
+    else:
+        val = 0.0
+
+    if adj_input is not None:
+        for idx1, dep in relevant_dependencies:
+            tlm_input = dep.tlm_value
+            if tlm_input is not None:
+                val += (self._operator.codegen(diff=(idx, idx1))(*inputs)
+                        * adj_input * tlm_input)
+    return val
+
+AdjFloatExprBlock.evaluate_hessian_component = _patched_adjfloat_expr_hessian
+# ---------------------------------------------------------------------------
+
 from nondimensionalization import first_nondimensionalisation, second_nondimensionalisation
 from background_flow_return_UFL import background_flow_differentiable, build_3d_background_flow_differentiable
-from perturbed_flow_return_UFL import perturbed_flow_differentiable
+from perturbed_flow_return_UFL import perturbed_flow_differentiable, cyl_project, r_scalar
 from build_3d_geometry_gmsh import make_curved_channel_section_with_spherical_hole
 from config_paper_parameters import R, H, W, Q, rho, mu, particle_maxh_rel, global_maxh_rel
 
@@ -150,21 +181,6 @@ def evaluate_forces(delta_r_hh, delta_z_hh, mesh_data, compute_jacobian=True):
         get_working_tape().clear_tape()
         return F
 
-    '''
-    with stop_annotating():
-        eps = 1e-5
-        F_rp = evaluate_forces(delta_r_hh + eps, delta_z_hh, mesh_data, compute_jacobian=False)
-        F_rm = evaluate_forces(delta_r_hh - eps, delta_z_hh, mesh_data, compute_jacobian=False)
-        F_zp = evaluate_forces(delta_r_hh, delta_z_hh + eps, mesh_data, compute_jacobian=False)
-        F_zm = evaluate_forces(delta_r_hh, delta_z_hh - eps, mesh_data, compute_jacobian=False)
-    
-        J = np.zeros((2, 2))
-        J[:, 0] = (F_rp - F_rm) / (2 * eps)
-        J[:, 1] = (F_zp - F_zm) / (2 * eps)
-    
-        return F, J
-    '''
-
     c_r = Control(delta_r)
     c_z = Control(delta_z)
 
@@ -244,25 +260,6 @@ def evaluate_forces_tlm(delta_r_hh, delta_z_hh, mesh_data, phi):
     stop_annotating()
     get_working_tape().clear_tape()
     return F, Jphi
-
-
-def evaluate_forces_and_fd_jacobian(delta_r_hh, delta_z_hh, mesh_data, eps=1e-5):
-
-    F0 = evaluate_forces(delta_r_hh, delta_z_hh, mesh_data, compute_jacobian=False)
-
-    # dF/d(delta_r)
-    F_rp = evaluate_forces(delta_r_hh + eps, delta_z_hh, mesh_data, compute_jacobian=False)
-    F_rm = evaluate_forces(delta_r_hh - eps, delta_z_hh, mesh_data, compute_jacobian=False)
-
-    # dF/d(delta_z)
-    F_zp = evaluate_forces(delta_r_hh, delta_z_hh + eps, mesh_data, compute_jacobian=False)
-    F_zm = evaluate_forces(delta_r_hh, delta_z_hh - eps, mesh_data, compute_jacobian=False)
-
-    J_fd = np.zeros((2, 2))
-    J_fd[:, 0] = (F_rp - F_rm) / (2 * eps)
-    J_fd[:, 1] = (F_zp - F_zm) / (2 * eps)
-
-    return F0, J_fd
 
 
 def newton_root_refine(r_off_hat_init, z_off_hat_init, a_hat, shared_data, *, tol=1e-10, max_iter=15):
@@ -493,11 +490,6 @@ def _print_result(r_off_hat, z_off_hat, a_hat, phi, sv, shared_data):
     print(f"    z_off      = {z_off_hat * L_c * 1e6:.4f} um")
 
 
-# ============================================================
-# BEGIN: Moore-Spence bifurcation solver (added section)
-# ============================================================
-
-
 def _moore_spence_eval(r_off_hat, z_off_hat, a_hat, shared_data):
     """Build mesh at (r, z, a) and evaluate forces + AD Jacobian.
     Returns (F, J_hh, mesh_data)."""
@@ -706,17 +698,6 @@ def moore_spence_solve(r_off_hat_eq, z_off_hat_eq, a_hat_init, shared_data, *, t
     return r, z, a, phi, False
 
 
-# ============================================================
-# END: Moore-Spence bifurcation solver (added section)
-# ============================================================
-
-
-# ============================================================
-# HAT-SYSTEM IMPLEMENTATION (no second nondimensionalization)
-# Moving mesh for all parameters: r, z, and a
-# ============================================================
-
-
 def setup_moving_mesh_hat(r_off_hat_init, z_off_hat_init, a_hat_init,
                           R_hat, H_hat, W_hat, Re, G_hat, U_m_hat,
                           u_bar_2d_hat, p_bar_tilde_2d_hat,
@@ -771,6 +752,18 @@ def setup_moving_mesh_hat(r_off_hat_init, z_off_hat_init, a_hat_init,
 
     _, ref_signs = check_mesh_quality(mesh3d)
 
+    # Pre-evaluate bump and d_hat to numpy arrays (off-tape) for XiHatBlock.
+    # These are fixed geometric quantities that depend only on X_ref.
+    with stop_annotating():
+        V_scalar = FunctionSpace(mesh3d, "CG", 1)
+        bump_fn = Function(V_scalar, name="bump_eval")
+        bump_fn.interpolate(bump)
+        bump_data = bump_fn.dat.data_ro.copy()
+
+        d_hat_fn = Function(V_def, name="d_hat_eval")
+        d_hat_fn.interpolate(as_vector([d_hat_x, d_hat_y, d_hat_z]))
+        d_hat_data = d_hat_fn.dat.data_ro.copy()
+
     print(f"  [setup_hat] Mesh in hat coords: R={R_hat:.2f}, H={H_hat:.2f}, "
           f"W={W_hat:.2f}, a={a_hat_init:.4f}, L={L_hat:.2f}")
 
@@ -778,6 +771,7 @@ def setup_moving_mesh_hat(r_off_hat_init, z_off_hat_init, a_hat_init,
         'mesh3d': mesh3d, 'tags': tags,
         'X_ref': X_ref, 'V_def': V_def,
         'bump': bump,
+        'bump_data': bump_data, 'd_hat_data': d_hat_data,
         'd_hat_x': d_hat_x, 'd_hat_y': d_hat_y, 'd_hat_z': d_hat_z,
         'cos_th': math.cos(theta_half),
         'sin_th': math.sin(theta_half),
@@ -790,15 +784,121 @@ def setup_moving_mesh_hat(r_off_hat_init, z_off_hat_init, a_hat_init,
     }
 
 
-def _build_xi_hat(delta_r, delta_z, delta_a, md):
-    """Build mesh deformation: translation (delta_r, delta_z) + sphere scaling (delta_a)."""
+class XiHatBlock(Block):
+    """Tape-aware mesh deformation  xi = f(delta_r, delta_z, delta_a).
 
+    The map is LINEAR in the three R-space controls:
+        xi[n, 0] = (delta_r · cos_th + delta_a · d_hat[n, 0]) · bump[n]
+        xi[n, 1] = (delta_r · sin_th + delta_a · d_hat[n, 1]) · bump[n]
+        xi[n, 2] = (delta_z           + delta_a · d_hat[n, 2]) · bump[n]
+
+    Because the map is linear, the second derivative vanishes: the Hessian
+    component is simply the adjoint applied to the second-order seed.
+
+    This replaces ``xi.interpolate(as_vector([...]))`` which puts an
+    InterpolateBlock on the tape.  That block's Hessian path crashes in
+    pyadjoint/UFL when the expression mixes R-space Functions with CG1
+    expressions (BaseFormOperatorDerivative Sum bug).
+
+    Dependencies: idx 0 = delta_r, idx 1 = delta_z, idx 2 = delta_a.
+    """
+
+    def __init__(self, delta_r, delta_z, delta_a, xi_out,
+                 cos_th, sin_th, bump_data, d_hat_data, V_def):
+        super().__init__()
+        self.add_dependency(delta_r)
+        self.add_dependency(delta_z)
+        self.add_dependency(delta_a)
+        self.add_output(xi_out.create_block_variable())
+        self.cos_th = cos_th
+        self.sin_th = sin_th
+        self.bump = bump_data       # (n_nodes,)
+        self.d_hat = d_hat_data     # (n_nodes, 3)
+        self.V_def = V_def
+
+    def recompute_component(self, inputs, block_variable, idx, prepared):
+        dr = float(inputs[0].dat.data_ro[0])
+        dz = float(inputs[1].dat.data_ro[0])
+        da = float(inputs[2].dat.data_ro[0])
+        out = block_variable.output
+        b, d = self.bump, self.d_hat
+        with stop_annotating():
+            out.dat.data[:, 0] = (dr * self.cos_th + da * d[:, 0]) * b
+            out.dat.data[:, 1] = (dr * self.sin_th + da * d[:, 1]) * b
+            out.dat.data[:, 2] = (dz               + da * d[:, 2]) * b
+        return out
+
+    def evaluate_adj_component(self, inputs, adj_inputs, block_variable, idx,
+                               prepared=None):
+        if adj_inputs[0] is None:
+            return None
+        a = np.asarray(adj_inputs[0].dat.data_ro)   # (n_nodes, 3)
+        b, d = self.bump, self.d_hat
+        with stop_annotating():
+            R_space = inputs[idx].function_space()
+            out = Cofunction(R_space.dual())
+            if idx == 0:    # delta_r
+                out.dat.data[0] = float(np.sum(
+                    self.cos_th * b * a[:, 0] + self.sin_th * b * a[:, 1]))
+            elif idx == 1:  # delta_z
+                out.dat.data[0] = float(np.sum(b * a[:, 2]))
+            elif idx == 2:  # delta_a
+                out.dat.data[0] = float(np.sum(
+                    d[:, 0] * b * a[:, 0] + d[:, 1] * b * a[:, 1]
+                    + d[:, 2] * b * a[:, 2]))
+        return out
+
+    def evaluate_tlm_component(self, inputs, tlm_inputs, block_variable, idx,
+                               prepared=None):
+        b, d = self.bump, self.d_hat
+        with stop_annotating():
+            out = Function(self.V_def)
+            data = np.zeros_like(out.dat.data)
+            if tlm_inputs[0] is not None:
+                ddr = float(tlm_inputs[0].dat.data_ro[0])
+                data[:, 0] += ddr * self.cos_th * b
+                data[:, 1] += ddr * self.sin_th * b
+            if tlm_inputs[1] is not None:
+                ddz = float(tlm_inputs[1].dat.data_ro[0])
+                data[:, 2] += ddz * b
+            if tlm_inputs[2] is not None:
+                dda = float(tlm_inputs[2].dat.data_ro[0])
+                data[:, 0] += dda * d[:, 0] * b
+                data[:, 1] += dda * d[:, 1] * b
+                data[:, 2] += dda * d[:, 2] * b
+            out.dat.data[:] = data
+        return out
+
+    def evaluate_hessian_component(self, inputs, hessian_inputs, adj_inputs,
+                                   block_variable, idx, relevant_dependencies,
+                                   prepared=None):
+        # Linear block ⇒ second derivative is zero ⇒ only pass through
+        # the adjoint of the second-order seed.
+        if hessian_inputs[0] is None:
+            return None
+        return self.evaluate_adj_component(
+            inputs, hessian_inputs, block_variable, idx, prepared)
+
+
+def _build_xi_hat(delta_r, delta_z, delta_a, md):
+    """Build mesh deformation via custom tape block (Hessian-safe).
+
+    Replaces the original ``xi.interpolate(as_vector([...]))`` which crashes
+    pyadjoint's Hessian on InterpolateBlocks mixing R-space and CG1 coefficients.
+    """
     xi = Function(md['V_def'], name="xi")
-    xi.interpolate(as_vector([
-        (delta_r * md['cos_th'] + delta_a * md['d_hat_x']) * md['bump'],
-        (delta_r * md['sin_th'] + delta_a * md['d_hat_y']) * md['bump'],
-        (delta_z              + delta_a * md['d_hat_z']) * md['bump'],
-    ]))
+    b, d = md['bump_data'], md['d_hat_data']
+    dr = float(delta_r.dat.data_ro[0])
+    dz = float(delta_z.dat.data_ro[0])
+    da = float(delta_a.dat.data_ro[0])
+    with stop_annotating():
+        xi.dat.data[:, 0] = (dr * md['cos_th'] + da * d[:, 0]) * b
+        xi.dat.data[:, 1] = (dr * md['sin_th'] + da * d[:, 1]) * b
+        xi.dat.data[:, 2] = (dz                + da * d[:, 2]) * b
+    if annotate_tape():
+        block = XiHatBlock(delta_r, delta_z, delta_a, xi,
+                           md['cos_th'], md['sin_th'], b, d, md['V_def'])
+        get_working_tape().add_block(block)
     return xi
 
 
@@ -851,9 +951,15 @@ def evaluate_forces_hat(delta_r_hat, delta_z_hat, delta_a_hat, mesh_data,
         mesh3d, md['tags'], md['u_bar_2d_hat'], md['p_bar_tilde_2d_hat'],
         X_ref=md['X_ref'], xi=xi)
 
+    # Tape-connected total particle radius a_total = a_hat_init + delta_a.
+    # Passing this (instead of the frozen scalar md['a_hat_init']) lets the
+    # centrifugal a^3 prefactor in perturbed_flow_differentiable update with
+    # delta_a, so the moving-mesh evaluation matches a fresh-mesh evaluation
+    # of the same physical sphere radius.  Re_p stays as md['Re'] — that is
+    # the hat-system convention and must NOT be touched.
     pf = perturbed_flow_differentiable(
         md['R_hat'], md['H_hat'], md['W_hat'], md['L_hat'],
-        md['a_hat_init'], md['Re'],
+        (md['a_hat_init'], delta_a), md['Re'],
         mesh3d, md['tags'], u_bar_3d, p_bar_3d,
         md['X_ref'], xi, u_cyl_3d)
 
@@ -913,9 +1019,10 @@ def evaluate_forces_tlm_hat(delta_r_hat, delta_z_hat, delta_a_hat,
         mesh3d, md['tags'], md['u_bar_2d_hat'], md['p_bar_tilde_2d_hat'],
         X_ref=md['X_ref'], xi=xi)
 
+    # Tape-connected total radius (see evaluate_forces_hat for rationale).
     pf = perturbed_flow_differentiable(
         md['R_hat'], md['H_hat'], md['W_hat'], md['L_hat'],
-        md['a_hat_init'], md['Re'],
+        (md['a_hat_init'], delta_a), md['Re'],
         mesh3d, md['tags'], u_bar_3d, p_bar_3d,
         md['X_ref'], xi, u_cyl_3d)
 
@@ -977,9 +1084,10 @@ def evaluate_forces_jac_hessian_hat(delta_r_hat, delta_z_hat, delta_a_hat,
         mesh3d, md['tags'], md['u_bar_2d_hat'], md['p_bar_tilde_2d_hat'],
         X_ref=md['X_ref'], xi=xi)
 
+    # Tape-connected total radius (see evaluate_forces_hat for rationale).
     pf = perturbed_flow_differentiable(
         md['R_hat'], md['H_hat'], md['W_hat'], md['L_hat'],
-        md['a_hat_init'], md['Re'],
+        (md['a_hat_init'], delta_a), md['Re'],
         mesh3d, md['tags'], u_bar_3d, p_bar_3d,
         md['X_ref'], xi, u_cyl_3d)
 
@@ -1008,7 +1116,13 @@ def evaluate_forces_jac_hessian_hat(delta_r_hat, delta_z_hat, delta_a_hat,
     phi_a_fn = Function(R_space).assign(0.0)
     m_dot = [phi_r_fn, phi_z_fn, phi_a_fn]
 
+    # IMPORTANT: derivative() must be called immediately before hessian()
+    # for the SAME functional.  Each derivative() call overwrites adj_sol
+    # on every SolveBlock on the tape.  If we call rf_z.derivative() then
+    # rf_x.hessian(), the hessian uses F_z's adjoint solution — wrong!
+    rf_x.derivative()
     Hphi_x = rf_x.hessian(m_dot)
+    rf_z.derivative()
     Hphi_z = rf_z.hessian(m_dot)
 
     dJphi_dx = np.zeros((2, 3))
@@ -1057,6 +1171,886 @@ def diag_hessian_vs_fd(dr, dz, da, md, phi, eps=1e-4):
     rel = np.linalg.norm(diff) / (np.linalg.norm(dJphi_dx_FD) + 1e-30)
     print(f"\n  Relative diff: {rel:.4e}")
     return dJphi_dx_AD, dJphi_dx_FD
+
+
+def diagnose_tape_hessian_blocks(dr, dz, da, md):
+    """List all blocks on the tape and flag those missing a Hessian implementation.
+
+    Blocks that inherit the default Block.evaluate_hessian_component return 0.0,
+    silently dropping their second-order contribution.
+    """
+    print("\n" + "=" * 70)
+    print("  TAPE HESSIAN AUDIT")
+    print("=" * 70)
+
+    set_working_tape(Tape())
+    continue_annotation()
+
+    mesh3d = md['mesh3d']
+    R_space = FunctionSpace(mesh3d, "R", 0)
+    delta_r = Function(R_space, name="delta_r").assign(dr)
+    delta_z = Function(R_space, name="delta_z").assign(dz)
+    delta_a = Function(R_space, name="delta_a").assign(da)
+
+    xi = _build_xi_hat(delta_r, delta_z, delta_a, md)
+    mesh3d.coordinates.assign(md['X_ref'] + xi)
+    check_mesh_quality(mesh3d, ref_signs=md['ref_signs'])
+
+    u_bar_3d, p_bar_3d, u_cyl_3d = build_3d_background_flow_differentiable(
+        md['R_hat'], md['H_hat'], md['W_hat'], md['G_hat'],
+        mesh3d, md['tags'], md['u_bar_2d_hat'], md['p_bar_tilde_2d_hat'],
+        X_ref=md['X_ref'], xi=xi)
+
+    pf = perturbed_flow_differentiable(
+        md['R_hat'], md['H_hat'], md['W_hat'], md['L_hat'],
+        (md['a_hat_init'], delta_a), md['Re'],
+        mesh3d, md['tags'], u_bar_3d, p_bar_3d,
+        md['X_ref'], xi, u_cyl_3d)
+
+    F_p_x, F_p_z = pf.F_p()
+
+    tape = get_working_tape()
+    blocks = tape.get_blocks()
+
+    # Check which blocks override evaluate_hessian_component
+    from pyadjoint import Block as BaseBlock
+    default_method = BaseBlock.evaluate_hessian_component
+
+    n_default = 0
+    n_custom = 0
+    print(f"\n  {len(blocks)} blocks on tape:\n")
+    print(f"  {'idx':>4s}  {'Block class':40s}  {'Hessian':15s}  {'module'}")
+    print(f"  {'----':>4s}  {'----------':40s}  {'-------':15s}  {'------'}")
+
+    for i, block in enumerate(blocks):
+        cls = type(block)
+        has_custom = cls.evaluate_hessian_component is not default_method
+        if has_custom:
+            tag = "CUSTOM"
+            n_custom += 1
+        else:
+            tag = "DEFAULT (=0) !!!"
+            n_default += 1
+        mod = cls.__module__ or ""
+        print(f"  {i:4d}  {cls.__name__:40s}  {tag:15s}  {mod}")
+
+    print(f"\n  Summary: {n_custom} custom, {n_default} default (= 0)")
+    if n_default > 0:
+        print(f"  !! {n_default} block(s) silently return 0 for the Hessian.")
+        print(f"  !! These are the likely cause of the wrong second derivatives.")
+    else:
+        print(f"  All blocks have custom Hessian implementations.")
+        print(f"  Bug is in the implementation of one of them.")
+
+    stop_annotating()
+    get_working_tape().clear_tape()
+
+    return n_default
+
+
+def verify_jacobian_deterministic(dr, dz, da, md, n_repeats=5):
+    """TEST A: Is the AD Jacobian deterministic?
+
+    Evaluates evaluate_forces_hat n_repeats times at the exact same point.
+    Any variation is floating-point non-determinism in the PDE solve.
+    """
+    print("\n" + "=" * 70)
+    print("  TEST A: AD Jacobian determinism")
+    print("=" * 70)
+
+    Fs, Js = [], []
+    for i in range(n_repeats):
+        F, J = evaluate_forces_hat(dr, dz, da, md)
+        Fs.append(F.copy())
+        Js.append(J.copy())
+
+    Fs = np.array(Fs)
+    Js = np.array(Js)
+
+    F_std = np.std(Fs, axis=0)
+    J_std = np.std(Js, axis=0)
+    F_mean = np.mean(Fs, axis=0)
+    J_mean = np.mean(Js, axis=0)
+
+    print(f"\n  {n_repeats} evaluations at (dr={dr}, dz={dz}, da={da}):")
+    print(f"  F mean: [{F_mean[0]:+.10e}, {F_mean[1]:+.10e}]")
+    print(f"  F std:  [{F_std[0]:.4e}, {F_std[1]:.4e}]")
+    print(f"\n  J mean:")
+    for i in range(2):
+        print(f"    [{' '.join(f'{J_mean[i,j]:+.10e}' for j in range(3))}]")
+    print(f"  J std:")
+    for i in range(2):
+        print(f"    [{' '.join(f'{J_std[i,j]:.4e}' for j in range(3))}]")
+
+    noise = J_std.max()
+    print(f"\n  Max J noise: {noise:.4e}")
+    if noise < 1e-12:
+        print(f"  -> DETERMINISTIC (noise < 1e-12)")
+    else:
+        print(f"  -> NON-DETERMINISTIC")
+        print(f"     At eps=1e-4, FD noise ~ {noise / 1e-4:.2e}")
+        print(f"     At eps=1e-3, FD noise ~ {noise / 1e-3:.2e}")
+
+    return {'F_mean': F_mean, 'J_mean': J_mean, 'F_std': F_std, 'J_std': J_std,
+            'noise': noise}
+
+
+def verify_jacobian_taylor(dr, dz, da, md, m_dir=None):
+    """TEST B: Taylor test for the AD Jacobian (first derivative).
+
+    Checks  F(x + h·m) - F(x) - h·J·m  =  O(h²)
+    for each force component.  Convergence rate ~2 confirms correctness.
+    """
+    print("\n" + "=" * 70)
+    print("  TEST B: Taylor test for AD Jacobian (gradient)")
+    print("=" * 70)
+
+    F0, J0 = evaluate_forces_hat(dr, dz, da, md)
+    if m_dir is None:
+        m_dir = np.array([1.0, 0.7, -0.3])
+    m_dir = m_dir / np.linalg.norm(m_dir)
+
+    Jm = J0 @ m_dir  # predicted linear change
+
+    h_values = [1e-2, 5e-3, 2e-3, 1e-3, 5e-4, 2e-4, 1e-4]
+    print(f"\n  Direction m = ({m_dir[0]:+.4f}, {m_dir[1]:+.4f}, {m_dir[2]:+.4f})")
+    print(f"  F0 = ({F0[0]:+.6e}, {F0[1]:+.6e})")
+    print(f"  J·m = ({Jm[0]:+.6e}, {Jm[1]:+.6e})")
+    print(f"\n  {'h':>10s}  {'|F(x+hm)-F(x)|':>14s}  {'|残差1|':>14s}  {'rate1':>6s}"
+          f"  {'|残差0| (no J)':>14s}  {'rate0':>6s}")
+
+    prev_r0, prev_r1 = None, None
+    for h in h_values:
+        dr_h = dr + h * m_dir[0]
+        dz_h = dz + h * m_dir[1]
+        da_h = da + h * m_dir[2]
+        try:
+            Fh = evaluate_forces_hat(dr_h, dz_h, da_h, md, compute_jacobian=False)
+        except MeshFlippedError:
+            print(f"  {h:10.1e}  MESH FLIPPED")
+            continue
+
+        diff = Fh - F0
+        r0 = np.linalg.norm(diff)           # should be O(h)
+        r1 = np.linalg.norm(diff - h * Jm)  # should be O(h²) if J correct
+
+        rate0 = f"{np.log(r0 / prev_r0) / np.log(h / h_prev):.2f}" if prev_r0 is not None and prev_r0 > 0 else "  —"
+        rate1 = f"{np.log(r1 / prev_r1) / np.log(h / h_prev):.2f}" if prev_r1 is not None and prev_r1 > 0 else "  —"
+
+        print(f"  {h:10.1e}  {np.linalg.norm(diff):14.6e}  {r1:14.6e}  {rate1:>6s}"
+              f"  {r0:14.6e}  {rate0:>6s}")
+
+        prev_r0, prev_r1 = r0, r1
+        h_prev = h
+
+    return {}
+
+
+def verify_hessian_taylor(dr, dz, da, md, phi, m_dir=None):
+    """TEST C: Taylor test for the AD Hessian (second derivative).
+
+    For scalar functional F_i(x), checks:
+        F_i(x + h·m) - F_i(x) - h·∇F_i·m - ½h²·mᵀ·H_i·m  =  O(h³)
+
+    Convergence rate ~3 confirms the Hessian is correct.
+    Rate ~2 means the Hessian is wrong but the gradient is right.
+    """
+    print("\n" + "=" * 70)
+    print("  TEST C: Taylor test for AD Hessian (second derivative)")
+    print("=" * 70)
+
+    if m_dir is None:
+        m_dir = np.array([1.0, 0.7, -0.3])
+    m_dir = m_dir / np.linalg.norm(m_dir)
+
+    # Compute F, J, and H·m at base point
+    try:
+        F0, J0, dJphi_dx = evaluate_forces_jac_hessian_hat(dr, dz, da, md, phi)
+    except Exception as e:
+        print(f"  AD Hessian FAILED: {type(e).__name__}: {e}")
+        return {'passed': False}
+
+    grad = J0 @ m_dir  # (2,) — gradient · direction for each force component
+
+    # Hessian · m for each force component:
+    # H_i · m_dir gives a 3-vector; the scalar mᵀ·H_i·m = m_dir · (H_i · m_dir)
+    # But evaluate_forces_jac_hessian_hat computes H_i · phi, not H_i · m_dir.
+    # We need H_i · m_dir. Since phi ≠ m_dir in general, we need a separate call.
+    # Actually, the Hessian seed in evaluate_forces_jac_hessian_hat is m_dot = (phi_r, phi_z, 0).
+    # For the Taylor test, we need H_i · m_dir with all 3 components of m_dir.
+
+    # Call hessian with m_dir as the seed instead of phi
+    set_working_tape(Tape())
+    continue_annotation()
+
+    mesh3d = md['mesh3d']
+    R_space = FunctionSpace(mesh3d, "R", 0)
+
+    delta_r = Function(R_space, name="delta_r").assign(dr)
+    delta_z = Function(R_space, name="delta_z").assign(dz)
+    delta_a = Function(R_space, name="delta_a").assign(da)
+
+    xi = _build_xi_hat(delta_r, delta_z, delta_a, md)
+    mesh3d.coordinates.assign(md['X_ref'] + xi)
+
+    u_bar_3d, p_bar_3d, u_cyl_3d = build_3d_background_flow_differentiable(
+        md['R_hat'], md['H_hat'], md['W_hat'], md['G_hat'],
+        mesh3d, md['tags'], md['u_bar_2d_hat'], md['p_bar_tilde_2d_hat'],
+        X_ref=md['X_ref'], xi=xi)
+
+    pf = perturbed_flow_differentiable(
+        md['R_hat'], md['H_hat'], md['W_hat'], md['L_hat'],
+        (md['a_hat_init'], delta_a), md['Re'],
+        mesh3d, md['tags'], u_bar_3d, p_bar_3d,
+        md['X_ref'], xi, u_cyl_3d)
+
+    F_p_x, F_p_z = pf.F_p()
+
+    controls = [Control(delta_r), Control(delta_z), Control(delta_a)]
+    rf_x = ReducedFunctional(F_p_x, controls)
+    rf_z = ReducedFunctional(F_p_z, controls)
+
+    m_r = Function(R_space).assign(float(m_dir[0]))
+    m_z = Function(R_space).assign(float(m_dir[1]))
+    m_a = Function(R_space).assign(float(m_dir[2]))
+    m_dot = [m_r, m_z, m_a]
+
+    # Gradient (for verification)
+    dFx = rf_x.derivative()
+    dFz = rf_z.derivative()
+
+    try:
+        Hm_x = rf_x.hessian(m_dot)
+        Hm_z = rf_z.hessian(m_dot)
+    except Exception as e:
+        stop_annotating()
+        get_working_tape().clear_tape()
+        print(f"  AD Hessian FAILED: {type(e).__name__}: {e}")
+        return {'passed': False}
+
+    # mᵀ · H · m for each component
+    mHm = np.zeros(2)
+    for j in range(3):
+        mHm[0] += float(Hm_x[j].dat.data_ro[0]) * m_dir[j]
+        mHm[1] += float(Hm_z[j].dat.data_ro[0]) * m_dir[j]
+
+    stop_annotating()
+    get_working_tape().clear_tape()
+
+    print(f"\n  Direction m = ({m_dir[0]:+.4f}, {m_dir[1]:+.4f}, {m_dir[2]:+.4f})")
+    print(f"  ∇F·m  = ({grad[0]:+.6e}, {grad[1]:+.6e})")
+    print(f"  mᵀHm  = ({mHm[0]:+.6e}, {mHm[1]:+.6e})")
+
+    h_values = [1e-2, 5e-3, 2e-3, 1e-3, 5e-4, 2e-4, 1e-4]
+
+    for comp, label in [(0, "F_x"), (1, "F_z")]:
+        print(f"\n  --- {label} ---")
+        print(f"  {'h':>10s}  {'|r1| (no H)':>14s}  {'rate1':>6s}"
+              f"  {'|r2| (with H)':>14s}  {'rate2':>6s}")
+
+        prev_r1, prev_r2 = None, None
+        h_prev = None
+        for h in h_values:
+            try:
+                Fh = evaluate_forces_hat(
+                    dr + h * m_dir[0], dz + h * m_dir[1], da + h * m_dir[2],
+                    md, compute_jacobian=False)
+            except MeshFlippedError:
+                print(f"  {h:10.1e}  MESH FLIPPED")
+                continue
+
+            diff = Fh[comp] - F0[comp]
+            r1 = abs(diff - h * grad[comp])                        # O(h²) if J correct
+            r2 = abs(diff - h * grad[comp] - 0.5 * h**2 * mHm[comp])  # O(h³) if H correct
+
+            rate1 = f"{np.log(r1 / prev_r1) / np.log(h / h_prev):.2f}" if prev_r1 and prev_r1 > 0 and h_prev else "  —"
+            rate2 = f"{np.log(r2 / prev_r2) / np.log(h / h_prev):.2f}" if prev_r2 and prev_r2 > 0 and h_prev else "  —"
+
+            print(f"  {h:10.1e}  {r1:14.6e}  {rate1:>6s}  {r2:14.6e}  {rate2:>6s}")
+
+            prev_r1, prev_r2 = r1, r2
+            h_prev = h
+
+    return {'mHm': mHm, 'grad': grad, 'passed': True}
+
+
+def _hessian_taylor_subchain(name, build_functional, dr, dz, da, md, m_dir,
+                              h_values=None):
+    """Run a second-order Taylor test on a sub-chain functional.
+
+    build_functional(delta_r, delta_z, delta_a, md) -> AdjFloat scalar
+    Must be called INSIDE an active tape.
+    """
+    if h_values is None:
+        h_values = [1e-2, 5e-3, 2e-3, 1e-3, 5e-4, 2e-4]
+
+    print(f"\n  --- Sub-chain: {name} ---")
+
+    # (a) Base evaluation with gradient + Hessian-vector product
+    set_working_tape(Tape())
+    continue_annotation()
+
+    mesh3d = md['mesh3d']
+    R_space = FunctionSpace(mesh3d, "R", 0)
+    delta_r = Function(R_space, name="delta_r").assign(dr)
+    delta_z = Function(R_space, name="delta_z").assign(dz)
+    delta_a = Function(R_space, name="delta_a").assign(da)
+
+    J_val = build_functional(delta_r, delta_z, delta_a, md)
+    J0 = float(J_val)
+
+    controls = [Control(delta_r), Control(delta_z), Control(delta_a)]
+    rf = ReducedFunctional(J_val, controls)
+
+    dJ = rf.derivative()
+    grad = np.array([float(dJ[j].dat.data_ro[0]) for j in range(3)])
+    grad_m = np.dot(grad, m_dir)
+
+    m_fns = [Function(R_space).assign(float(m_dir[j])) for j in range(3)]
+    try:
+        Hm = rf.hessian(m_fns)
+        Hm_arr = np.array([float(Hm[j].dat.data_ro[0]) for j in range(3)])
+        mHm = np.dot(m_dir, Hm_arr)
+        hessian_ok = True
+    except Exception as e:
+        print(f"    Hessian CRASHED: {type(e).__name__}: {e}")
+        mHm = 0.0
+        hessian_ok = False
+
+    stop_annotating()
+    get_working_tape().clear_tape()
+
+    print(f"    J0 = {J0:+.6e},  ∇J·m = {grad_m:+.6e},  mᵀHm = {mHm:+.6e}")
+
+    if not hessian_ok:
+        return False
+
+    # (b) Taylor test: F(x+hm) - F(x) - h*grad - ½h²*mᵀHm = O(h³)?
+    print(f"    {'h':>10s}  {'|r1| O(h²)':>12s}  {'rate1':>6s}  {'|r2| O(h³)':>12s}  {'rate2':>6s}")
+    prev_r1, prev_r2, h_prev = None, None, None
+
+    for h in h_values:
+        set_working_tape(Tape())
+        continue_annotation()
+        d_r = Function(R_space, name="delta_r").assign(dr + h * m_dir[0])
+        d_z = Function(R_space, name="delta_z").assign(dz + h * m_dir[1])
+        d_a = Function(R_space, name="delta_a").assign(da + h * m_dir[2])
+        try:
+            Jh = float(build_functional(d_r, d_z, d_a, md))
+        except Exception:
+            print(f"    {h:10.1e}  FAILED")
+            stop_annotating()
+            get_working_tape().clear_tape()
+            continue
+        stop_annotating()
+        get_working_tape().clear_tape()
+
+        diff = Jh - J0
+        r1 = abs(diff - h * grad_m)
+        r2 = abs(diff - h * grad_m - 0.5 * h**2 * mHm)
+
+        rate1 = f"{np.log(r1/prev_r1)/np.log(h/h_prev):.2f}" if prev_r1 and prev_r1 > 0 and h_prev else "  —"
+        rate2 = f"{np.log(r2/prev_r2)/np.log(h/h_prev):.2f}" if prev_r2 and prev_r2 > 0 and h_prev else "  —"
+        print(f"    {h:10.1e}  {r1:12.4e}  {rate1:>6s}  {r2:12.4e}  {rate2:>6s}")
+
+        prev_r1, prev_r2, h_prev = r1, r2, h
+
+    return True
+
+
+def bisect_hessian_bug(dr, dz, da, md):
+    """Binary search: Taylor-test sub-chain functionals to isolate the faulty block."""
+
+    print("\n" + "=" * 70)
+    print("  HESSIAN BUG BISECTION")
+    print("=" * 70)
+
+    m_dir = np.array([1.0, 0.7, -0.3])
+    m_dir = m_dir / np.linalg.norm(m_dir)
+
+    # Stages 1-3 (xi, mesh vol, bg flow) verified: rate2 ≈ 3.0 ✓
+    # Bug is between bg flow and F_p — isolating Stokes solve chain.
+
+    # ── Stage 4: Xi + mesh + background + one Stokes solve ──
+    def func_one_stokes(delta_r, delta_z, delta_a, md):
+        mesh3d = md['mesh3d']
+        xi = _build_xi_hat(delta_r, delta_z, delta_a, md)
+        mesh3d.coordinates.assign(md['X_ref'] + xi)
+        check_mesh_quality(mesh3d, ref_signs=md['ref_signs'])
+        u_bar_3d, p_bar_3d, u_cyl_3d = build_3d_background_flow_differentiable(
+            md['R_hat'], md['H_hat'], md['W_hat'], md['G_hat'],
+            mesh3d, md['tags'], md['u_bar_2d_hat'], md['p_bar_tilde_2d_hat'],
+            X_ref=md['X_ref'], xi=xi)
+        pf = perturbed_flow_differentiable(
+            md['R_hat'], md['H_hat'], md['W_hat'], md['L_hat'],
+            (md['a_hat_init'], delta_a), md['Re'],
+            mesh3d, md['tags'], u_bar_3d, p_bar_3d,
+            md['X_ref'], xi, u_cyl_3d)
+        # Just the first Stokes solve's velocity norm
+        v_bg, _ = pf._solve_stokes(pf.bc_bg)
+        return assemble(inner(v_bg, v_bg) * dx)
+
+    # ── Stage 4+: Test each F_p sub-component individually ──
+    def _make_pf(delta_r, delta_z, delta_a, md):
+        """Helper: build the full perturbed_flow object on the tape."""
+        mesh3d = md['mesh3d']
+        xi = _build_xi_hat(delta_r, delta_z, delta_a, md)
+        mesh3d.coordinates.assign(md['X_ref'] + xi)
+        check_mesh_quality(mesh3d, ref_signs=md['ref_signs'])
+        u_bar_3d, p_bar_3d, u_cyl_3d = build_3d_background_flow_differentiable(
+            md['R_hat'], md['H_hat'], md['W_hat'], md['G_hat'],
+            mesh3d, md['tags'], md['u_bar_2d_hat'], md['p_bar_tilde_2d_hat'],
+            X_ref=md['X_ref'], xi=xi)
+        return perturbed_flow_differentiable(
+            md['R_hat'], md['H_hat'], md['W_hat'], md['L_hat'],
+            (md['a_hat_init'], delta_a), md['Re'],
+            mesh3d, md['tags'], u_bar_3d, p_bar_3d,
+            md['X_ref'], xi, u_cyl_3d)
+
+    # Test ALL sub-components in both x and z directions
+    component_names = [
+        "F_s_x", "F_s_z",
+        "inertial_x", "inertial_z",
+        "centrifugal_x", "centrifugal_z",
+        "fluid_stress_x", "fluid_stress_z",
+    ]
+    for comp_name in component_names:
+        def func_comp(delta_r, delta_z, delta_a, md, _name=comp_name):
+            pf = _make_pf(delta_r, delta_z, delta_a, md)
+            _, _, comps = pf.F_p(return_components=True)
+            return comps[_name]
+        _hessian_taylor_subchain(f"{comp_name}", func_comp,
+                                  dr, dz, da, md, m_dir)
+
+    # ── Isolate: Stokes solve with constant BC via firedrake.solve ──
+    # This uses GenericSolveBlock directly (no CachedStokesSolveBlock).
+    # If this also has rate2≈2.0, firedrake's GenericSolveBlock is buggy.
+    # If rate2≈3.0, our CachedStokesSolveBlock override is the problem.
+    def func_stokes_firedrake_solve(delta_r, delta_z, delta_a, md):
+        """Stokes via firedrake.solve (standard GenericSolveBlock)."""
+        mesh3d = md['mesh3d']
+        xi = _build_xi_hat(delta_r, delta_z, delta_a, md)
+        mesh3d.coordinates.assign(md['X_ref'] + xi)
+
+        V = VectorFunctionSpace(mesh3d, "CG", 2)
+        Q_space = FunctionSpace(mesh3d, "CG", 1)
+        W = V * Q_space
+
+        (v_trial, p_trial) = TrialFunctions(W)
+        (v_test, q_test) = TestFunctions(W)
+
+        a_form = (2 * inner(sym(grad(v_trial)), sym(grad(v_test))) * dx
+                  - p_trial * div(v_test) * dx
+                  + q_test * div(v_trial) * dx)
+        L_form = inner(Constant((0.0, 0.0, 0.0)), v_test) * dx
+
+        bc_wall = DirichletBC(W.sub(0), Constant((0.0, 0.0, 0.0)),
+                              md['tags']["walls"])
+        bc_particle = DirichletBC(W.sub(0), Constant((0.0, 0.0, 1.0)),
+                                  md['tags']["particle"])
+
+        w = Function(W)
+        nullspace = MixedVectorSpaceBasis(
+            W, [W.sub(0), VectorSpaceBasis(constant=True, comm=W.comm)])
+        solve(a_form == L_form, w, bcs=[bc_wall, bc_particle],
+              nullspace=nullspace,
+              solver_parameters={
+                  "ksp_type": "preonly",
+                  "pc_type": "lu",
+                  "pc_factor_mat_solver_type": "mumps",
+              })
+
+        v_sol = w.subfunctions[0]
+        return assemble(inner(v_sol, v_sol) * dx)
+
+    _hessian_taylor_subchain("||v||² firedrake.solve (GenericSolveBlock)",
+                              func_stokes_firedrake_solve, dr, dz, da, md, m_dir)
+
+    # ── Isolate: Theta_fn via NumpyLinSolveBlock (before RScalarBlock) ──
+    def func_Theta_fn_norm(delta_r, delta_z, delta_a, md):
+        """||Theta_fn||² on R-space — tests NumpyLinSolveBlock only."""
+        pf = _make_pf(delta_r, delta_z, delta_a, md)
+        _, _, comps = pf.F_p(return_components=True)
+        # T_adj is the AdjFloat from RScalarBlock. Instead test Theta_fn directly.
+        # Theta_fn is the first output of NumpyLinSolveBlock.
+        # We can access it via comps['T_adj'] which IS Theta_fn passed through RScalarBlock.
+        # But to isolate, let's just test T_adj² which goes through both blocks.
+        T = comps['T_adj']
+        return T * T
+
+    _hessian_taylor_subchain("T_adj² (NumpyLinSolve + RScalar)", func_Theta_fn_norm,
+                              dr, dz, da, md, m_dir)
+
+    # ── Isolate: just RScalarBlock on delta_a ──
+    def func_r_scalar_a(delta_r, delta_z, delta_a, md):
+        """r_scalar(delta_a)² — tests RScalarBlock in isolation."""
+        val = r_scalar(delta_a)
+        return val * val
+
+    _hessian_taylor_subchain("r_scalar(delta_a)² (RScalarBlock only)", func_r_scalar_a,
+                              dr, dz, da, md, m_dir)
+
+    # Full F_p_x for reference
+    def func_Fp_x(delta_r, delta_z, delta_a, md):
+        pf = _make_pf(delta_r, delta_z, delta_a, md)
+        F_p_x, _ = pf.F_p()
+        return F_p_x
+
+    _hessian_taylor_subchain("F_p_x (full)", func_Fp_x,
+                              dr, dz, da, md, m_dir)
+
+
+def verify_moore_spence_derivatives(dr, dz, da, md, phi):
+    """Comprehensive verification of ALL derivatives needed for Moore–Spence Newton.
+
+    Moore–Spence solves the 5×5 extended system:
+        G1 = F(r, z; a)              = 0   (equilibrium)
+        G2 = J_sp(r, z; a) · φ      = 0   (singular Jacobian)
+        G3 = l^T φ - 1               = 0   (normalisation)
+
+    The Newton Jacobian DG has the structure:
+        ┌                                           ┐
+        │  J_sp       │  dF/da   │   0              │   ← rows 0-1: first derivatives
+        │─────────────┼──────────┼──────────────────│
+        │ d(Jφ)/dr    │ d(Jφ)/da │  J_sp            │   ← rows 2-3: SECOND derivatives
+        │ d(Jφ)/dz    │          │                  │
+        │─────────────┼──────────┼──────────────────│
+        │     0       │    0     │   l^T            │   ← row 4: constant
+        └                                           ┘
+
+    This test verifies:
+      TEST 1 — Jacobian determinism:  is J reproducible?
+      TEST 2 — Jacobian correctness:  Taylor test F(x+hm) - F(x) = h·J·m + O(h²)
+      TEST 3 — Hessian correctness:   Taylor test per force component
+               F_i(x+hm) - F_i(x) - h·∇F_i·m = ½h²·mᵀH_im + O(h³)
+      TEST 4 — Cross-validation:      AD Hessian vs FD of AD Jacobian
+      TEST 5 — Full DG assembly:      condition number and trial Newton step
+    """
+
+    print("\n" + "#" * 70)
+    print("#  VERIFICATION OF MOORE–SPENCE DERIVATIVES")
+    print("#  All derivatives computed via AD (pyadjoint)")
+    print("#" * 70)
+
+    h_values = [1e-2, 5e-3, 2e-3, 1e-3, 5e-4, 2e-4, 1e-4]
+    m_dir = np.array([1.0, 0.7, -0.3])
+    m_dir = m_dir / np.linalg.norm(m_dir)
+
+    # ══════════════════════════════════════════════════════════════════
+    #  TEST 1: Jacobian determinism
+    # ══════════════════════════════════════════════════════════════════
+    print("\n" + "=" * 70)
+    print("  TEST 1: AD Jacobian determinism  (needed: J is reproducible)")
+    print("=" * 70)
+
+    Js = []
+    for _ in range(5):
+        _, J = evaluate_forces_hat(dr, dz, da, md)
+        Js.append(J.copy())
+    Js = np.array(Js)
+    J_noise = np.std(Js, axis=0).max()
+    J_mean = np.mean(Js, axis=0)
+
+    print(f"  5 repeated evaluations at (dr={dr}, dz={dz}, da={da})")
+    print(f"  Max std across all J entries: {J_noise:.4e}")
+    test1_pass = J_noise < 1e-12
+    print(f"  → {'PASS' if test1_pass else 'FAIL'}: J is {'deterministic' if test1_pass else 'noisy'}")
+
+    # ══════════════════════════════════════════════════════════════════
+    #  TEST 2: Jacobian correctness (Taylor order 2)
+    # ══════════════════════════════════════════════════════════════════
+    print("\n" + "=" * 70)
+    print("  TEST 2: AD Jacobian correctness  (needed: Newton convergence)")
+    print("  Checks: F(x+hm) - F(x) - h·J·m = O(h²)")
+    print("=" * 70)
+
+    F0, J0 = evaluate_forces_hat(dr, dz, da, md)
+    Jm = J0 @ m_dir
+    J_sp = J0[:, :2]
+    dF_da = J0[:, 2]
+
+    print(f"  F0        = ({F0[0]:+.6e}, {F0[1]:+.6e})")
+    print(f"  |F0|      = {np.linalg.norm(F0):.6e}")
+    print(f"  J·m       = ({Jm[0]:+.6e}, {Jm[1]:+.6e})")
+    print(f"  det(J_sp) = {np.linalg.det(J_sp):+.6e}")
+    sv = np.linalg.svd(J_sp, compute_uv=False)
+    print(f"  σ(J_sp)   = ({sv[0]:.6e}, {sv[1]:.6e})")
+    print(f"  m_dir     = ({m_dir[0]:+.4f}, {m_dir[1]:+.4f}, {m_dir[2]:+.4f})")
+
+    print(f"\n  {'h':>10s}  {'|F(x+hm)-F(x)|':>14s}  {'|residual|':>14s}  {'rate':>6s}")
+    prev_r, h_prev = None, None
+    rates_t2 = []
+    for h in h_values:
+        try:
+            Fh = evaluate_forces_hat(
+                dr + h * m_dir[0], dz + h * m_dir[1], da + h * m_dir[2],
+                md, compute_jacobian=False)
+        except MeshFlippedError:
+            continue
+        diff = Fh - F0
+        r = np.linalg.norm(diff - h * Jm)
+        rate = ""
+        if prev_r and prev_r > 0 and h_prev:
+            rv = np.log(r / prev_r) / np.log(h / h_prev)
+            rate = f"{rv:.2f}"
+            rates_t2.append(rv)
+        print(f"  {h:10.1e}  {np.linalg.norm(diff):14.6e}  {r:14.6e}  {rate:>6s}")
+        prev_r, h_prev = r, h
+
+    test2_rate = np.median(rates_t2) if rates_t2 else 0.0
+    test2_pass = abs(test2_rate - 2.0) < 0.2
+    print(f"\n  Median convergence rate: {test2_rate:.2f}  (expected: 2.00)")
+    print(f"  → {'PASS' if test2_pass else 'FAIL'}: AD Jacobian is {'correct' if test2_pass else 'incorrect'}")
+
+    # ══════════════════════════════════════════════════════════════════
+    #  TEST 3: Hessian correctness (Taylor order 3, per component)
+    # ══════════════════════════════════════════════════════════════════
+    print("\n" + "=" * 70)
+    print("  TEST 3: AD Hessian correctness  (needed: Moore–Spence rows 2-3)")
+    print("  Checks: F_i(x+hm) - F_i(x) - h·∇F_i·m - ½h²·mᵀH_im = O(h³)")
+    print("=" * 70)
+
+    # Compute Hessian·m for each component
+    F_hess, J_hess, dJphi_dx = evaluate_forces_jac_hessian_hat(dr, dz, da, md, phi)
+    # We need H_i · m_dir, not H_i · phi. Build it manually.
+    set_working_tape(Tape())
+    continue_annotation()
+
+    mesh3d = md['mesh3d']
+    R_space = FunctionSpace(mesh3d, "R", 0)
+    delta_r = Function(R_space, name="delta_r").assign(dr)
+    delta_z = Function(R_space, name="delta_z").assign(dz)
+    delta_a = Function(R_space, name="delta_a").assign(da)
+
+    xi = _build_xi_hat(delta_r, delta_z, delta_a, md)
+    mesh3d.coordinates.assign(md['X_ref'] + xi)
+
+    u_bar_3d, p_bar_3d, u_cyl_3d = build_3d_background_flow_differentiable(
+        md['R_hat'], md['H_hat'], md['W_hat'], md['G_hat'],
+        mesh3d, md['tags'], md['u_bar_2d_hat'], md['p_bar_tilde_2d_hat'],
+        X_ref=md['X_ref'], xi=xi)
+
+    pf = perturbed_flow_differentiable(
+        md['R_hat'], md['H_hat'], md['W_hat'], md['L_hat'],
+        (md['a_hat_init'], delta_a), md['Re'],
+        mesh3d, md['tags'], u_bar_3d, p_bar_3d,
+        md['X_ref'], xi, u_cyl_3d)
+
+    F_p_x, F_p_z = pf.F_p()
+    controls = [Control(delta_r), Control(delta_z), Control(delta_a)]
+
+    rf_x = ReducedFunctional(F_p_x, controls)
+    rf_z = ReducedFunctional(F_p_z, controls)
+
+    grad_x = rf_x.derivative()
+    grad_z = rf_z.derivative()
+    grad = np.zeros((2, 3))
+    for j in range(3):
+        grad[0, j] = float(grad_x[j].dat.data_ro[0])
+        grad[1, j] = float(grad_z[j].dat.data_ro[0])
+
+    m_fns = [Function(R_space).assign(float(m_dir[j])) for j in range(3)]
+
+    # Re-run derivative immediately before hessian for each functional.
+    # derivative() overwrites adj_sol on all SolveBlocks on the shared tape,
+    # so the hessian must use the adj_sol from its own functional.
+    rf_x.derivative()
+    Hm_x = rf_x.hessian(m_fns)
+    rf_z.derivative()
+    Hm_z = rf_z.hessian(m_fns)
+
+    mHm = np.zeros(2)
+    for j in range(3):
+        mHm[0] += float(Hm_x[j].dat.data_ro[0]) * m_dir[j]
+        mHm[1] += float(Hm_z[j].dat.data_ro[0]) * m_dir[j]
+
+    stop_annotating()
+    get_working_tape().clear_tape()
+
+    print(f"  ∇F·m  = ({grad[0] @ m_dir:+.6e}, {grad[1] @ m_dir:+.6e})")
+    print(f"  mᵀHm  = ({mHm[0]:+.6e}, {mHm[1]:+.6e})")
+
+    test3_pass_all = True
+    for comp, label in [(0, "F_x"), (1, "F_z")]:
+        grad_m = grad[comp] @ m_dir
+        print(f"\n  --- {label} ---")
+        print(f"  {'h':>10s}  {'|r1| O(h²)':>14s}  {'rate1':>6s}"
+              f"  {'|r2| O(h³)':>14s}  {'rate2':>6s}")
+
+        prev_r1, prev_r2, h_prev = None, None, None
+        rates_comp = []
+        for h in h_values:
+            try:
+                Fh = evaluate_forces_hat(
+                    dr + h * m_dir[0], dz + h * m_dir[1], da + h * m_dir[2],
+                    md, compute_jacobian=False)
+            except MeshFlippedError:
+                continue
+            diff = Fh[comp] - F0[comp]
+            r1 = abs(diff - h * grad_m)
+            r2 = abs(diff - h * grad_m - 0.5 * h**2 * mHm[comp])
+
+            rate1 = f"{np.log(r1/prev_r1)/np.log(h/h_prev):.2f}" if prev_r1 and prev_r1 > 0 and h_prev else "  —"
+            rate2_str = "  —"
+            if prev_r2 and prev_r2 > 0 and h_prev:
+                rv = np.log(r2 / prev_r2) / np.log(h / h_prev)
+                rate2_str = f"{rv:.2f}"
+                if h >= 2e-4:  # only count rates above noise floor
+                    rates_comp.append(rv)
+
+            print(f"  {h:10.1e}  {r1:14.6e}  {rate1:>6s}  {r2:14.6e}  {rate2_str:>6s}")
+            prev_r1, prev_r2, h_prev = r1, r2, h
+
+        med_rate = np.median(rates_comp) if rates_comp else 0.0
+        comp_pass = med_rate > 2.5
+        test3_pass_all = test3_pass_all and comp_pass
+        print(f"  Median rate2: {med_rate:.2f}  → {'PASS' if comp_pass else 'FAIL'}")
+
+    print(f"\n  → Overall TEST 3: {'PASS' if test3_pass_all else 'FAIL'}")
+
+    if not test3_pass_all:
+        # ══════════════════════════════════════════════════════════
+        #  TEST 3b: Sub-component Taylor tests to isolate which term
+        # ══════════════════════════════════════════════════════════
+        print("\n" + "=" * 70)
+        print("  TEST 3b: Hessian Taylor test per F_p sub-component")
+        print("  Isolating which force term has the wrong Hessian")
+        print("=" * 70)
+        bisect_hessian_bug(dr, dz, da, md)
+
+    # ══════════════════════════════════════════════════════════════════
+    #  TEST 4: Cross-validation AD Hessian vs FD of AD Jacobian
+    # ══════════════════════════════════════════════════════════════════
+    print("\n" + "=" * 70)
+    print("  TEST 4: AD Hessian vs FD of AD Jacobian  (cross-check)")
+    print("  d(J_sp·φ)/dx  via AD Hessian  vs  central FD at multiple ε")
+    print("=" * 70)
+
+    print(f"  φ = ({phi[0]:.8f}, {phi[1]:.8f})")
+
+    # AD Hessian result (already computed above)
+    print(f"\n  AD Hessian d(J·φ)/d(r,z,a):")
+    for i in range(2):
+        print(f"    F_{['x','z'][i]}: [{' '.join(f'{dJphi_dx[i,j]:+12.6e}' for j in range(3))}]")
+
+    # FD at multiple eps
+    eps_values = [1e-3, 3e-4, 1e-4, 3e-5]
+    labels = ['d/dr', 'd/dz', 'd/da']
+    print(f"\n  FD convergence study:")
+    print(f"  {'eps':>10s}", end="")
+    for lbl in labels:
+        print(f"  {lbl+'[0]':>12s}  {lbl+'[1]':>12s}", end="")
+    print(f"  {'|AD-FD|/|FD|':>14s}")
+
+    for eps in eps_values:
+        dJphi_FD = np.zeros((2, 3))
+        for k, (dr_off, dz_off, da_off) in enumerate(
+                [(eps, 0, 0), (0, eps, 0), (0, 0, eps)]):
+            _, J_p = evaluate_forces_hat(dr + dr_off, dz + dz_off, da + da_off, md)
+            _, J_m = evaluate_forces_hat(dr - dr_off, dz - dz_off, da - da_off, md)
+            dJphi_FD[:, k] = (J_p[:, :2] @ phi - J_m[:, :2] @ phi) / (2 * eps)
+
+        rel = np.linalg.norm(dJphi_dx - dJphi_FD) / (np.linalg.norm(dJphi_FD) + 1e-30)
+        print(f"  {eps:10.1e}", end="")
+        for j in range(3):
+            print(f"  {dJphi_FD[0,j]:+12.4e}  {dJphi_FD[1,j]:+12.4e}", end="")
+        print(f"  {rel:14.4e}")
+
+    # Element-wise comparison at best eps
+    best_eps = 1e-4
+    dJphi_FD_best = np.zeros((2, 3))
+    for k, (dr_off, dz_off, da_off) in enumerate(
+            [(best_eps, 0, 0), (0, best_eps, 0), (0, 0, best_eps)]):
+        _, J_p = evaluate_forces_hat(dr + dr_off, dz + dz_off, da + da_off, md)
+        _, J_m = evaluate_forces_hat(dr - dr_off, dz - dz_off, da - da_off, md)
+        dJphi_FD_best[:, k] = (J_p[:, :2] @ phi - J_m[:, :2] @ phi) / (2 * best_eps)
+
+    print(f"\n  Element-wise comparison (eps = {best_eps:.0e}):")
+    print(f"  {'':>6s}  {'AD':>12s}  {'FD':>12s}  {'rel diff':>10s}")
+    max_rel = 0.0
+    for i in range(2):
+        for j in range(3):
+            a_val = dJphi_dx[i, j]
+            f_val = dJphi_FD_best[i, j]
+            rel_ij = abs(a_val - f_val) / (abs(f_val) + 1e-30)
+            max_rel = max(max_rel, rel_ij)
+            tag = "  <<<" if rel_ij > 0.3 else ""
+            print(f"  [{i},{j}]  {a_val:+12.6e}  {f_val:+12.6e}  {rel_ij:10.4e}{tag}")
+
+    test4_pass = max_rel < 0.3
+    print(f"\n  Max element-wise relative diff: {max_rel:.4e}")
+    print(f"  → {'PASS' if test4_pass else 'FAIL'}")
+
+    # ══════════════════════════════════════════════════════════════════
+    #  TEST 5: Full 5×5 DG matrix assembly
+    # ══════════════════════════════════════════════════════════════════
+    print("\n" + "=" * 70)
+    print("  TEST 5: Full 5×5 Moore–Spence Jacobian DG")
+    print("=" * 70)
+
+    l_vec = phi.copy()
+
+    DG = np.zeros((5, 5))
+    DG[0:2, 0:2] = J_sp
+    DG[0:2, 2] = dF_da
+    DG[2:4, 0] = dJphi_dx[:, 0]
+    DG[2:4, 1] = dJphi_dx[:, 1]
+    DG[2:4, 2] = dJphi_dx[:, 2]
+    DG[2:4, 3:5] = J_sp
+    DG[4, 3:5] = l_vec
+
+    cond_DG = np.linalg.cond(DG)
+    print(f"\n  DG matrix (AD Hessian):")
+    print(f"  cond(DG) = {cond_DG:.2e}")
+    for row in range(5):
+        print(f"    [{' '.join(f'{DG[row,j]:+10.4e}' for j in range(5))}]")
+
+    G1 = F0
+    G2 = J_sp @ phi
+    G3 = np.dot(l_vec, phi) - 1.0
+    G = np.concatenate([G1, G2, [G3]])
+    print(f"\n  Residual G:")
+    print(f"    |G|      = {np.linalg.norm(G):.4e}")
+    print(f"    |G1| (F) = {np.linalg.norm(G1):.4e}")
+    print(f"    |G2| (Jφ)= {np.linalg.norm(G2):.4e}")
+    print(f"    G3 (norm)= {G3:.4e}")
+
+    if cond_DG < 1e14:
+        dy = np.linalg.solve(DG, -G)
+        print(f"\n  Trial Newton step:")
+        print(f"    dy = [{' '.join(f'{v:+10.4e}' for v in dy)}]")
+        print(f"    |DG·dy + G| = {np.linalg.norm(DG @ dy + G):.2e}")
+        test5_pass = True
+    else:
+        print(f"\n  DG too ill-conditioned ({cond_DG:.2e})")
+        test5_pass = False
+
+    # ══════════════════════════════════════════════════════════════════
+    #  SUMMARY
+    # ══════════════════════════════════════════════════════════════════
+    print("\n" + "=" * 70)
+    print("  SUMMARY")
+    print("=" * 70)
+    results = [
+        ("TEST 1: Jacobian determinism", test1_pass),
+        ("TEST 2: Jacobian correctness (rate ≈ 2)", test2_pass),
+        ("TEST 3: Hessian correctness  (rate ≈ 3)", test3_pass_all),
+        ("TEST 4: AD Hessian ≈ FD cross-check", test4_pass),
+        ("TEST 5: DG well-conditioned", test5_pass),
+    ]
+    all_pass = True
+    for name, passed in results:
+        status = "PASS" if passed else "FAIL"
+        print(f"    {status}  {name}")
+        all_pass = all_pass and passed
+
+    if all_pass:
+        print(f"\n  ✓ All tests passed. AD Hessian can be used for Moore–Spence.")
+    else:
+        print(f"\n  ✗ Some tests failed. Review output above.")
+    print("=" * 70)
+
+    return {'passed': all_pass}
 
 
 def moore_spence_solve_hat_ad(r_off_hat_eq, z_off_hat_eq, a_hat_init, shared_data,
@@ -1672,15 +2666,6 @@ def bisection_bifurcation_hat(r_off_hat_eq, z_off_hat_eq, a_hat_init,
     return r_best, z_best, a_best, False
 
 
-# ============================================================
-# END: Hat-system implementation
-# ============================================================
-
-
-# ============================================================
-# DIAGNOSTIC TESTS for Moore-Spence convergence issues
-# ============================================================
-
 
 def diag_fd_convergence_study(dr, dz, da, md, phi, eps_values=None):
     """Test 1: FD convergence study for d(J·phi)/d(r,z,a).
@@ -2022,12 +3007,345 @@ def run_all_diagnostics(r_eq, z_eq, a_hat, shared_data):
     print("#" * 70)
 
 
+def pseudo_arclength_continuation(r_eq, z_eq, a_eq, shared_data,
+                                   *, ds=0.005, max_steps=100,
+                                   newton_tol=1e-10, newton_max_iter=15,
+                                   direction=1):
+    """Trace the equilibrium branch F(r,z; a) = 0 via pseudo arc-length continuation.
+
+    Uses a single moving mesh built at (r_eq, z_eq, a_eq).
+    All derivatives (2×3 Jacobian) via AD (evaluate_forces_hat).
+    Monitors det(J_spatial) for bifurcation detection; stops at sign change.
+
+    Parameters
+    ----------
+    r_eq, z_eq : float
+        Known equilibrium position in hat coordinates at a_eq.
+    a_eq : float
+        Starting particle-size parameter.
+    shared_data : tuple
+        Background flow data.
+    ds : float
+        Initial arc-length step size (adaptive).
+    max_steps : int
+        Maximum continuation steps.
+    newton_tol : float
+        Convergence tolerance for the corrector Newton.
+    direction : int
+        +1 to increase a, -1 to decrease a (initial tangent orientation).
+
+    Returns
+    -------
+    branch : list of dict
+        Each entry: r, z, a, dr, dz, da, det_J, sigma_min.
+    md : dict
+        Mesh data (for reuse in subsequent Moore–Spence).
+    """
+    R_hat, H_hat, W_hat, L_c, U_c, Re, G_hat, U_m_hat, u_2d, p_2d = shared_data
+
+    md = setup_moving_mesh_hat(r_eq, z_eq, a_eq,
+                                R_hat, H_hat, W_hat, Re, G_hat, U_m_hat, u_2d, p_2d)
+
+    # State: deltas from mesh reference
+    dr, dz, da = 0.0, 0.0, 0.0
+
+    # Initial evaluation
+    F0, J0_full = evaluate_forces_hat(dr, dz, da, md)
+    J_sp = J0_full[:, :2]
+    J_a = J0_full[:, 2]
+
+    if np.linalg.norm(F0) > 1e-6:
+        print(f"  WARNING: starting point not at equilibrium (|F| = {np.linalg.norm(F0):.4e})")
+
+    # ── Initial tangent via SVD of [J_sp | J_a] (robust even near bifurcation)
+    J_aug = np.column_stack([J_sp, J_a.reshape(-1, 1)])  # 2×3
+    _, S_aug, Vt_aug = np.linalg.svd(J_aug)
+    tangent = Vt_aug[-1, :]  # null vector of J_aug
+    # Orient: da_dot should match *direction*
+    if np.sign(tangent[2]) != direction:
+        tangent = -tangent
+    dx_dot = tangent[:2]
+    da_dot = tangent[2]
+
+    branch = []
+    det_J = float(np.linalg.det(J_sp))
+    sv = np.linalg.svd(J_sp, compute_uv=False)
+
+    branch.append({
+        'r': r_eq, 'z': z_eq, 'a': a_eq,
+        'dr': 0.0, 'dz': 0.0, 'da': 0.0,
+        'det_J': det_J, 'sigma_min': float(sv.min()),
+    })
+
+    print(f"\n{'=' * 65}")
+    print(f"  PSEUDO ARC-LENGTH CONTINUATION")
+    print(f"  Start: r = {r_eq:.8f}, z = {z_eq:.8f}, a = {a_eq:.6f}")
+    print(f"  ds = {ds:.4f}, direction = {direction:+d}")
+    print(f"  det(J) = {det_J:+.4e}, sigma_min = {sv.min():.4e}")
+    print(f"{'=' * 65}")
+
+    ds_cur = ds
+
+    for step in range(max_steps):
+        # ═══ Predictor ═══
+        dr_pred = dr + ds_cur * dx_dot[0]
+        dz_pred = dz + ds_cur * dx_dot[1]
+        da_pred = da + ds_cur * da_dot
+
+        # ═══ Corrector (Newton on 3×3 augmented system) ═══
+        #   G = [F(x, λ); N(x, λ)] = 0
+        #   N = ẋ_prev · (x - x_prev) + λ̇_prev · (λ - λ_prev) - ds = 0
+        dr_c, dz_c, da_c = dr_pred, dz_pred, da_pred
+        corrector_ok = False
+
+        for it in range(newton_max_iter):
+            try:
+                F_c, J_full_c = evaluate_forces_hat(dr_c, dz_c, da_c, md)
+            except MeshFlippedError:
+                print(f"  Step {step}: mesh flipped at corrector iter {it}")
+                break
+
+            # Arc-length constraint
+            N_c = (dx_dot[0] * (dr_c - dr) + dx_dot[1] * (dz_c - dz)
+                   + da_dot * (da_c - da) - ds_cur)
+
+            G_aug = np.array([F_c[0], F_c[1], N_c])
+            res = np.linalg.norm(G_aug)
+
+            if res < newton_tol:
+                corrector_ok = True
+                break
+
+            # Augmented Jacobian (3×3)
+            DG = np.zeros((3, 3))
+            DG[:2, :2] = J_full_c[:, :2]
+            DG[:2, 2] = J_full_c[:, 2]
+            DG[2, :] = [dx_dot[0], dx_dot[1], da_dot]
+
+            try:
+                delta = np.linalg.solve(DG, -G_aug)
+            except np.linalg.LinAlgError:
+                print(f"  Step {step}: singular augmented Jacobian at iter {it}")
+                break
+
+            dr_c += delta[0]
+            dz_c += delta[1]
+            da_c += delta[2]
+
+        if not corrector_ok:
+            ds_cur *= 0.5
+            if ds_cur < 1e-8:
+                print(f"  Step {step}: ds too small ({ds_cur:.2e}), stopping.")
+                break
+            print(f"  Step {step}: corrector failed (|G| = {res:.4e}), "
+                  f"halving ds -> {ds_cur:.4e}")
+            continue
+
+        # ═══ Accept step ═══
+        dr, dz, da = dr_c, dz_c, da_c
+
+        # Quantities at accepted point (reuse last corrector evaluation)
+        J_sp_new = J_full_c[:, :2]
+        J_a_new = J_full_c[:, 2]
+        det_J_new = float(np.linalg.det(J_sp_new))
+        sv_new = np.linalg.svd(J_sp_new, compute_uv=False)
+
+        r_cur = r_eq + dr
+        z_cur = z_eq + dz
+        a_cur = a_eq + da
+
+        branch.append({
+            'r': r_cur, 'z': z_cur, 'a': a_cur,
+            'dr': dr, 'dz': dz, 'da': da,
+            'det_J': det_J_new, 'sigma_min': float(sv_new.min()),
+        })
+
+        print(f"  Step {step:3d} | a = {a_cur:.8f}  r = {r_cur:+.8f}"
+              f"  z = {z_cur:+.8f}"
+              f" | det(J) = {det_J_new:+.4e}  σ_min = {sv_new.min():.4e}"
+              f"  ds = {ds_cur:.4e}  ({it} corr. iters)")
+
+        # ── Check for det(J) sign change (bifurcation bracket) ──
+        if len(branch) >= 2 and branch[-1]['det_J'] * branch[-2]['det_J'] < 0:
+            print(f"\n  *** det(J) SIGN CHANGE detected!")
+            print(f"      a in [{branch[-2]['a']:.8f}, {branch[-1]['a']:.8f}]")
+            print(f"      det(J): {branch[-2]['det_J']:+.4e} -> {branch[-1]['det_J']:+.4e}")
+            break
+
+        # ── New tangent via bordered system (robust near bifurcation) ──
+        #   [J_sp  J_a ] [dx_dot]   [0]
+        #   [ẋ_p   λ̇_p] [da_dot] = [1]
+        B = np.zeros((3, 3))
+        B[:2, :2] = J_sp_new
+        B[:2, 2] = J_a_new
+        B[2, :] = [dx_dot[0], dx_dot[1], da_dot]
+
+        try:
+            t_new = np.linalg.solve(B, np.array([0.0, 0.0, 1.0]))
+            tn = np.linalg.norm(t_new)
+            if tn > 1e-14:
+                t_new /= tn
+            else:
+                raise np.linalg.LinAlgError("zero tangent")
+        except np.linalg.LinAlgError:
+            # Fallback: SVD of [J_sp | J_a]
+            J_aug_new = np.column_stack([J_sp_new, J_a_new.reshape(-1, 1)])
+            _, _, Vt_new = np.linalg.svd(J_aug_new)
+            t_new = Vt_new[-1, :]
+
+        # Consistent orientation with previous tangent
+        if np.dot(t_new, np.array([dx_dot[0], dx_dot[1], da_dot])) < 0:
+            t_new = -t_new
+
+        dx_dot = t_new[:2]
+        da_dot = t_new[2]
+
+        # ── Adaptive step size ──
+        if it <= 2:
+            ds_cur = min(ds_cur * 1.5, 5.0 * ds)  # fast convergence -> grow
+        elif it >= 8:
+            ds_cur = max(ds_cur * 0.5, 0.1 * ds)   # slow convergence -> shrink
+
+        gc.collect()
+
+    return branch, md
+
+
+def find_bifurcation_combined(r_eq, z_eq, a_start, shared_data,
+                               *, ds=0.005, direction=1,
+                               cont_newton_tol=1e-10, cont_max_steps=100,
+                               ms_tol=1e-8, ms_max_iter=20,
+                               ms_method='ad_hessian'):
+    """Combined pseudo arc-length continuation + Moore–Spence bifurcation detection.
+
+    Phase 1 – Continuation:
+        Trace the equilibrium branch from (r_eq, z_eq, a_start) along a,
+        monitoring det(J_spatial) until a sign change brackets the bifurcation.
+
+    Phase 2 – Moore–Spence:
+        Initialize from the pre-bifurcation point and solve the 5×5 extended
+        system to locate the exact bifurcation point (r*, z*, a*, φ).
+
+    Parameters
+    ----------
+    ms_method : str
+        'ad_hessian'  – use pyadjoint Hessian-vector products (moore_spence_solve_hat_ad).
+        'fd_exact'    – use FD of AD Jacobian (moore_spence_solve_hat, exact).
+        'fd_broyden'  – use FD + Broyden updates (moore_spence_solve_hat, broyden).
+
+    Returns
+    -------
+    branch : list of dict
+        The continuation branch (from Phase 1).
+    bif_result : dict or None
+        {'r', 'z', 'a', 'phi', 'converged'} from Moore–Spence, or None.
+    """
+
+    L_c = shared_data[3]
+
+    # ── Phase 1: Pseudo arc-length continuation ──
+    print("\n" + "#" * 70)
+    print("#  PHASE 1: Pseudo Arc-Length Continuation")
+    print("#" * 70)
+
+    branch, md_cont = pseudo_arclength_continuation(
+        r_eq, z_eq, a_start, shared_data,
+        ds=ds, max_steps=cont_max_steps, direction=direction,
+        newton_tol=cont_newton_tol)
+
+    # ── Find det(J) sign change ──
+    bif_bracket = None
+    for i in range(1, len(branch)):
+        if branch[i]['det_J'] * branch[i-1]['det_J'] < 0:
+            bif_bracket = (branch[i - 1], branch[i])
+            break
+
+    if bif_bracket is None:
+        print("\n  No bifurcation detected during continuation.")
+        return branch, None
+
+    # ── Phase 2: Moore–Spence ──
+    print("\n" + "#" * 70)
+    print("#  PHASE 2: Moore–Spence Bifurcation Solver")
+    print("#" * 70)
+
+    # Initialize from the pre-bifurcation point (closer to where J is still
+    # invertible, so the initial null-vector estimate is better).
+    pt = bif_bracket[0]
+    print(f"  Initializing from continuation point:")
+    print(f"    r = {pt['r']:.8f},  z = {pt['z']:.8f},  a = {pt['a']:.8f}")
+    print(f"    det(J) = {pt['det_J']:+.4e},  sigma_min = {pt['sigma_min']:.4e}")
+
+    if ms_method == 'ad_hessian':
+        r_bif, z_bif, a_bif, phi_bif, converged = moore_spence_solve_hat_ad(
+            pt['r'], pt['z'], pt['a'], shared_data,
+            tol=ms_tol, max_iter=ms_max_iter)
+    elif ms_method in ('fd_exact', 'fd_broyden'):
+        update = 'exact' if ms_method == 'fd_exact' else 'broyden'
+        r_bif, z_bif, a_bif, phi_bif, converged = moore_spence_solve_hat(
+            pt['r'], pt['z'], pt['a'], shared_data,
+            tol=ms_tol, max_iter=ms_max_iter, eps_fd=1e-4,
+            jacobian_update=update)
+    else:
+        raise ValueError(f"Unknown ms_method: {ms_method!r}")
+
+    bif_result = {
+        'r': r_bif, 'z': z_bif, 'a': a_bif,
+        'phi': phi_bif, 'converged': converged,
+    }
+
+    if converged:
+        a_phys = a_bif * L_c
+        print(f"\n  {'=' * 60}")
+        print(f"  BIFURCATION POINT FOUND")
+        print(f"  {'=' * 60}")
+        print(f"    r_off_hat = {r_bif:.10f}")
+        print(f"    z_off_hat = {z_bif:.10f}")
+        print(f"    a_hat     = {a_bif:.10f}  (a = {a_phys * 1e6:.4f} µm)")
+        print(f"    phi       = ({phi_bif[0]:.8f}, {phi_bif[1]:.8f})")
+        print(f"  {'=' * 60}")
+    else:
+        print(f"\n  Moore–Spence ({ms_method}) did not converge.")
+        # Try fallback if primary method was ad_hessian
+        if ms_method == 'ad_hessian':
+            print(f"  Trying FD fallback (fd_exact)...")
+            r_bif, z_bif, a_bif, phi_bif, converged = moore_spence_solve_hat(
+                pt['r'], pt['z'], pt['a'], shared_data,
+                tol=ms_tol, max_iter=ms_max_iter, eps_fd=1e-4,
+                jacobian_update='exact')
+            bif_result = {
+                'r': r_bif, 'z': z_bif, 'a': a_bif,
+                'phi': phi_bif, 'converged': converged,
+            }
+            if converged:
+                a_phys = a_bif * L_c
+                print(f"\n  BIFURCATION POINT FOUND (FD fallback)")
+                print(f"    r_off_hat = {r_bif:.10f}")
+                print(f"    z_off_hat = {z_bif:.10f}")
+                print(f"    a_hat     = {a_bif:.10f}  (a = {a_phys * 1e6:.4f} µm)")
+
+    return branch, bif_result
+
+
 if __name__ == "__main__":
 
+    # ── Configuration ──
+    # Initial guess near the equilibrium on the symmetry axis.
+    # The bifurcation (pitchfork) lies between a_hat = 0.13 and 0.14
+    # (see images/Sweep_a=0.01_to_0.15_R=500_H=W=2/bifurcation_results.json).
     r_off_hat_init = 0.61558964
     z_off_hat_init = 0.00176900
-    a_hat_init = 0.135
+    a_hat_start = 0.135        # start on the pre-bifurcation side
 
+    RUN_MODE = 'verify_only'
+    # Options: 'verify_only'       – only run Hessian verification, then stop
+    #          'pac_moore_spence'   – pseudo arc-length continuation + Moore–Spence
+    #          'moore_spence_ad'    – direct Moore–Spence with AD Hessian
+    #          'moore_spence_exact' – Moore–Spence with FD of AD Jacobian
+    #          'moore_spence_broyden'
+    #          'bisection'
+
+    # ── Background flow (shared across all methods) ──
     R_hat, H_hat, W_hat, L_c, U_c, Re = first_nondimensionalisation(R, H, W, Q, rho, mu, print_values=True)
 
     bg = background_flow_differentiable(R_hat, H_hat, W_hat, Re)
@@ -2036,56 +3354,56 @@ if __name__ == "__main__":
 
     shared_data = (R_hat, H_hat, W_hat, L_c, U_c, Re, G_hat, U_m_hat, u_bar_2d_hat, p_bar_tilde_2d_hat)
 
-    # ============================================================
-    # Phase 1: Find equilibrium on initial mesh.
-    # ============================================================
-    r_hat, z_hat, converged, md = newton_root_refine_hat(
-        r_off_hat_init, z_off_hat_init, a_hat_init, shared_data, tol=1e-10, max_iter=15)
+    # ── Verify second derivatives ──
+    print("\n" + "#" * 70)
+    print("#  VERIFYING SECOND DERIVATIVES (AD Hessian vs FD)")
+    print("#" * 70)
+
+    md_verify = setup_moving_mesh_hat(r_off_hat_init, z_off_hat_init, a_hat_start,
+                                       R_hat, H_hat, W_hat, Re, G_hat, U_m_hat,
+                                       u_bar_2d_hat, p_bar_tilde_2d_hat)
+    _, J0_full = evaluate_forces_hat(0.0, 0.0, 0.0, md_verify)
+    phi_init = estimate_null_vector(J0_full[:, :2])
+
+    verify_result = verify_moore_spence_derivatives(
+        0.0, 0.0, 0.0, md_verify, phi_init)
+
+    if RUN_MODE == 'verify_only':
+        print("\n  RUN_MODE = 'verify_only' — stopping here.")
+        import sys
+        sys.exit(0)
+
+    del md_verify
+    gc.collect()
+
+    BIFURCATION_METHOD = RUN_MODE
+
+    # ── Newton refinement at starting a_hat ──
+    r_hat, z_hat, converged, _ = newton_root_refine_hat(
+        r_off_hat_init, z_off_hat_init, a_hat_start, shared_data,
+        tol=1e-10, max_iter=15)
     if not converged:
-        raise ValueError("Newton refinement did not converge.")
+        raise ValueError(f"Newton refinement did not converge at a_hat = {a_hat_start}")
 
-    # ============================================================
-    # Sanity check: remesh at found equilibrium and evaluate |F|.
-    # ============================================================
-    print("=" * 65)
-    print("  Remesh sanity check at converged equilibrium")
-    print("=" * 65)
-    R_hat, H_hat, W_hat = shared_data[:3]
-    md_check = setup_moving_mesh_hat(r_hat, z_hat, a_hat_init,
-                                     R_hat, H_hat, W_hat, Re, G_hat, U_m_hat,
-                                     u_bar_2d_hat, p_bar_tilde_2d_hat)
-    F_check = evaluate_forces_hat(0.0, 0.0, 0.0, md_check, compute_jacobian=False)
-    print(f"  |F| on fresh mesh at (r={r_hat:.8f}, z={z_hat:.8f}): {np.linalg.norm(F_check):.4e}")
-    print(f"  F = ({F_check[0]:.6e}, {F_check[1]:.6e})\n")
+    # ── Phase 2: Bifurcation detection ──
+    if BIFURCATION_METHOD == 'pac_moore_spence':
+        # Pseudo arc-length continuation toward a_hat = 0.14,
+        # then Moore–Spence to pinpoint the bifurcation.
+        _ms = 'ad_hessian'
+        print(f"\n  Moore–Spence method: {_ms}")
+        branch, bif_result = find_bifurcation_combined(
+            r_hat, z_hat, a_hat_start, shared_data,
+            ds=0.002, direction=1,                  # increase a
+            cont_newton_tol=1e-10, cont_max_steps=100,
+            ms_tol=1e-8, ms_max_iter=20,
+            ms_method=_ms)
 
-    # ============================================================
-    # DIAGNOSTICS: Run before Moore-Spence to identify issues.
-    # Comment out once the problem is understood.
-    # ============================================================
-    run_all_diagnostics(r_hat, z_hat, a_hat_init, shared_data)
+        if bif_result is not None and not bif_result['converged']:
+            print("\n  WARNING: Bifurcation detection did not fully converge.")
 
-    # ============================================================
-    # Phase 2: Bifurcation detection (hat system).
-    # Uses the fresh mesh at the equilibrium; a changes via moving
-    # mesh from here — no further remeshing.
-    #
-    # Four switches are available:
-    #   'moore_spence_ad'      — Moore-Spence with AD-based Hessian
-    #                            (1 forward + 2 reverse + 2 H·v per iter).
-    #                            No FD anywhere — Newton-like convergence
-    #                            if the tape is twice differentiable.
-    #   'moore_spence_broyden' — Moore-Spence with Broyden rank-1 update
-    #                            of the 5x5 DG (cheap, superlinear).
-    #   'moore_spence_exact'   — Moore-Spence with exact FD rebuild of DG
-    #                            in every iteration (~7 AD evals/iter).
-    #   'bisection'            — pure bisection on a_hat with an inner
-    #                            Newton on (r, z); no second derivatives.
-    # ============================================================
-    BIFURCATION_METHOD = 'moore_spence_ad'
-
-    if BIFURCATION_METHOD == 'moore_spence_ad':
+    elif BIFURCATION_METHOD == 'moore_spence_ad':
         r_bif, z_bif, a_bif, phi_bif, ms_converged = moore_spence_solve_hat_ad(
-            r_hat, z_hat, a_hat_init, shared_data, tol=1e-8, max_iter=20)
+            r_hat, z_hat, a_hat_start, shared_data, tol=1e-8, max_iter=20)
 
         if not ms_converged:
             print("\n  WARNING: Moore-Spence (AD) did not converge.")
@@ -2096,11 +3414,12 @@ if __name__ == "__main__":
             print(f"        z_off_hat = {z_bif:.10f}")
             print(f"        a_hat     = {a_bif:.10f}  (a = {a_phys_bif * 1e6:.4f} um)")
             print(f"        phi       = ({phi_bif[0]:.8f}, {phi_bif[1]:.8f})")
+
     elif BIFURCATION_METHOD in ('moore_spence_broyden', 'moore_spence_exact'):
         _ms_update = ('broyden' if BIFURCATION_METHOD == 'moore_spence_broyden'
                       else 'exact')
         r_bif, z_bif, a_bif, phi_bif, ms_converged = moore_spence_solve_hat(
-             r_hat, z_hat, a_hat_init, shared_data, tol=1e-8, max_iter=20, eps_fd=1e-4,
+             r_hat, z_hat, a_hat_start, shared_data, tol=1e-8, max_iter=20, eps_fd=1e-4,
              jacobian_update=_ms_update)
 
         if not ms_converged:
@@ -2112,16 +3431,14 @@ if __name__ == "__main__":
              print(f"        z_off_hat = {z_bif:.10f}")
              print(f"        a_hat     = {a_bif:.10f}  (a = {a_phys_bif * 1e6:.4f} um)")
              print(f"        phi       = ({phi_bif[0]:.8f}, {phi_bif[1]:.8f})")
+
     elif BIFURCATION_METHOD == 'bisection':
-        # Bracket on a_hat. One endpoint should sit on the "equilibrium
-        # exists" side, the other beyond the bifurcation. Adjust to taste.
         a_hat_lo = 0.13
         a_hat_hi = 0.14
         r_bif, z_bif, a_bif, bis_converged = bisection_bifurcation_hat(
-            r_hat, z_hat, a_hat_init, a_hat_lo, a_hat_hi, shared_data,
+            r_hat, z_hat, a_hat_start, a_hat_lo, a_hat_hi, shared_data,
             tol_a=1e-6, max_bisect=30,
             newton_tol=1e-10, newton_max_iter=15)
-        phi_bif = None
 
         if not bis_converged:
             print("\n  WARNING: Bisection did not converge.")
@@ -2131,8 +3448,9 @@ if __name__ == "__main__":
             print(f"        r_off_hat = {r_bif:.10f}")
             print(f"        z_off_hat = {z_bif:.10f}")
             print(f"        a_hat     = {a_bif:.10f}  (a = {a_phys_bif * 1e6:.4f} um)")
+
     else:
         raise ValueError(
             f"Unknown BIFURCATION_METHOD: {BIFURCATION_METHOD!r}. "
-            "Use 'moore_spence_ad', 'moore_spence_broyden', "
+            "Use 'pac_moore_spence', 'moore_spence_ad', 'moore_spence_broyden', "
             "'moore_spence_exact', or 'bisection'.")
