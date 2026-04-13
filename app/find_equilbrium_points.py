@@ -3,6 +3,7 @@ import matplotlib.patches as patches
 from scipy.interpolate import RectBivariateSpline
 from scipy.optimize import root
 import os
+import shutil
 import pickle
 from mpi4py import MPI
 import numpy as np
@@ -314,6 +315,7 @@ class F_p_grid:
         ax.set_title(f"Force_Map_a={a:.3f}_R={R:.0f}_W={W:.0f}_H={H:.0f}_Re{self.Re_p/(a**2)}_N_grid={self.N_grid}")
         plt.tight_layout()
         filename = f"images/Force_Map_a={a:.3f}_R={R:.0f}_W={W:.0f}_H={H:.0f}_Re{self.Re_p/(a**2)}_N_grid={self.N_grid}.png"
+        os.makedirs("images", exist_ok=True)
         plt.savefig(filename)
         print(f"Plot saved to {filename}")
         plt.show()
@@ -483,7 +485,10 @@ def auto_start_mpi(n_procs=5):
         cmd = ["mpiexec", "-n", str(n_procs), sys.executable, "-u"] + sys.argv
         print(f"Executing: {' '.join(cmd)}\n")
 
-        os.execv("/opt/homebrew/bin/mpiexec", ["/opt/homebrew/bin/mpiexec"] + cmd[1:])
+        mpiexec_path = shutil.which("mpiexec")
+        if mpiexec_path is None:
+            raise FileNotFoundError("mpiexec not found in PATH")
+        os.execv(mpiexec_path, [mpiexec_path] + cmd[1:])
 
 
 if __name__ == "__main__":

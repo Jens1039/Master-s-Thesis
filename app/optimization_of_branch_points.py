@@ -969,6 +969,7 @@ def evaluate_forces_hat(delta_r_hat, delta_z_hat, delta_a_hat, mesh_data,
     if not compute_jacobian:
         stop_annotating()
         get_working_tape().clear_tape()
+        gc.collect()
         return F
 
     c_r = Control(delta_r)
@@ -988,6 +989,7 @@ def evaluate_forces_hat(delta_r_hat, delta_z_hat, delta_a_hat, mesh_data,
 
     stop_annotating()
     get_working_tape().clear_tape()
+    gc.collect()
     return F, J
 
 
@@ -1043,6 +1045,7 @@ def evaluate_forces_tlm_hat(delta_r_hat, delta_z_hat, delta_a_hat,
 
     stop_annotating()
     get_working_tape().clear_tape()
+    gc.collect()
     return F, Jphi
 
 
@@ -1132,6 +1135,7 @@ def evaluate_forces_jac_hessian_hat(delta_r_hat, delta_z_hat, delta_a_hat,
 
     stop_annotating()
     get_working_tape().clear_tape()
+    gc.collect()
     return F, J, dJphi_dx
 
 
@@ -2054,38 +2058,56 @@ def verify_moore_spence_derivatives(dr, dz, da, md, phi):
 
 
 def moore_spence_solve_hat_ad(r_off_hat_eq, z_off_hat_eq, a_hat_init, shared_data,
-                               *, tol=1e-8, max_iter=20):
+                               *, tol=1e-8, max_iter=20, md=None,
+                               dr_init=0.0, dz_init=0.0, da_init=0.0):
     """Moore-Spence with AD-based Hessian (pure reverse + Hessian-vector AD).
 
     Builds the full 5x5 DG every iteration without any finite differences.
     Cost per iteration: 1 forward + 2 reverse + 2 Hessian-vector products
     (plus line-search forward evaluations).
 
-    Should give Newton-like quadratic convergence if the mesh-deformation
-    pathway in pyadjoint is twice differentiable.
+    Parameters
+    ----------
+    md : dict, optional
+        Pre-built mesh data.  If None, a new mesh is generated at
+        (r_off_hat_eq, z_off_hat_eq, a_hat_init).
+    dr_init, dz_init, da_init : float
+        Initial mesh-displacement deltas (relative to md's reference point).
+        Non-zero when reusing a mesh from a previous phase (e.g. PALC).
+        The mesh reference point is (r_off_hat_eq - dr_init, ...).
     """
 
     R_hat, H_hat, W_hat, L_c, U_c, Re, G_hat, U_m_hat, u_2d, p_2d = shared_data
 
-    r = float(r_off_hat_eq)
-    z = float(z_off_hat_eq)
-    a = float(a_hat_init)
+    # Mesh reference point: where the mesh was originally built.
+    # When md is provided externally, the caller passes the current absolute
+    # position as (r_off_hat_eq, z_off_hat_eq, a_hat_init) and the delta from
+    # the mesh reference as (dr_init, dz_init, da_init).
+    # => mesh_ref = absolute - delta
+    r_ref = float(r_off_hat_eq) - float(dr_init)
+    z_ref = float(z_off_hat_eq) - float(dz_init)
+    a_ref = float(a_hat_init)   - float(da_init)
 
-    md = setup_moving_mesh_hat(r, z, a, R_hat, H_hat, W_hat,
-                                Re, G_hat, U_m_hat, u_2d, p_2d)
+    if md is None:
+        md = setup_moving_mesh_hat(
+            r_ref, z_ref, a_ref, R_hat, H_hat, W_hat,
+            Re, G_hat, U_m_hat, u_2d, p_2d)
 
-    F0, J0_full = evaluate_forces_hat(0.0, 0.0, 0.0, md)
+    dr, dz, da = float(dr_init), float(dz_init), float(da_init)
+
+    F0, J0_full = evaluate_forces_hat(dr, dz, da, md)
     J0 = J0_full[:, :2]
     phi = estimate_null_vector(J0)
     l_vec = phi.copy()
     phi = phi / np.dot(l_vec, phi)
 
-    dr, dz, da = 0.0, 0.0, 0.0
-
     sv0 = np.linalg.svd(J0, compute_uv=False)
+    r_start = r_ref + dr
+    z_start = z_ref + dz
+    a_start = a_ref + da
     print("\n" + "=" * 65)
     print(f"  MOORE-SPENCE (hat system, AD Hessian, single mesh)")
-    print(f"  Start: r = {r:.6f}, z = {z:.6f}, a = {a:.6f}")
+    print(f"  Start: r = {r_start:.6f}, z = {z_start:.6f}, a = {a_start:.6f}")
     print(f"  |F_0| = {np.linalg.norm(F0):.4e}, sigma_min = {sv0.min():.4e}")
     print("=" * 65)
 
@@ -2104,7 +2126,7 @@ def moore_spence_solve_hat_ad(r_off_hat_eq, z_off_hat_eq, a_hat_init, shared_dat
         res = np.linalg.norm(G)
 
         sv = np.linalg.svd(J_sp, compute_uv=False)
-        r_cur, z_cur, a_cur = r + dr, z + dz, a + da
+        r_cur, z_cur, a_cur = r_ref + dr, z_ref + dz, a_ref + da
         print(f"\n  Iter {k:2d} | r = {r_cur:+.8f}  z = {z_cur:+.8f}  a = {a_cur:.8f}")
         print(f"         | |G| = {res:.4e}  |F| = {np.linalg.norm(G1):.4e}"
               f"  |J*phi| = {np.linalg.norm(G2):.4e}"
@@ -2153,7 +2175,7 @@ def moore_spence_solve_hat_ad(r_off_hat_eq, z_off_hat_eq, a_hat_init, shared_dat
             da_try = da + alpha * dy[2]
             phi_try = phi + alpha * dy[3:5]
 
-            if a + da_try <= 0:
+            if a_ref + da_try <= 0:
                 alpha *= 0.5
                 continue
 
@@ -2182,7 +2204,7 @@ def moore_spence_solve_hat_ad(r_off_hat_eq, z_off_hat_eq, a_hat_init, shared_dat
 
         gc.collect()
 
-    r_cur, z_cur, a_cur = r + dr, z + dz, a + da
+    r_cur, z_cur, a_cur = r_ref + dr, z_ref + dz, a_ref + da
     print(f"\n  Moore-Spence (AD) did not converge after {max_iter} iterations.")
     return r_cur, z_cur, a_cur, phi, False
 
@@ -2215,7 +2237,7 @@ def newton_root_refine_hat(r_off_hat_init, z_off_hat_init, a_hat, shared_data,
 
         if res < tol:
             print(f"  -> Converged after {k} iterations.\n")
-            return r_cur, z_cur, True, md
+            return r_cur, z_cur, True, md, dr, dz
 
         dx_n = np.linalg.solve(J, -F)
 
@@ -2241,7 +2263,7 @@ def newton_root_refine_hat(r_off_hat_init, z_off_hat_init, a_hat, shared_data,
     r_cur = r_off_hat_init + dr
     z_cur = z_off_hat_init + dz
     print(f"  Did not converge after {max_iter} iterations.\n")
-    return r_cur, z_cur, False, md
+    return r_cur, z_cur, False, md, dr, dz
 
 
 def moore_spence_solve_hat(r_off_hat_eq, z_off_hat_eq, a_hat_init, shared_data,
@@ -3010,10 +3032,12 @@ def run_all_diagnostics(r_eq, z_eq, a_hat, shared_data):
 def pseudo_arclength_continuation(r_eq, z_eq, a_eq, shared_data,
                                    *, ds=0.005, max_steps=100,
                                    newton_tol=1e-10, newton_max_iter=15,
-                                   direction=1):
+                                   direction=1, md=None,
+                                   dr_init=0.0, dz_init=0.0, da_init=0.0):
     """Trace the equilibrium branch F(r,z; a) = 0 via pseudo arc-length continuation.
 
-    Uses a single moving mesh built at (r_eq, z_eq, a_eq).
+    Uses a single moving mesh built at (r_eq, z_eq, a_eq), or reuses
+    an existing mesh if *md* is provided (avoids remeshing inconsistency).
     All derivatives (2×3 Jacobian) via AD (evaluate_forces_hat).
     Monitors det(J_spatial) for bifurcation detection; stops at sign change.
 
@@ -3033,6 +3057,9 @@ def pseudo_arclength_continuation(r_eq, z_eq, a_eq, shared_data,
         Convergence tolerance for the corrector Newton.
     direction : int
         +1 to increase a, -1 to decrease a (initial tangent orientation).
+    md : dict, optional
+        Pre-built mesh data (from newton_root_refine_hat or earlier phase).
+        If None, a new mesh is generated at (r_eq, z_eq, a_eq).
 
     Returns
     -------
@@ -3043,11 +3070,18 @@ def pseudo_arclength_continuation(r_eq, z_eq, a_eq, shared_data,
     """
     R_hat, H_hat, W_hat, L_c, U_c, Re, G_hat, U_m_hat, u_2d, p_2d = shared_data
 
-    md = setup_moving_mesh_hat(r_eq, z_eq, a_eq,
-                                R_hat, H_hat, W_hat, Re, G_hat, U_m_hat, u_2d, p_2d)
+    if md is None:
+        md = setup_moving_mesh_hat(r_eq, z_eq, a_eq,
+                                    R_hat, H_hat, W_hat, Re, G_hat, U_m_hat, u_2d, p_2d)
 
-    # State: deltas from mesh reference
-    dr, dz, da = 0.0, 0.0, 0.0
+    # Mesh reference point: where the mesh was originally built.
+    # All deltas (dr, dz, da) are relative to this point.
+    r_mesh_ref = r_eq - float(dr_init)
+    z_mesh_ref = z_eq - float(dz_init)
+    a_mesh_ref = a_eq - float(da_init)
+
+    # State: deltas from mesh reference.
+    dr, dz, da = float(dr_init), float(dz_init), float(da_init)
 
     # Initial evaluation
     F0, J0_full = evaluate_forces_hat(dr, dz, da, md)
@@ -3073,7 +3107,7 @@ def pseudo_arclength_continuation(r_eq, z_eq, a_eq, shared_data,
 
     branch.append({
         'r': r_eq, 'z': z_eq, 'a': a_eq,
-        'dr': 0.0, 'dz': 0.0, 'da': 0.0,
+        'dr': dr, 'dz': dz, 'da': da,
         'det_J': det_J, 'sigma_min': float(sv.min()),
     })
 
@@ -3150,9 +3184,9 @@ def pseudo_arclength_continuation(r_eq, z_eq, a_eq, shared_data,
         det_J_new = float(np.linalg.det(J_sp_new))
         sv_new = np.linalg.svd(J_sp_new, compute_uv=False)
 
-        r_cur = r_eq + dr
-        z_cur = z_eq + dz
-        a_cur = a_eq + da
+        r_cur = r_mesh_ref + dr
+        z_cur = z_mesh_ref + dz
+        a_cur = a_mesh_ref + da
 
         branch.append({
             'r': r_cur, 'z': z_cur, 'a': a_cur,
@@ -3215,7 +3249,8 @@ def find_bifurcation_combined(r_eq, z_eq, a_start, shared_data,
                                *, ds=0.005, direction=1,
                                cont_newton_tol=1e-10, cont_max_steps=100,
                                ms_tol=1e-8, ms_max_iter=20,
-                               ms_method='ad_hessian'):
+                               ms_method='ad_hessian', md=None,
+                               dr_init=0.0, dz_init=0.0, da_init=0.0):
     """Combined pseudo arc-length continuation + Moore–Spence bifurcation detection.
 
     Phase 1 – Continuation:
@@ -3251,7 +3286,8 @@ def find_bifurcation_combined(r_eq, z_eq, a_start, shared_data,
     branch, md_cont = pseudo_arclength_continuation(
         r_eq, z_eq, a_start, shared_data,
         ds=ds, max_steps=cont_max_steps, direction=direction,
-        newton_tol=cont_newton_tol)
+        newton_tol=cont_newton_tol, md=md,
+        dr_init=dr_init, dz_init=dz_init, da_init=da_init)
 
     # ── Find det(J) sign change ──
     bif_bracket = None
@@ -3279,7 +3315,8 @@ def find_bifurcation_combined(r_eq, z_eq, a_start, shared_data,
     if ms_method == 'ad_hessian':
         r_bif, z_bif, a_bif, phi_bif, converged = moore_spence_solve_hat_ad(
             pt['r'], pt['z'], pt['a'], shared_data,
-            tol=ms_tol, max_iter=ms_max_iter)
+            tol=ms_tol, max_iter=ms_max_iter,
+            md=md_cont, dr_init=pt['dr'], dz_init=pt['dz'], da_init=pt['da'])
     elif ms_method in ('fd_exact', 'fd_broyden'):
         update = 'exact' if ms_method == 'fd_exact' else 'broyden'
         r_bif, z_bif, a_bif, phi_bif, converged = moore_spence_solve_hat(
@@ -3334,10 +3371,10 @@ if __name__ == "__main__":
     # The bifurcation (pitchfork) lies between a_hat = 0.13 and 0.14
     # (see images/Sweep_a=0.01_to_0.15_R=500_H=W=2/bifurcation_results.json).
     r_off_hat_init = 0.61558964
-    z_off_hat_init = 0.00176900
-    a_hat_start = 0.135        # start on the pre-bifurcation side
+    z_off_hat_init = 0.0
+    a_hat_start = 0.136        # start on the pre-bifurcation side
 
-    RUN_MODE = 'verify_only'
+    RUN_MODE = 'moore_spence_ad'
     # Options: 'verify_only'       – only run Hessian verification, then stop
     #          'pac_moore_spence'   – pseudo arc-length continuation + Moore–Spence
     #          'moore_spence_ad'    – direct Moore–Spence with AD Hessian
@@ -3365,8 +3402,7 @@ if __name__ == "__main__":
     _, J0_full = evaluate_forces_hat(0.0, 0.0, 0.0, md_verify)
     phi_init = estimate_null_vector(J0_full[:, :2])
 
-    verify_result = verify_moore_spence_derivatives(
-        0.0, 0.0, 0.0, md_verify, phi_init)
+    # verify_result = verify_moore_spence_derivatives(0.0, 0.0, 0.0, md_verify, phi_init)
 
     if RUN_MODE == 'verify_only':
         print("\n  RUN_MODE = 'verify_only' — stopping here.")
@@ -3379,7 +3415,7 @@ if __name__ == "__main__":
     BIFURCATION_METHOD = RUN_MODE
 
     # ── Newton refinement at starting a_hat ──
-    r_hat, z_hat, converged, _ = newton_root_refine_hat(
+    r_hat, z_hat, converged, md_newton, dr_newton, dz_newton = newton_root_refine_hat(
         r_off_hat_init, z_off_hat_init, a_hat_start, shared_data,
         tol=1e-10, max_iter=15)
     if not converged:
@@ -3396,14 +3432,16 @@ if __name__ == "__main__":
             ds=0.002, direction=1,                  # increase a
             cont_newton_tol=1e-10, cont_max_steps=100,
             ms_tol=1e-8, ms_max_iter=20,
-            ms_method=_ms)
+            ms_method=_ms, md=md_newton,
+            dr_init=dr_newton, dz_init=dz_newton)
 
         if bif_result is not None and not bif_result['converged']:
             print("\n  WARNING: Bifurcation detection did not fully converge.")
 
     elif BIFURCATION_METHOD == 'moore_spence_ad':
         r_bif, z_bif, a_bif, phi_bif, ms_converged = moore_spence_solve_hat_ad(
-            r_hat, z_hat, a_hat_start, shared_data, tol=1e-8, max_iter=20)
+            r_hat, z_hat, a_hat_start, shared_data, tol=1e-8, max_iter=20,
+            md=md_newton, dr_init=dr_newton, dz_init=dz_newton)
 
         if not ms_converged:
             print("\n  WARNING: Moore-Spence (AD) did not converge.")

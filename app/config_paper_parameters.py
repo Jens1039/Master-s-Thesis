@@ -15,7 +15,7 @@ mu  = 10.02e-4              # dyn. viscosity [Pa·s]
 # ------------------------------------------------------
 
 # ---LENGTH RATIOS FROM THE PAPER-----------------------
-# a = 0.135 * (H/2)            # radius of the cell/particle [m]
+a = 0.137 * (H/2)            # radius of the cell/particle [m]
 W = 1*H                     # duct width  [m]
 R = 500 * (H/2)             # bend radius [m]
 # ------------------------------------------------------
