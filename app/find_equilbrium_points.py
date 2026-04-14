@@ -9,6 +9,7 @@ from mpi4py import MPI
 import numpy as np
 import gc
 import sys
+from petsc4py import PETSc
 
 from nondimensionalization import *
 from background_flow import *
@@ -48,7 +49,7 @@ class F_p_grid:
         self._current_z = None
 
 
-    def compute_F_p_grid_ensemble(self, N_grid, u_bg_data_np, p_bg_data_np):
+    def compute_F_p_grid_ensemble(self, N_grid, u_bg_data_np, p_bg_data_np, checkpoint_dir=None):
 
         self.N_grid = N_grid
 
@@ -78,13 +79,27 @@ class F_p_grid:
                 all_tasks.append((i, j, r_vals[i], z_vals[j]))
 
         my_tasks = all_tasks[global_rank::global_size]
-        local_results = []
+
+        # --- Checkpoint setup: load already computed points for this rank ---
+        ckpt_file = None
+        computed = {}  # (i, j) -> (i, j, F_r, F_z)
+
+        if checkpoint_dir is not None:
+            os.makedirs(checkpoint_dir, exist_ok=True)
+            ckpt_file = os.path.join(checkpoint_dir, f"rank_{global_rank}.pkl")
+            if os.path.exists(ckpt_file):
+                with open(ckpt_file, 'rb') as f:
+                    computed = pickle.load(f)
+                print(f"[Rank {global_rank}] Resuming: {len(computed)}/{len(my_tasks)} points already done.")
 
         if global_rank == 0:
             print(f"Start ensemble grid: {len(all_tasks)} points on {global_size} cores.")
 
         for task in tqdm(my_tasks, disable=(global_rank != 0)):
             (i, j, r_loc, z_loc) = task
+
+            if (i, j) in computed:
+                continue
 
             mesh3d, tags = make_curved_channel_section_with_spherical_hole(self.R, self.H, self.W, self.L, self.a,
                                                                            self.particle_maxh, self.global_maxh,
@@ -97,13 +112,18 @@ class F_p_grid:
 
             F_r, F_z = pf.F_p()
 
-            local_results.append((i, j, F_r, F_z))
-
-            # fix memory leakage
+            # Clean up all heavy objects before saving
             del pf, mesh3d, tags, u_3d, p_3d
             gc.collect()
+            PETSc.garbage_cleanup()  # flush PETSc-internal deferred destruction
 
+            # Persist result immediately to disk so progress survives OOM-kill
+            computed[(i, j)] = (i, j, F_r, F_z)
+            if ckpt_file is not None:
+                with open(ckpt_file, 'wb') as f:
+                    pickle.dump(computed, f)
 
+        local_results = list(computed.values())
         all_data = COMM_WORLD.gather(local_results, root=0)
 
 
@@ -312,9 +332,9 @@ class F_p_grid:
         H = (L_c_p/L_c) * self.H
         W = (L_c_p/L_c) * self.W
 
-        ax.set_title(f"Force_Map_a={a:.3f}_R={R:.0f}_W={W:.0f}_H={H:.0f}_Re{self.Re_p/(a**2)}_N_grid={self.N_grid}")
+        ax.set_title(f"Force_Map_a={a:.5f}_R={R:.0f}_W={W:.0f}_H={H:.0f}_Re{self.Re_p/(a**2)}_N_grid={self.N_grid}_particle_maxh_rel={self.particle_maxh}")
         plt.tight_layout()
-        filename = f"images/Force_Map_a={a:.3f}_R={R:.0f}_W={W:.0f}_H={H:.0f}_Re{self.Re_p/(a**2)}_N_grid={self.N_grid}.png"
+        filename = f"images/Force_Map_a={a:.5f}_R={R:.0f}_W={W:.0f}_H={H:.0f}_Re{self.Re_p/(a**2)}_N_grid={self.N_grid}_particle_maxh_rel={self.particle_maxh}.png"
         os.makedirs("images", exist_ok=True)
         plt.savefig(filename)
         print(f"Plot saved to {filename}")
@@ -398,6 +418,9 @@ def force_grid(R, H, W, Q, rho, mu, a, N_grid, particle_maxh_rel, global_maxh_re
         if rank == 0:
             print("Starting parallel force grid calculation...")
 
+        # Checkpoint-Verzeichnis parallel zum Cache-File
+        checkpoint_dir = cache_filename.replace(".pkl", "_ckpt")
+
         # F_p_grid für die echte Berechnung instanziieren
         f_grid_calc = F_p_grid(
             params['R_hat_hat'], params['H_hat_hat'], params['W_hat_hat'],
@@ -406,7 +429,8 @@ def force_grid(R, H, W, Q, rho, mu, a, N_grid, particle_maxh_rel, global_maxh_re
         )
 
         grid_values = f_grid_calc.compute_F_p_grid_ensemble(N_grid=N_grid, u_bg_data_np=u_data_np,
-                                                            p_bg_data_np=p_data_np)
+                                                            p_bg_data_np=p_data_np,
+                                                            checkpoint_dir=checkpoint_dir)
 
         if rank == 0:
             r_vals, z_vals, phi, Fr_grid, Fz_grid = grid_values
@@ -425,6 +449,11 @@ def force_grid(R, H, W, Q, rho, mu, a, N_grid, particle_maxh_rel, global_maxh_re
                 pickle.dump(data_to_save, f)
 
             print(f"Parallel computation finished. Raw data saved to {cache_filename}")
+
+            # Remove per-rank checkpoint files now that results are safely in cache
+            if os.path.isdir(checkpoint_dir):
+                shutil.rmtree(checkpoint_dir)
+                print(f"Checkpoint directory {checkpoint_dir} removed.")
         else:
             return None
 
@@ -496,5 +525,8 @@ if __name__ == "__main__":
     auto_start_mpi()
 
     from config_paper_parameters import *
+
+    if MPI.COMM_WORLD.Get_rank() == 0:
+        print("particle_maxh_rel = ", particle_maxh_rel)
 
     force_grid(R, H, W, Q, rho, mu, a, N_grid, particle_maxh_rel, global_maxh_rel, eps_rel)

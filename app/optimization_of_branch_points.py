@@ -2059,7 +2059,8 @@ def verify_moore_spence_derivatives(dr, dz, da, md, phi):
 
 def moore_spence_solve_hat_ad(r_off_hat_eq, z_off_hat_eq, a_hat_init, shared_data,
                                *, tol=1e-8, max_iter=20, md=None,
-                               dr_init=0.0, dz_init=0.0, da_init=0.0):
+                               dr_init=0.0, dz_init=0.0, da_init=0.0,
+                               globalization='armijo'):
     """Moore-Spence with AD-based Hessian (pure reverse + Hessian-vector AD).
 
     Builds the full 5x5 DG every iteration without any finite differences.
@@ -2075,15 +2076,23 @@ def moore_spence_solve_hat_ad(r_off_hat_eq, z_off_hat_eq, a_hat_init, shared_dat
         Initial mesh-displacement deltas (relative to md's reference point).
         Non-zero when reusing a mesh from a previous phase (e.g. PALC).
         The mesh reference point is (r_off_hat_eq - dr_init, ...).
+    globalization : str
+        'armijo'          — Armijo backtracking line search (original method).
+        'trust_region'    — Trust-region with diagonal scaling.  Limits the
+                            step in each scaled variable independently,
+                            adapts the trust-region radius based on the
+                            predicted vs actual reduction ratio.
+        'exact_linesearch' — 1-D minimisation of ½|G(x+α·dy)|² via Brent's
+                             method (scipy.optimize.minimize_scalar).  Each
+                             function evaluation calls evaluate_forces_hat
+                             (cheap: 1 forward + 2 reverse, no Hessian).
+                             Useful when the merit function is non-convex and
+                             Armijo cannot find a sufficient decrease.
     """
 
     R_hat, H_hat, W_hat, L_c, U_c, Re, G_hat, U_m_hat, u_2d, p_2d = shared_data
 
     # Mesh reference point: where the mesh was originally built.
-    # When md is provided externally, the caller passes the current absolute
-    # position as (r_off_hat_eq, z_off_hat_eq, a_hat_init) and the delta from
-    # the mesh reference as (dr_init, dz_init, da_init).
-    # => mesh_ref = absolute - delta
     r_ref = float(r_off_hat_eq) - float(dr_init)
     z_ref = float(z_off_hat_eq) - float(dz_init)
     a_ref = float(a_hat_init)   - float(da_init)
@@ -2105,11 +2114,24 @@ def moore_spence_solve_hat_ad(r_off_hat_eq, z_off_hat_eq, a_hat_init, shared_dat
     r_start = r_ref + dr
     z_start = z_ref + dz
     a_start = a_ref + da
+
+    use_tr = (globalization == 'trust_region')
+    use_exact_ls = (globalization == 'exact_linesearch')
+    glob_label = ("trust-region" if use_tr else
+                  "exact line search" if use_exact_ls else "Armijo")
+
     print("\n" + "=" * 65)
-    print(f"  MOORE-SPENCE (hat system, AD Hessian, single mesh)")
+    print(f"  MOORE-SPENCE (hat system, AD Hessian, {glob_label})")
     print(f"  Start: r = {r_start:.6f}, z = {z_start:.6f}, a = {a_start:.6f}")
     print(f"  |F_0| = {np.linalg.norm(F0):.4e}, sigma_min = {sv0.min():.4e}")
     print("=" * 65)
+
+    # Trust-region state
+    if use_tr:
+        Delta = 0.1  # initial trust-region radius (in scaled space)
+        Delta_max = 1.0
+        eta_accept = 0.1   # minimum ratio to accept step
+        eta_good = 0.75    # ratio threshold to grow TR
 
     for k in range(max_iter):
 
@@ -2152,55 +2174,165 @@ def moore_spence_solve_hat_ad(r_off_hat_eq, z_off_hat_eq, a_hat_init, shared_dat
         DG[2:4, 3:5] = J_sp                # dG2/dphi
         DG[4, 3:5]   = l_vec               # dG3/dphi
 
-        cond_DG = np.linalg.cond(DG)
-        print(f"         | cond(DG) = {cond_DG:.2e}")
+        # ── Diagonal column equilibration ──
+        # Divide each column j by its max absolute value D_j so that every
+        # column of DG_s has unit max norm.  This balances variables with
+        # very different magnitudes (e.g. phi ≈ O(1) vs r,z ≈ O(1e-2)).
+        # Substitution: dy = dy_s / D  →  DG / diag(D) * dy_s = -G
+        # i.e. DG_s = DG @ diag(1/D),  dy = dy_s / D.
+        D = np.maximum(np.abs(DG).max(axis=0), 1e-14)
+        DG_s = DG / D[np.newaxis, :]   # column equilibration: max|col_j| = 1
+        cond_DG_s = np.linalg.cond(DG_s)
+        print(f"         | cond(DG) = {np.linalg.cond(DG):.2e}"
+              f"  cond(DG_scaled) = {cond_DG_s:.2e}"
+              f"  D = [{', '.join(f'{d:.2e}' for d in D)}]")
 
-        if cond_DG > 1e14:
+        if cond_DG_s > 1e14:
             print("  !! DG ill-conditioned — aborting.")
             return r_cur, z_cur, a_cur, phi, False
 
         try:
-            dy = np.linalg.solve(DG, -G)
+            dy_s = np.linalg.solve(DG_s, -G)
         except np.linalg.LinAlgError:
             print("  !! DG singular — aborting.")
             return r_cur, z_cur, a_cur, phi, False
 
+        dy = dy_s / D  # back to unscaled space
+
         print(f"         | step: dr={dy[0]:+.4e}  dz={dy[1]:+.4e}  da={dy[2]:+.4e}")
 
-        # Line search (uses cheaper Jacobian-only evaluator)
-        alpha = 1.0
-        for _ in range(12):
-            dr_try = dr + alpha * dy[0]
-            dz_try = dz + alpha * dy[1]
-            da_try = da + alpha * dy[2]
-            phi_try = phi + alpha * dy[3:5]
+        if use_tr:
+            # ── Trust-region globalization ──
+            # dy_s is the equilibrated step (dimensionless after column scaling).
+            # The TR radius Delta is measured in this scaled space.
+            step_norm_s = np.linalg.norm(dy_s)
+            if step_norm_s > Delta:
+                dy_s_clipped = dy_s * (Delta / step_norm_s)
+                dy = dy_s_clipped / D   # consistent with dy = dy_s / D
+                print(f"         | TR: step clipped {step_norm_s:.4e} -> {Delta:.4e}"
+                      f"  (dr={dy[0]:+.4e}  dz={dy[1]:+.4e}  da={dy[2]:+.4e})")
+            else:
+                dy_s_clipped = dy_s
 
+            # Predicted reduction: |G|^2 - |G + DG*dy|^2 ≈ |G|^2 - |G - G|^2 for full step
+            # Use the linear model: G_pred = G + DG @ dy
+            G_pred = G + DG @ dy
+            pred = res**2 - np.linalg.norm(G_pred)**2
+
+            # Evaluate actual reduction
+            dr_try = dr + dy[0]
+            dz_try = dz + dy[1]
+            da_try = da + dy[2]
+            phi_try = phi + dy[3:5]
+
+            step_ok = True
             if a_ref + da_try <= 0:
+                step_ok = False
+            else:
+                try:
+                    F_try, J_try = evaluate_forces_hat(dr_try, dz_try, da_try, md)
+                    G_try = np.concatenate([F_try, J_try[:, :2] @ phi_try,
+                                            [np.dot(l_vec, phi_try) - 1.0]])
+                    res_try = np.linalg.norm(G_try)
+                    ared = res**2 - res_try**2
+                except MeshFlippedError:
+                    step_ok = False
+
+            if not step_ok:
+                rho = -1.0
+            elif abs(pred) < 1e-30:
+                rho = 1.0 if ared >= 0 else -1.0
+            else:
+                rho = ared / pred
+
+            print(f"         | TR: |G_try|={res_try if step_ok else float('nan'):.4e}"
+                  f"  rho={rho:+.4f}  Delta={Delta:.4e}")
+
+            # Accept or reject
+            if rho >= eta_accept and step_ok:
+                dr, dz, da = dr_try, dz_try, da_try
+                phi = phi_try / np.dot(l_vec, phi_try)
+                print(f"         | TR: step ACCEPTED")
+            else:
+                print(f"         | TR: step REJECTED")
+
+            # Update trust-region radius
+            if rho < 0.25:
+                Delta = max(Delta * 0.25, 1e-8)
+            elif rho > eta_good and step_norm_s >= 0.95 * Delta:
+                Delta = min(Delta * 2.0, Delta_max)
+
+        elif use_exact_ls:
+            # ── Exact line search: 1-D Brent minimisation of ½|G(x+α·dy)|² ──
+            from scipy.optimize import minimize_scalar
+
+            def _merit(alpha):
+                if alpha <= 0:
+                    return res**2
+                dr_t = dr + alpha * dy[0]
+                dz_t = dz + alpha * dy[1]
+                da_t = da + alpha * dy[2]
+                phi_t = phi + alpha * dy[3:5]
+                if a_ref + da_t <= 0:
+                    return res**2
+                try:
+                    F_t, J_t = evaluate_forces_hat(dr_t, dz_t, da_t, md)
+                except MeshFlippedError:
+                    return res**2
+                G_t = np.concatenate([F_t, J_t[:, :2] @ phi_t,
+                                      [np.dot(l_vec, phi_t) - 1.0]])
+                return float(np.dot(G_t, G_t))
+
+            # Search on (0, alpha_max]; alpha_max=3 allows overshoot
+            result = minimize_scalar(_merit, bounds=(1e-6, 3.0), method='bounded',
+                                     options={'xatol': 1e-3, 'maxiter': 20})
+            alpha = float(result.x)
+            res_try = result.fun ** 0.5
+
+            print(f"         | exact ls: alpha={alpha:.6f}  |G|={res_try:.4e}"
+                  f"  nfev={result.nfev}")
+
+            dr += alpha * dy[0]
+            dz += alpha * dy[1]
+            da += alpha * dy[2]
+            phi += alpha * dy[3:5]
+            phi = phi / np.dot(l_vec, phi)
+
+        else:
+            # ── Armijo backtracking ──
+            alpha = 1.0
+            for _ in range(12):
+                dr_try = dr + alpha * dy[0]
+                dz_try = dz + alpha * dy[1]
+                da_try = da + alpha * dy[2]
+                phi_try = phi + alpha * dy[3:5]
+
+                if a_ref + da_try <= 0:
+                    alpha *= 0.5
+                    continue
+
+                try:
+                    F_try, J_try = evaluate_forces_hat(dr_try, dz_try, da_try, md)
+                except MeshFlippedError:
+                    print(f"         | ls: flipped at alpha={alpha:.4e}, halving")
+                    alpha *= 0.5
+                    continue
+
+                G_try = np.concatenate([F_try, J_try[:, :2] @ phi_try,
+                                        [np.dot(l_vec, phi_try) - 1.0]])
+                res_try = np.linalg.norm(G_try)
+                print(f"         | ls alpha={alpha:.4f}: |G|={res_try:.4e}"
+                      f"  {'OK' if res_try < (1 - 1e-4 * alpha) * res else 'reject'}")
+
+                if res_try < (1 - 1e-4 * alpha) * res:
+                    break
                 alpha *= 0.5
-                continue
 
-            try:
-                F_try, J_try = evaluate_forces_hat(dr_try, dz_try, da_try, md)
-            except MeshFlippedError:
-                print(f"         | ls: flipped at alpha={alpha:.4e}, halving")
-                alpha *= 0.5
-                continue
-
-            G_try = np.concatenate([F_try, J_try[:, :2] @ phi_try,
-                                    [np.dot(l_vec, phi_try) - 1.0]])
-            res_try = np.linalg.norm(G_try)
-            print(f"         | ls alpha={alpha:.4f}: |G|={res_try:.4e}"
-                  f"  {'OK' if res_try < (1 - 1e-4 * alpha) * res else 'reject'}")
-
-            if res_try < (1 - 1e-4 * alpha) * res:
-                break
-            alpha *= 0.5
-
-        dr += alpha * dy[0]
-        dz += alpha * dy[1]
-        da += alpha * dy[2]
-        phi += alpha * dy[3:5]
-        phi = phi / np.dot(l_vec, phi)
+            dr += alpha * dy[0]
+            dz += alpha * dy[1]
+            da += alpha * dy[2]
+            phi += alpha * dy[3:5]
+            phi = phi / np.dot(l_vec, phi)
 
         gc.collect()
 
@@ -2648,22 +2780,32 @@ def bisection_bifurcation_hat(r_off_hat_eq, z_off_hat_eq, a_hat_init,
             r_best, z_best, a_best, sig_best = r_mid, z_mid, a_mid, sig_mid
 
         if conv_lo and conv_hi:
-            # Both sides converge — bisect toward smaller sigma_min
-            if sig_mid <= sig_lo and sig_mid <= sig_hi:
-                if sig_lo < sig_hi:
-                    a_hat_hi = a_mid
-                    sig_hi = sig_mid
-                else:
+            if conv_mid and np.sign(det_lo) != np.sign(det_hi):
+                # Proper sign-change bracket (pitchfork or fold where det(J) crosses zero).
+                # Place mid on whichever side has matching sign.
+                if np.sign(det_mid) == np.sign(det_lo):
                     a_hat_lo = a_mid
-                    sig_lo = sig_mid
-            elif sig_mid < sig_lo:
-                a_hat_lo = a_mid
-                sig_lo = sig_mid
-                r_lo, z_lo = r_mid, z_mid
-            else:
-                a_hat_hi = a_mid
-                sig_hi = sig_mid
-                r_hi, z_hi = r_mid, z_mid
+                    r_lo, z_lo, sig_lo, det_lo = r_mid, z_mid, sig_mid, det_mid
+                else:
+                    a_hat_hi = a_mid
+                    r_hi, z_hi, sig_hi, det_hi = r_mid, z_mid, sig_mid, det_mid
+            elif conv_mid:
+                # No sign change yet (degenerate/perturbed pitchfork) —
+                # fall back to bisecting toward smaller sigma_min.
+                if sig_mid < sig_lo and sig_mid < sig_hi:
+                    # mid is the new best; keep the side that is further from bif
+                    if sig_lo > sig_hi:
+                        a_hat_lo = a_mid
+                        r_lo, z_lo, sig_lo, det_lo = r_mid, z_mid, sig_mid, det_mid
+                    else:
+                        a_hat_hi = a_mid
+                        r_hi, z_hi, sig_hi, det_hi = r_mid, z_mid, sig_mid, det_mid
+                elif sig_mid < sig_lo:
+                    a_hat_lo = a_mid
+                    r_lo, z_lo, sig_lo, det_lo = r_mid, z_mid, sig_mid, det_mid
+                else:
+                    a_hat_hi = a_mid
+                    r_hi, z_hi, sig_hi, det_hi = r_mid, z_mid, sig_mid, det_mid
         else:
             # One side converges, one doesn't — standard bisection
             if conv_mid:
@@ -3372,13 +3514,17 @@ if __name__ == "__main__":
     # (see images/Sweep_a=0.01_to_0.15_R=500_H=W=2/bifurcation_results.json).
     r_off_hat_init = 0.61558964
     z_off_hat_init = 0.0
-    a_hat_start = 0.136        # start on the pre-bifurcation side
+    a_hat_start = 0.133        # start on the pre-bifurcation side
 
-    RUN_MODE = 'moore_spence_ad'
-    # Options: 'verify_only'       – only run Hessian verification, then stop
-    #          'pac_moore_spence'   – pseudo arc-length continuation + Moore–Spence
-    #          'moore_spence_ad'    – direct Moore–Spence with AD Hessian
-    #          'moore_spence_exact' – Moore–Spence with FD of AD Jacobian
+    print("particle_maxh_rel:", particle_maxh_rel)
+
+    RUN_MODE = 'moore_spence_ad_tr'
+    # Options: 'verify_only'          – only run Hessian verification, then stop
+    #          'pac_moore_spence'      – pseudo arc-length continuation + Moore–Spence
+    #          'moore_spence_ad'       – direct Moore–Spence with AD Hessian (Armijo)
+    #          'moore_spence_ad_tr'    – direct Moore–Spence with AD Hessian (trust-region + scaling)
+    #          'moore_spence_ad_els'   – direct Moore–Spence with AD Hessian (exact line search via Brent)
+    #          'moore_spence_exact'    – Moore–Spence with FD of AD Jacobian
     #          'moore_spence_broyden'
     #          'bisection'
 
@@ -3391,26 +3537,23 @@ if __name__ == "__main__":
 
     shared_data = (R_hat, H_hat, W_hat, L_c, U_c, Re, G_hat, U_m_hat, u_bar_2d_hat, p_bar_tilde_2d_hat)
 
-    # ── Verify second derivatives ──
-    print("\n" + "#" * 70)
-    print("#  VERIFYING SECOND DERIVATIVES (AD Hessian vs FD)")
-    print("#" * 70)
-
-    md_verify = setup_moving_mesh_hat(r_off_hat_init, z_off_hat_init, a_hat_start,
-                                       R_hat, H_hat, W_hat, Re, G_hat, U_m_hat,
-                                       u_bar_2d_hat, p_bar_tilde_2d_hat)
-    _, J0_full = evaluate_forces_hat(0.0, 0.0, 0.0, md_verify)
-    phi_init = estimate_null_vector(J0_full[:, :2])
-
-    # verify_result = verify_moore_spence_derivatives(0.0, 0.0, 0.0, md_verify, phi_init)
-
     if RUN_MODE == 'verify_only':
+        # ── Verify second derivatives ──
+        print("\n" + "#" * 70)
+        print("#  VERIFYING SECOND DERIVATIVES (AD Hessian vs FD)")
+        print("#" * 70)
+
+        md_verify = setup_moving_mesh_hat(r_off_hat_init, z_off_hat_init, a_hat_start,
+                                           R_hat, H_hat, W_hat, Re, G_hat, U_m_hat,
+                                           u_bar_2d_hat, p_bar_tilde_2d_hat)
+        _, J0_full = evaluate_forces_hat(0.0, 0.0, 0.0, md_verify)
+        phi_init = estimate_null_vector(J0_full[:, :2])
+
+        # verify_result = verify_moore_spence_derivatives(0.0, 0.0, 0.0, md_verify, phi_init)
+
         print("\n  RUN_MODE = 'verify_only' — stopping here.")
         import sys
         sys.exit(0)
-
-    del md_verify
-    gc.collect()
 
     BIFURCATION_METHOD = RUN_MODE
 
@@ -3438,10 +3581,18 @@ if __name__ == "__main__":
         if bif_result is not None and not bif_result['converged']:
             print("\n  WARNING: Bifurcation detection did not fully converge.")
 
-    elif BIFURCATION_METHOD == 'moore_spence_ad':
+    elif BIFURCATION_METHOD in ('moore_spence_ad', 'moore_spence_ad_tr',
+                                'moore_spence_ad_els'):
+        if BIFURCATION_METHOD == 'moore_spence_ad_tr':
+            _glob = 'trust_region'
+        elif BIFURCATION_METHOD == 'moore_spence_ad_els':
+            _glob = 'exact_linesearch'
+        else:
+            _glob = 'armijo'
         r_bif, z_bif, a_bif, phi_bif, ms_converged = moore_spence_solve_hat_ad(
-            r_hat, z_hat, a_hat_start, shared_data, tol=1e-8, max_iter=20,
-            md=md_newton, dr_init=dr_newton, dz_init=dz_newton)
+            r_hat, z_hat, a_hat_start, shared_data, tol=1e-8, max_iter=40,
+            md=md_newton, dr_init=dr_newton, dz_init=dz_newton,
+            globalization=_glob)
 
         if not ms_converged:
             print("\n  WARNING: Moore-Spence (AD) did not converge.")
