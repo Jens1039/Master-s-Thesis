@@ -3596,9 +3596,9 @@ if __name__ == "__main__":
     # Initial guess near the equilibrium on the symmetry axis.
     # The bifurcation (pitchfork) lies between a_hat = 0.13 and 0.14
     # (see images/Sweep_a=0.01_to_0.15_R=500_H=W=2/bifurcation_results.json).
-    r_off_hat_init = - 0.5574
+    r_off_hat_init = - 0.37
     z_off_hat_init = 0.0
-    a_hat_start = 0.08       # start on the pre-bifurcation side
+    a_hat_start = 0.079       # start on the pre-bifurcation side
 
     print("particle_maxh_rel:", particle_maxh_rel)
 
@@ -3677,7 +3677,7 @@ if __name__ == "__main__":
         else:
             _glob = 'armijo'
         r_bif, z_bif, a_bif, phi_bif, ms_converged = moore_spence_solve_hat_ad(
-            r_hat, z_hat, a_hat_start, shared_data, tol=3e-8, max_iter=40,
+            r_hat, z_hat, a_hat_start, shared_data, tol=5e-8, max_iter=40,
             md=md_newton, dr_init=dr_newton, dz_init=dz_newton,
             globalization=_glob)
 
