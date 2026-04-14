@@ -26,7 +26,7 @@ Q = 2*2.40961923848e-10                   # volumetric flow rate [m^3/s]
 
 # ---NUMERICAL PRECISION--------------------------------
 N_grid = 20
-particle_maxh_rel = 0.05
+particle_maxh_rel = 0.1
 global_maxh_rel = 0.2
 eps_rel = 0.2
 # ------------------------------------------------------

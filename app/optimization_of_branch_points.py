@@ -2116,8 +2116,10 @@ def moore_spence_solve_hat_ad(r_off_hat_eq, z_off_hat_eq, a_hat_init, shared_dat
     a_start = a_ref + da
 
     use_tr = (globalization == 'trust_region')
+    use_tr_lm = (globalization == 'trust_region_lm')
     use_exact_ls = (globalization == 'exact_linesearch')
-    glob_label = ("trust-region" if use_tr else
+    glob_label = ("trust-region+LM" if use_tr_lm else
+                  "trust-region" if use_tr else
                   "exact line search" if use_exact_ls else "Armijo")
 
     print("\n" + "=" * 65)
@@ -2127,7 +2129,7 @@ def moore_spence_solve_hat_ad(r_off_hat_eq, z_off_hat_eq, a_hat_init, shared_dat
     print("=" * 65)
 
     # Trust-region state
-    if use_tr:
+    if use_tr or use_tr_lm:
         Delta = 0.1  # initial trust-region radius (in scaled space)
         Delta_max = 1.0
         eta_accept = 0.1   # minimum ratio to accept step
@@ -2257,6 +2259,88 @@ def moore_spence_solve_hat_ad(r_off_hat_eq, z_off_hat_eq, a_hat_init, shared_dat
                 print(f"         | TR: step REJECTED")
 
             # Update trust-region radius
+            if rho < 0.25:
+                Delta = max(Delta * 0.25, 1e-8)
+            elif rho > eta_good and step_norm_s >= 0.95 * Delta:
+                Delta = min(Delta * 2.0, Delta_max)
+
+        elif use_tr_lm:
+            # ── Trust-region + Levenberg-Marquardt fallback ──
+            # Same as trust_region but when rho < eta_accept (Newton step rejected),
+            # falls back to LM normal equations:
+            #   (DG_s^T DG_s + lam*I) dy_s = -DG_s^T G
+            # which always gives a descent direction for |G|^2.
+
+            def _eval_step_lm(dy_candidate):
+                dr_t = dr + dy_candidate[0]
+                dz_t = dz + dy_candidate[1]
+                da_t = da + dy_candidate[2]
+                phi_t = phi + dy_candidate[3:5]
+                if a_ref + da_t <= 0:
+                    return float('nan'), False
+                try:
+                    F_t, J_t = evaluate_forces_hat(dr_t, dz_t, da_t, md)
+                    G_t = np.concatenate([F_t, J_t[:, :2] @ phi_t,
+                                          [np.dot(l_vec, phi_t) - 1.0]])
+                    return float(np.linalg.norm(G_t)), True
+                except MeshFlippedError:
+                    return float('nan'), False
+
+            # Pure Newton step clipped to Delta
+            step_norm_s = np.linalg.norm(dy_s)
+            if step_norm_s > Delta:
+                dy_s_try = dy_s * (Delta / step_norm_s)
+                dy_try = dy_s_try / D
+                print(f"         | TR: step clipped {step_norm_s:.4e} -> {Delta:.4e}"
+                      f"  (dr={dy_try[0]:+.4e}  dz={dy_try[1]:+.4e}  da={dy_try[2]:+.4e})")
+            else:
+                dy_try = dy_s / D
+
+            G_pred = G + DG @ dy_try
+            pred = res**2 - np.linalg.norm(G_pred)**2
+            res_try, step_ok = _eval_step_lm(dy_try)
+            if step_ok:
+                ared = res**2 - res_try**2
+                rho = ared / pred if abs(pred) > 1e-30 else (1.0 if ared >= 0 else -1.0)
+            else:
+                rho = -1.0
+
+            print(f"         | TR: |G_try|={res_try:.4e}  rho={rho:+.4f}  Delta={Delta:.4e}")
+            accepted = (rho >= eta_accept and step_ok)
+
+            if not accepted:
+                # LM fallback: solve normal equations with increasing lambda
+                lam = 1e-6 * np.linalg.norm(DG_s)**2
+                for _lm_it in range(8):
+                    A = DG_s.T @ DG_s + lam * np.eye(5)
+                    b = -DG_s.T @ G
+                    try:
+                        dy_s_lm = np.linalg.solve(A, b)
+                    except np.linalg.LinAlgError:
+                        lam *= 10.0
+                        continue
+                    dy_lm = dy_s_lm / D
+                    res_lm, ok_lm = _eval_step_lm(dy_lm)
+                    if ok_lm and res_lm < res:
+                        print(f"         | LM(lam={lam:.2e}): |G_try|={res_lm:.4e}  ACCEPTED")
+                        dy_try = dy_lm
+                        res_try = res_lm
+                        accepted = True
+                        break
+                    print(f"         | LM(lam={lam:.2e}): |G_try|={res_lm:.4e}  reject")
+                    lam *= 10.0
+
+            if accepted:
+                dr += dy_try[0]
+                dz += dy_try[1]
+                da += dy_try[2]
+                phi_new = phi + dy_try[3:5]
+                phi = phi_new / np.dot(l_vec, phi_new)
+                print(f"         | step ACCEPTED")
+            else:
+                print(f"         | step REJECTED (TR + all LM attempts failed)")
+
+            # Update TR radius based on Newton rho
             if rho < 0.25:
                 Delta = max(Delta * 0.25, 1e-8)
             elif rho > eta_good and step_norm_s >= 0.95 * Delta:
@@ -3512,17 +3596,18 @@ if __name__ == "__main__":
     # Initial guess near the equilibrium on the symmetry axis.
     # The bifurcation (pitchfork) lies between a_hat = 0.13 and 0.14
     # (see images/Sweep_a=0.01_to_0.15_R=500_H=W=2/bifurcation_results.json).
-    r_off_hat_init = 0.61558964
+    r_off_hat_init = - 0.5574
     z_off_hat_init = 0.0
-    a_hat_start = 0.133        # start on the pre-bifurcation side
+    a_hat_start = 0.08       # start on the pre-bifurcation side
 
     print("particle_maxh_rel:", particle_maxh_rel)
 
-    RUN_MODE = 'moore_spence_ad_tr'
+    RUN_MODE = 'moore_spence_ad_tr_lm'
     # Options: 'verify_only'          – only run Hessian verification, then stop
     #          'pac_moore_spence'      – pseudo arc-length continuation + Moore–Spence
     #          'moore_spence_ad'       – direct Moore–Spence with AD Hessian (Armijo)
     #          'moore_spence_ad_tr'    – direct Moore–Spence with AD Hessian (trust-region + scaling)
+    #          'moore_spence_ad_tr_lm' – direct Moore–Spence with AD Hessian (trust-region + LM fallback)
     #          'moore_spence_ad_els'   – direct Moore–Spence with AD Hessian (exact line search via Brent)
     #          'moore_spence_exact'    – Moore–Spence with FD of AD Jacobian
     #          'moore_spence_broyden'
@@ -3582,15 +3667,17 @@ if __name__ == "__main__":
             print("\n  WARNING: Bifurcation detection did not fully converge.")
 
     elif BIFURCATION_METHOD in ('moore_spence_ad', 'moore_spence_ad_tr',
-                                'moore_spence_ad_els'):
+                                'moore_spence_ad_tr_lm', 'moore_spence_ad_els'):
         if BIFURCATION_METHOD == 'moore_spence_ad_tr':
             _glob = 'trust_region'
+        elif BIFURCATION_METHOD == 'moore_spence_ad_tr_lm':
+            _glob = 'trust_region_lm'
         elif BIFURCATION_METHOD == 'moore_spence_ad_els':
             _glob = 'exact_linesearch'
         else:
             _glob = 'armijo'
         r_bif, z_bif, a_bif, phi_bif, ms_converged = moore_spence_solve_hat_ad(
-            r_hat, z_hat, a_hat_start, shared_data, tol=1e-8, max_iter=40,
+            r_hat, z_hat, a_hat_start, shared_data, tol=3e-8, max_iter=40,
             md=md_newton, dr_init=dr_newton, dz_init=dz_newton,
             globalization=_glob)
 
