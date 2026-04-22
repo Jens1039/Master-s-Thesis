@@ -1,6 +1,7 @@
 import os
 os.environ["OMP_NUM_THREADS"] = "1"
 
+import numpy as np
 from firedrake import *
 
 
@@ -125,7 +126,7 @@ class perturbed_flow:
         Theta = Constant(Theta_np)
         n = FacetNormal(self.mesh3d)
 
-        centrifugal_term = - (4*np.pi)/3 * (Theta_np**2) * np.cross(e_z_np, np.cross(e_z_np, x_p_np))
+        centrifugal_term = - (4*np.pi)/3 * self.a**3 * (Theta_np**2) * np.cross(e_z_np, np.cross(e_z_np, x_p_np))
 
         # Refactor the background inertial volume integral into a surface integral using the divergence theorem and incompressibility
         inertial_integrand = dot(u_bar_a, -n) * u_bar_a + (dot(u_bar_s, -n) * u_bar_a + dot(u_bar_a, -n) * u_bar_s) + dot(u_bar_s, -n) * u_bar_s
@@ -149,7 +150,6 @@ class perturbed_flow:
                         + dot(grad(v_0_a), v_0_s + u_bar_s)
         )
 
-        # It seems there is a sign error in the paper in equation (2.24). The minus in front of the RHS is missing.
         fluid_stress_x = - dot(u_x, fluid_stress_right_inner)
         fluid_stress_z = - dot(u_z, fluid_stress_right_inner)
 
@@ -256,33 +256,26 @@ if __name__ == "__main__":
     W_hat = 2
     a_hat = 0.05
     Re = 1.0
-    L_c = H_hat / 2
-    U_c = 0.008366733466944444
 
-    from nondimensionalization import *
     from background_flow import *
     from build_3d_geometry_gmsh import make_curved_channel_section_with_spherical_hole
 
     bg = background_flow(R_hat, H_hat, W_hat, Re)
     G_val, U_m_hat, u_bar, p_bar_tilde = bg.solve_2D_background_flow()
 
-    R_hat_hat, H_hat_hat, W_hat_hat, a_hat_hat, G_hat_hat, L_c_p, U_c_p, u_bar_2d_hat_hat, p_bar_2d_hat_hat, Re_p = second_nondimensionalisation(
-        R_hat, H_hat, W_hat, a_hat, L_c, U_c, G_val, Re, u_bar, p_bar_tilde, U_m_hat, print_values=True)
+    L_hat = 4 * max(H_hat, W_hat)
+    particle_maxh = 0.2 * a_hat
+    global_maxh = 0.2 * min(H_hat, W_hat)
 
-    L_hat_hat = 4 * max(H_hat_hat, W_hat_hat)
-    particle_maxh_hat_hat = 0.2 * a_hat_hat
-    global_maxh_hat_hat = 0.2 * min(H_hat_hat, W_hat_hat)
+    mesh3d, tags = make_curved_channel_section_with_spherical_hole(R_hat, H_hat, W_hat, L_hat, a_hat,
+                                                                   particle_maxh, global_maxh, r_off=0.0, z_off=0.0)
 
-    mesh3d, tags = make_curved_channel_section_with_spherical_hole(
-        R_hat_hat, H_hat_hat, W_hat_hat, L_hat_hat, a_hat_hat,
-        particle_maxh_hat_hat, global_maxh_hat_hat, r_off=0.0, z_off=0.0)
+    u_bar_3d, p_bar_3d = build_3d_background_flow(R_hat, H_hat, W_hat, G_val, mesh3d, tags, u_bar, p_bar_tilde)
 
-    u_bar_3d, p_bar_3d = build_3d_background_flow(
-        R_hat_hat, H_hat_hat, W_hat_hat, G_hat_hat, mesh3d, tags, u_bar_2d_hat_hat, p_bar_2d_hat_hat)
-
-    pf = perturbed_flow(R_hat_hat, H_hat_hat, W_hat_hat, L_hat_hat, a_hat_hat, Re_p, mesh3d, tags, u_bar_3d, p_bar_3d)
+    pf = perturbed_flow(R_hat, H_hat, W_hat, L_hat, a_hat, Re, mesh3d, tags, u_bar_3d, p_bar_3d)
 
     F_p_x, F_p_z = pf.F_p()
+
     print(f"F_p_x = {float(F_p_x)}")
     print(f"F_p_z = {float(F_p_z)}")
 

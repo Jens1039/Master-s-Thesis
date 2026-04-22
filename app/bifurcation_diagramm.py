@@ -19,10 +19,11 @@ warnings.filterwarnings("ignore", message=".*import SLEPc.*", category=UserWarni
 comm = MPI.COMM_WORLD
 rank = comm.Get_rank()
 
-a_hat_values = np.round(np.arange(0.01, 0.2, 0.0025), 5)
+a_hat_values = np.round(np.arange(0.1375, 0.1376, 0.0025), 7)
 
-RESULTS_FILE = "bifurcation_results.json"
+RESULTS_FILE = "../images/Sweep_a=0.01_to_0.20_R=500_H=W=2_ss=0.0025/bifurcation_results.json"
 PLOT_MODE = "3d"  # allowed: "3d", "2d_r", "2d_z"
+
 
 def auto_start_mpi(n_procs=5):
 
@@ -44,12 +45,7 @@ def auto_start_mpi(n_procs=5):
 
 
 def plot_bifurcation_diagram(data, plot_mode="3d", save=True, show=True):
-    """
-    Plotly bifurcation diagram with selectable projection:
-      - "3d":   x=a_hat, y=r_norm, z=z_norm
-      - "2d_r": x=a_hat, y=r_norm
-      - "2d_z": x=a_hat, y=z_norm
-    """
+
     valid_modes = {"3d", "2d_r", "2d_z"}
     if plot_mode not in valid_modes:
         raise ValueError(f"Unsupported plot_mode '{plot_mode}'. Allowed: {sorted(valid_modes)}")
@@ -120,7 +116,7 @@ def plot_bifurcation_diagram(data, plot_mode="3d", save=True, show=True):
                     f"type: {eq_type}<extra></extra>"
                 ),
             ))
-        else:  # plot_mode == "2d_z"
+        else:
             fig.add_trace(go.Scatter(
                 x=x_vals,
                 y=z_vals,
@@ -172,7 +168,7 @@ def plot_bifurcation_diagram(data, plot_mode="3d", save=True, show=True):
             legend=dict(x=0.01, y=0.99),
             template="plotly_white",
         )
-    else:  # plot_mode == "2d_z"
+    else:
         fig.add_hline(y=H_hat / 2, line_dash="dash", line_color="black")
         fig.add_hline(y=-H_hat / 2, line_dash="dash", line_color="black")
         fig.add_hline(y=0.0, line_dash="dot", line_color="gray")
@@ -189,7 +185,7 @@ def plot_bifurcation_diagram(data, plot_mode="3d", save=True, show=True):
     if save:
         a_min = min(a_hat_values)
         a_max = max(a_hat_values)
-        out_dir = "images"
+        out_dir = "../images/Sweep_a=0.01_to_0.20_R=500_H=W=2_ss=0.0025/images"
         os.makedirs(out_dir, exist_ok=True)
         html_path = (
             f"{out_dir}/Bifurcation_diagram_{plot_mode}_a_min={a_min:.3f}_a_max={a_max:.3f}"
@@ -208,9 +204,8 @@ if __name__ == "__main__":
 
     auto_start_mpi()
 
-    os.makedirs("images", exist_ok=True)
+    os.makedirs("../images/Sweep_a=0.01_to_0.20_R=500_H=W=2_ss=0.0025/images", exist_ok=True)
 
-    # Load cached data if existent
     use_cache = False
     if rank == 0:
         use_cache = os.path.exists(RESULTS_FILE)
@@ -241,8 +236,6 @@ if __name__ == "__main__":
     scalar_bg = comm.bcast(scalar_bg, root=0)
     (R_hat, H_hat, W_hat, L_c, U_c, Re, G_hat, U_m_hat) = scalar_bg
 
-
-    #  sweep over a_hat values
     bifurcation_data = []
 
     for a_hat in a_hat_values:
@@ -302,7 +295,6 @@ if __name__ == "__main__":
 
             for eq in classified_equilibria:
                 r_eq, z_eq = eq["x_eq"]
-                # convert doubly-nondim → singly-nondim (r / (H/2))
                 r_norm = float(r_eq) * (L_c_p / L_c)
                 z_norm = float(z_eq) * (L_c_p / L_c)
 
@@ -316,8 +308,9 @@ if __name__ == "__main__":
                     "color":  eq["color"],
                 })
 
+            with open(RESULTS_FILE, "w") as f:
+                json.dump(bifurcation_data, f, indent=2)
+            print(f"  Results written to {RESULTS_FILE} ({len(bifurcation_data)} entries total)")
+
     if rank == 0:
-        with open(RESULTS_FILE, "w") as f:
-            json.dump(bifurcation_data, f, indent=2)
-        print(f"\nResults saved to {RESULTS_FILE}")
         plot_bifurcation_diagram(bifurcation_data, plot_mode=PLOT_MODE, save=True, show=True)

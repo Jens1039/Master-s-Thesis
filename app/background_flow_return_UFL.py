@@ -4,7 +4,6 @@ os.environ["OMP_NUM_THREADS"] = "1"
 import numpy as np
 import sys
 import math
-from copy import deepcopy
 from scipy.spatial import cKDTree
 import warnings
 
@@ -23,13 +22,14 @@ class background_flow_differentiable:
         self.W   = W
         self.Re_float  = Re
         actual_comm = comm if comm is not None else COMM_WORLD
-        self.mesh2d = RectangleMesh(120, 120, self.W, self.H, quadrilateral=False, comm=actual_comm)
+        self.mesh2d = RectangleMesh(128, 128, self.W, self.H, quadrilateral=False, comm=actual_comm)
 
 
     def solve_2D_background_flow(self):
 
-        V       = VectorFunctionSpace(self.mesh2d, "CG", 2, dim=3)
-        Q       = FunctionSpace(self.mesh2d, "CG", 1)
+        # CG 3/ CG 2 because of 2nd order derivative? If lower not correct?
+        V       = VectorFunctionSpace(self.mesh2d, "CG", 3, dim=3)
+        Q       = FunctionSpace(self.mesh2d, "CG", 2)
         G_space = FunctionSpace(self.mesh2d, "R", 0)
         W_mixed = V * Q * G_space
 
@@ -117,11 +117,16 @@ class background_flow_differentiable:
 
 class VOMTransferBlock(Block):
 
-    def __init__(self, u_vom, u_out, inv_perm, V_vom):
+    def __init__(self, u_in, u_out, inv_perm, V_vom):
 
+        # Initializes the node object itself so pyadjoint recognizes it as a mathematical operation
         super().__init__()
-        self.add_dependency(u_vom)
+        # Draws an incoming arrow: "This node requires the data from u_in to compute"
+        self.add_dependency(u_in)
+        # Draws an outgoing arrow: "This node produces u_out as its result"
+        # .create_block_variable() creates a Block variable of u_out, so that it can be registered on the tape
         self.add_output(u_out.create_block_variable())
+
         self.inv_perm = inv_perm
         self.perm     = np.argsort(inv_perm)
         self.V_vom    = V_vom
@@ -129,9 +134,12 @@ class VOMTransferBlock(Block):
 
     def recompute_component(self, inputs, block_variable, idx, prepared):
 
+        # .output is the method, that grants us access to the variable contained in a Block structure
         out = block_variable.output
+
         with stop_annotating():
             out.dat.data[:] = inputs[0].dat.data_ro[self.inv_perm]
+
         return out
 
 
@@ -140,55 +148,40 @@ class VOMTransferBlock(Block):
         with stop_annotating():
             adj = Function(self.V_vom)
             adj.dat.data[:] = adj_inputs[0].dat.data_ro[self.perm]
+
         return adj
 
 
     def evaluate_tlm_component(self, inputs, tlm_inputs, block_variable, idx, prepared=None):
 
+        # pyadjoint sets tlm_inputs[i] to None if they dont contribute to the current directional derivative
         if tlm_inputs[0] is None:
             return None
+
         with stop_annotating():
             out = Function(block_variable.output.function_space())
             out.dat.data[:] = tlm_inputs[0].dat.data_ro[self.inv_perm]
+
         return out
 
 
-    def evaluate_hessian_component(self, inputs, hessian_inputs, adj_inputs,
-                                   block_variable, idx, relevant_dependencies,
-                                   prepared=None):
-        # Linear block (just a permutation copy): the second-order term is
-        # identically zero, so the Hessian contribution is exactly the
-        # adjoint operator applied to the second-order adjoint flowing back.
+    def evaluate_hessian_component(self, inputs, hessian_inputs, adj_inputs, block_variable, idx, relevant_dependencies, prepared=None):
+
+        # pyadjoint sets hessian_inputs[i] to None if they dont contribute to the current directional derivative
         if hessian_inputs[0] is None:
             return None
-        return self.evaluate_adj_component(
-            inputs, hessian_inputs, block_variable, idx, prepared)
 
-
-def vom_transfer(u_vom, V_target, inv_perm, V_vom):
-
-    u_out = Function(V_target)
-    with stop_annotating():
-        u_out.dat.data[:] = u_vom.dat.data_ro[inv_perm]
-    if annotate_tape():
-        block = VOMTransferBlock(u_vom, u_out, inv_perm, V_vom)
-        get_working_tape().add_block(block)
-    return u_out
-
-
-def _compute_inv_perm(vom, query_pts):
-    tree = cKDTree(vom.coordinates.dat.data_ro)
-    dist, inv_perm = tree.query(query_pts, workers=-1)
-    assert np.max(dist) < 1e-10, f"VOM mismatch: max dist {np.max(dist):.2e}"
-    return inv_perm.astype(np.int32)
+        return self.evaluate_adj_component(inputs, hessian_inputs, block_variable, idx, prepared)
 
 
 class WallBCBlock(Block):
 
     def __init__(self, u_in, u_out, bc_node_indices, V):
+
         super().__init__()
         self.add_dependency(u_in)
         self.add_output(u_out.create_block_variable())
+
         self.bc_nodes = bc_node_indices
         self.V = V
 
@@ -197,6 +190,7 @@ class WallBCBlock(Block):
 
         out = data_in.copy()
         out[self.bc_nodes] = 0.0
+
         return out
 
 
@@ -212,6 +206,7 @@ class WallBCBlock(Block):
         with stop_annotating():
             adj = Function(self.V)
             adj.dat.data[:] = self._apply_projection(adj_inputs[0].dat.data_ro)
+
         return adj
 
 
@@ -224,88 +219,13 @@ class WallBCBlock(Block):
             out.dat.data[:] = self._apply_projection(tlm_inputs[0].dat.data_ro)
         return out
 
-    def evaluate_hessian_component(self, inputs, hessian_inputs, adj_inputs,
-                                   block_variable, idx, relevant_dependencies,
-                                   prepared=None):
-        # Linear projection ⇒ second-order term vanishes; only the adjoint
-        # of the second-order seed flows back.
+
+    def evaluate_hessian_component(self, inputs, hessian_inputs, adj_inputs, block_variable, idx, relevant_dependencies, prepared=None):
+
         if hessian_inputs[0] is None:
             return None
-        return self.evaluate_adj_component(
-            inputs, hessian_inputs, block_variable, idx, prepared)
 
-
-def apply_wall_bc_on_tape(u_fn, V, wall_tag):
-
-    with stop_annotating():
-        bc = DirichletBC(V, Constant((0.0, 0.0, 0.0)), wall_tag)
-        bc_node_indices = bc.nodes
-
-    u_out = Function(V, name=u_fn.name() + "_bc" if u_fn.name() else "u_bc")
-    with stop_annotating():
-        u_out.dat.data[:] = u_fn.dat.data_ro[:]
-        u_out.dat.data[bc_node_indices] = 0.0
-
-    if annotate_tape():
-        block = WallBCBlock(u_fn, u_out, bc_node_indices, V)
-        get_working_tape().add_block(block)
-
-    return u_out
-
-
-def _build_CG1_to_CG2_map(mesh3d):
-
-    from scipy.sparse import coo_matrix
-
-    V1 = FunctionSpace(mesh3d, "CG", 1)
-    V2 = FunctionSpace(mesh3d, "CG", 2)
-    # The dofs are here all the nodes of the net as well as the points in between the nodes, which fix
-    # polynomials of higher degree (here 2)
-    n1 = V1.dof_count
-    n2 = V2.dof_count
-
-    # V1.cell_node_map().values returns a list of lists which contains the global indices of dofs with each tetraeder being one list
-    cmap1 = V1.cell_node_map().values
-    cmap2 = V2.cell_node_map().values
-    dpc1  = cmap1.shape[1]
-    dpc2  = cmap2.shape[1]
-    n_cells = cmap1.shape[0]
-
-    with stop_annotating():
-        src = Function(V1)
-        dst = Function(V2)
-        g1_c0 = cmap1[0]
-        g2_c0 = cmap2[0]
-        local_M = np.zeros((dpc2, dpc1))
-        for j in range(dpc1):
-            src.dat.data[:] = 0.0
-            src.dat.data[g1_c0[j]] = 1.0
-            dst.interpolate(src)
-            for i in range(dpc2):
-                local_M[i, j] = dst.dat.data_ro[g2_c0[i]]
-
-    nz_i, nz_j = np.nonzero(np.abs(local_M) > 1e-14)
-    nz_vals = local_M[nz_i, nz_j]
-
-    rows = cmap2[:, nz_i].ravel()
-    cols = cmap1[:, nz_j].ravel()
-    vals = np.tile(nz_vals, n_cells)
-
-    M_sum = coo_matrix((vals, (rows, cols)), shape=(n2, n1)).tocsr()
-    M_cnt = coo_matrix((np.ones_like(vals), (rows, cols)), shape=(n2, n1)).tocsr()
-    M = M_sum.copy()
-    M.data /= M_cnt.data
-
-    with stop_annotating():
-        rng = np.random.default_rng(42)
-        test_fn = Function(V1)
-        test_fn.dat.data[:] = rng.standard_normal(n1)
-        expected = Function(V2).interpolate(test_fn).dat.data_ro.copy()
-        got = M @ test_fn.dat.data_ro
-        err = np.max(np.abs(got - expected))
-        assert err < 1e-10, f"CG1→CG2 map verification failed: {err:.2e}"
-
-    return M
+        return self.evaluate_adj_component(inputs, hessian_inputs, block_variable, idx, prepared)
 
 
 class DifferentiableFieldEvalBlock(Block):
@@ -680,8 +600,43 @@ class BuildXiBlock(Block):
             inputs, hessian_inputs, block_variable, idx, prepared)
 
 
-def build_xi_diff(delta_r, delta_z, bump, cos_th, sin_th, V_def,
-                  delta_a=None, d_hat_data=None):
+def vom_transfer(u_vom, V_target, inv_perm, V_vom):
+
+    u_out = Function(V_target)
+    with stop_annotating():
+        u_out.dat.data[:] = u_vom.dat.data_ro[inv_perm]
+    if annotate_tape():
+        block = VOMTransferBlock(u_vom, u_out, inv_perm, V_vom)
+        get_working_tape().add_block(block)
+    return u_out
+
+
+def _compute_inv_perm(vom, query_pts):
+    tree = cKDTree(vom.coordinates.dat.data_ro)
+    dist, inv_perm = tree.query(query_pts, workers=-1)
+    assert np.max(dist) < 1e-10, f"VOM mismatch: max dist {np.max(dist):.2e}"
+    return inv_perm.astype(np.int32)
+
+
+def apply_wall_bc_on_tape(u_fn, V, wall_tag):
+
+    with stop_annotating():
+        bc = DirichletBC(V, Constant((0.0, 0.0, 0.0)), wall_tag)
+        bc_node_indices = bc.nodes
+
+    u_out = Function(V, name=u_fn.name() + "_bc" if u_fn.name() else "u_bc")
+    with stop_annotating():
+        u_out.dat.data[:] = u_fn.dat.data_ro[:]
+        u_out.dat.data[bc_node_indices] = 0.0
+
+    if annotate_tape():
+        block = WallBCBlock(u_fn, u_out, bc_node_indices, V)
+        get_working_tape().add_block(block)
+
+    return u_out
+
+
+def build_xi_diff(delta_r, delta_z, bump, cos_th, sin_th, V_def, delta_a=None, d_hat_data=None):
     """Tape-aware construction of
         xi = dr * (cos_th, sin_th, 0) * bump
            + dz * (0, 0, 1)            * bump
@@ -749,6 +704,61 @@ def differentiable_field_eval(xi, X_ref, field_2d, R, W, H, V_def, V_3d, field_d
         get_working_tape().add_block(block)
 
     return out
+
+
+def _build_CG1_to_CG2_map(mesh3d):
+
+    from scipy.sparse import coo_matrix
+
+    V1 = FunctionSpace(mesh3d, "CG", 1)
+    V2 = FunctionSpace(mesh3d, "CG", 2)
+    # The dofs are here all the nodes of the net as well as the points in between the nodes, which fix
+    # polynomials of higher degree (here 2)
+    n1 = V1.dof_count
+    n2 = V2.dof_count
+
+    # V1.cell_node_map().values returns a list of lists which contains the global indices of dofs with each tetraeder being one list
+    cmap1 = V1.cell_node_map().values
+    cmap2 = V2.cell_node_map().values
+    dpc1  = cmap1.shape[1]
+    dpc2  = cmap2.shape[1]
+    n_cells = cmap1.shape[0]
+
+    with stop_annotating():
+        src = Function(V1)
+        dst = Function(V2)
+        g1_c0 = cmap1[0]
+        g2_c0 = cmap2[0]
+        local_M = np.zeros((dpc2, dpc1))
+        for j in range(dpc1):
+            src.dat.data[:] = 0.0
+            src.dat.data[g1_c0[j]] = 1.0
+            dst.interpolate(src)
+            for i in range(dpc2):
+                local_M[i, j] = dst.dat.data_ro[g2_c0[i]]
+
+    nz_i, nz_j = np.nonzero(np.abs(local_M) > 1e-14)
+    nz_vals = local_M[nz_i, nz_j]
+
+    rows = cmap2[:, nz_i].ravel()
+    cols = cmap1[:, nz_j].ravel()
+    vals = np.tile(nz_vals, n_cells)
+
+    M_sum = coo_matrix((vals, (rows, cols)), shape=(n2, n1)).tocsr()
+    M_cnt = coo_matrix((np.ones_like(vals), (rows, cols)), shape=(n2, n1)).tocsr()
+    M = M_sum.copy()
+    M.data /= M_cnt.data
+
+    with stop_annotating():
+        rng = np.random.default_rng(42)
+        test_fn = Function(V1)
+        test_fn.dat.data[:] = rng.standard_normal(n1)
+        expected = Function(V2).interpolate(test_fn).dat.data_ro.copy()
+        got = M @ test_fn.dat.data_ro
+        err = np.max(np.abs(got - expected))
+        assert err < 1e-10, f"CG1→CG2 map verification failed: {err:.2e}"
+
+    return M
 
 
 def build_3d_background_flow_differentiable(R, H, W, G_val, mesh3d, tags, u_bar_2d, p_bar_2d, X_ref=None, xi=None):
@@ -820,49 +830,33 @@ def build_3d_background_flow_differentiable(R, H, W, G_val, mesh3d, tags, u_bar_
     return u_bar_3d, p_bar_3d, u_cyl_3d
 
 
-def _banner(title):
-    print(f"\n{'=' * 70}\n  {title}\n{'=' * 70}")
-
-
-def _pass_fail(name, passed, detail=""):
-    tag = "PASS" if passed else "FAIL"
-    suffix = f"  ({detail})" if detail else ""
-    print(f"  [{tag}] {name}{suffix}")
-    return passed
-
-
 if __name__ == "__main__":
 
-    # ----- scenario parameters in hat-coordinates -----------------------
     R_hat = 500.0
     H_hat = 2.0
     W_hat = 2.0
     a_hat = 0.05
-    L_hat = 4.0 * max(H_hat, W_hat)
-    Re    = 1.0
+    Re = 1.0
 
-    particle_maxh = 0.05 * a_hat
-    global_maxh   = 0.20 * min(H_hat, W_hat)
+    L_hat_rel = 4.0
+    particle_maxh_rel = 0.2
+    global_maxh_rel = 0.2
 
-    # ----- 1) 2D background flow on the duct cross section --------------
+    x_off_hat = 0.3
+    z_off_hat = 0.2
+
+    results = []
+
     with stop_annotating():
         bg = background_flow_differentiable(R_hat, H_hat, W_hat, Re)
         G_val, U_m_hat, u_2d, p_2d = bg.solve_2D_background_flow()
-    print(f"  2D background flow solved: G = {G_val:+.6e},  U_m_hat = {U_m_hat:+.6e}")
+        mesh3d, tags = make_curved_channel_section_with_spherical_hole(R_hat, H_hat, W_hat, L_hat_rel * max(H_hat, W_hat), a_hat,
+                                                particle_maxh_rel * a_hat, global_maxh_rel * min(H_hat, W_hat), x_off_hat, z_off_hat)
 
-    # ----- 2) 3D mesh with spherical particle hole at the centre --------
-    with stop_annotating():
-        mesh3d, tags = make_curved_channel_section_with_spherical_hole(
-            R_hat, H_hat, W_hat, L_hat, a_hat,
-            particle_maxh, global_maxh, 0.0, 0.0)
-    print(f"  3D mesh: theta = {tags['theta']:.4f},  "
-          f"particle_center = ({tags['particle_center'][0]:.3f}, "
-          f"{tags['particle_center'][1]:.3f}, {tags['particle_center'][2]:.3f})")
-
-    # ----- 3) deformation-field machinery -------------------------------
-    V_def     = VectorFunctionSpace(mesh3d, "CG", 1)
-    V_scalar  = FunctionSpace(mesh3d, "CG", 1)
-    R_space   = FunctionSpace(mesh3d, "R", 0)
+    V_3d  = VectorFunctionSpace(mesh3d, "CG", 2)
+    Q_3d  = FunctionSpace(mesh3d, "CG", 1)
+    V_def = VectorFunctionSpace(mesh3d, "CG", 1)
+    R_space = FunctionSpace(mesh3d, "R", 0)
 
     with stop_annotating():
         X_ref = Function(V_def, name="X_ref")
@@ -870,461 +864,415 @@ if __name__ == "__main__":
 
         cx, cy, cz = tags["particle_center"]
         x = SpatialCoordinate(mesh3d)
-        dist = sqrt((x[0] - cx)**2 + (x[1] - cy)**2 + (x[2] - cz)**2)
-
-        # Bump: 1 on the sphere surface (dist = a_hat), linear decay to 0 at r_cut.
-        # Same construction as in setup_moving_mesh_hat in optimization_of_branch_points.
-        a_c   = Constant(a_hat)
-        r_cut = Constant(0.5 * min(H_hat, W_hat))
-        bump_expr = max_value(Constant(0.0),
-                              1.0 - max_value(Constant(0.0), dist - a_c) / (r_cut - a_c))
-
-        # Sample bump and the per-node radial direction onto CG1 nodes,
-        # so they can be passed as numpy arrays to BuildXiBlock.
-        bump_fn = Function(V_scalar, name="bump")
-        bump_fn.interpolate(bump_expr)
-
+        dist = sqrt((x[0]-cx)**2 + (x[1]-cy)**2 + (x[2]-cz)**2)
+        bump_fn = Function(FunctionSpace(mesh3d, "CG", 1), name="bump")
+        bump_fn.interpolate(max_value(Constant(0.0),
+            1.0 - max_value(Constant(0.0), dist - Constant(a_hat))
+                / (Constant(0.5*min(H_hat,W_hat)) - Constant(a_hat))))
         d_hat_fn = Function(V_def, name="d_hat")
-        d_hat_fn.interpolate(as_vector([
-            (x[0] - cx) / dist,
-            (x[1] - cy) / dist,
-            (x[2] - cz) / dist,
-        ]))
+        d_hat_fn.interpolate(as_vector([(x[i]-[cx,cy,cz][i])/dist for i in range(3)]))
         d_hat_data = d_hat_fn.dat.data_ro.copy()
 
-    theta_half = tags["theta"] / 2.0
-    cos_th = math.cos(theta_half)
-    sin_th = math.sin(theta_half)
-
-    # The test functional itself is documented in the top-level banner
-    # block printed by the AD test driver further down.
-
-    # ----- 4) functional builder ----------------------------------------
-    def _build_Jhat():
-        """Set up a fresh tape, build xi(delta_r, delta_z, delta_a) via
-        BuildXiBlock (so that 2nd derivatives are well-defined), evaluate the
-        3D background flow, and return (Jhat, m0, controls)."""
-
-        set_working_tape(Tape())
-        continue_annotation()
-
-        # Reset the mesh to its undeformed reference configuration before
-        # we start re-recording the tape.  Without this, repeated calls
-        # would compose deformations on top of each other.
-        with stop_annotating():
-            mesh3d.coordinates.assign(X_ref)
-
-        delta_r = Function(R_space, name="delta_r").assign(0.0)
-        delta_z = Function(R_space, name="delta_z").assign(0.0)
-        delta_a = Function(R_space, name="delta_a").assign(0.0)
-
-        # Tape-friendly xi construction.  build_xi_diff routes everything
-        # through BuildXiBlock, which has an exact (zero) Hessian and
-        # therefore avoids the `ZeroBaseForm` crash that
-        # xi.interpolate(as_vector([...])) triggers in pyadjoint.
-        xi = build_xi_diff(delta_r, delta_z, bump_fn, cos_th, sin_th, V_def,
-                           delta_a=delta_a, d_hat_data=d_hat_data)
-        mesh3d.coordinates.assign(X_ref + xi)
-
-        u_bar_3d, p_bar_3d, u_cyl_3d = build_3d_background_flow_differentiable(
-            R_hat, H_hat, W_hat, G_val, mesh3d, tags, u_2d, p_2d,
-            X_ref=X_ref, xi=xi)
-
-        # See block comment above for the rationale behind this choice.
-        J = assemble(inner(u_bar_3d, u_bar_3d) * ds(tags["particle"], domain=mesh3d))
-
-        controls = [Control(delta_r), Control(delta_z), Control(delta_a)]
-        Jhat = ReducedFunctional(J, controls)
-
-        m0 = [Function(R_space).assign(0.0),
-              Function(R_space).assign(0.0),
-              Function(R_space).assign(0.0)]
-
-        return Jhat, m0, controls
-
-    # =====================================================================
-    #  Helper printer for matrices
-    # =====================================================================
+    cos_th = math.cos(tags["theta"] / 2.0)
+    sin_th = math.sin(tags["theta"] / 2.0)
+    H_MAG = 0.1
     ctrl_names = ["delta_r", "delta_z", "delta_a"]
-    n_ctrl = 3
 
-    def _print_matrix(label, M, indent="  "):
-        print(f"\n{indent}{label}:")
-        header = indent + " " * 11 + "  ".join(f"{c:>14}" for c in ctrl_names)
-        print(header)
-        for i, name in enumerate(ctrl_names):
-            row = "  ".join(f"{M[i, j]:+14.6e}" for j in range(n_ctrl))
-            print(f"{indent}{name:>9}   {row}")
+    def make_m0():
+        return [Function(R_space).assign(0.0) for _ in range(3)]
 
-    # =====================================================================
-    #  Top-level explanation of what we are testing and why
-    # =====================================================================
-    _banner("BACKGROUND FLOW UFL — AD CORRECTNESS TESTS  (a = 0.05, R = 500)")
-    print("""
-  GOAL
-  ----
-  Verify that automatic differentiation through the chain
+    def make_h(idx):
+        return [Function(R_space).assign(H_MAG if k == idx else 0.0) for k in range(3)]
 
-      controls (delta_r, delta_z, delta_a)
-        --> BuildXiBlock
-        --> mesh3d.coordinates.assign(X_ref + xi)
-        --> build_3d_background_flow_differentiable
-        --> assemble(... ds(particle))
+    def make_h_mixed():
+        return [Function(R_space).assign(H_MAG) for _ in range(3)]
 
-  produces correct first AND second derivatives, so that this tape
-  can later be reused inside a Newton solver for the Moore-Spence
-  bifurcation system on the particle force F_p (Boullé/Farrell/
-  Paganini, Algorithm 4.1).  Newton on Moore-Spence needs Hessian-
-  vector products, so first-derivative correctness alone is not
-  enough — we must also verify the second-derivative path.
-
-  CONTROLS
-  --------
-      delta_r : radial translation of the particle
-      delta_z : axial   translation of the particle
-      delta_a : isotropic radial scaling of the particle (size)
-
-  All three enter the geometry via a single deformation field xi,
-  built through BuildXiBlock so that pyadjoint sees a tape with an
-  exact (analytically zero) second derivative for the xi map and
-  therefore avoids the well-known Interpolate-of-coefficients bug
-  in firedrake.adjoint.
-
-  TEST FUNCTIONAL
-  ---------------
-      J(delta_r, delta_z, delta_a)
-          = ∫_{particle surface} |u_bar_3d|^2  dS
-
-  This is non-zero at the reference (apply_wall_bc_on_tape only zeroes
-  the *walls*, not the particle), localised on the particle so the
-  signal-to-noise ratio is high, and depends sharply on which (s,t)
-  of the 2D background flow the particle surface samples.  All three
-  controls produce a strong signal in this functional.
-
-  WHAT FOLLOWS
-  ------------
-      TESTS 1-3 : Gradient correctness (Taylor R1).
-      TEST 4    : Hessian symmetry (Schwarz consistency check).
-      TEST 5    : Hessian numerical correctness (AD vs FD-of-AD-gradient).
-""")
-
-    results = []
-
-    # =====================================================================
-    #  TESTS 1-3:  GRADIENT CORRECTNESS via TAYLOR R1
-    # =====================================================================
-    _banner("TESTS 1-3:  GRADIENT CORRECTNESS  (Taylor R1)")
-    print("""
-  WHAT WE MEASURE
-  ---------------
-      R1(eps) := | J(m + eps·h)  -  J(m)  -  eps·<dJ_AD, h> |
-
-  where dJ_AD is the gradient that pyadjoint returns from a reverse
-  pass through the tape.  We evaluate R1 at four halving values of
-  eps and inspect the convergence rate.
-
-  WHY THIS PROVES THE GRADIENT IS CORRECT
-  ---------------------------------------
-  By Taylor's theorem,
-
-      J(m + eps·h)  =  J(m)  +  eps·<dJ_true, h>  +  0.5·eps²·<h, H·h>  +  O(eps³)
-
-  Therefore
-
-      R1(eps)  =  | eps·<dJ_true - dJ_AD, h>  +  0.5·eps²·<h, H·h>  +  O(eps³) |.
-
-  -- If dJ_AD == dJ_true exactly, the linear-in-eps term vanishes
-     and R1 = O(eps²), so log2(R1(eps)/R1(eps/2)) -> 2 as eps -> 0.
-  -- If dJ_AD is wrong by any non-trivial amount, the linear-in-eps
-     term dominates and R1 = O(eps), giving rate -> 1.
-
-  The convergence rate is therefore a direct, theoretically rigorous
-  signature of gradient correctness.  It is independent of the size
-  of |H| or |J'''| — both terms appear at higher orders in eps and
-  do not affect the rate.
-
-  PASS CRITERION
-  --------------
-      Minimum observed convergence rate >= 1.9.
-
-  We allow a 0.1 margin below the theoretical 2.0 to absorb
-  floating-point and finite-element-assembly noise; in practice for
-  this functional we see rates of 2.0000 (4 digits), well clear of
-  the bound.
-
-  Pass on all three controls means: the AD path through every block
-  on the tape (BuildXiBlock, mesh-coordinate assign, the field-eval
-  block, the form assembly) computes a correct first derivative.
-""")
-
-    tol_R1 = 1.9
-
-    def run_R1_test(label, idx_active, eps):
-        Jhat, m0, _ = _build_Jhat()
-        h = [Function(R_space).assign(eps if k == idx_active else 0.0)
-             for k in range(n_ctrl)]
-        rate = taylor_test(Jhat, m0, h)
-        ok = _pass_fail(f"{label}  Taylor R1",
-                        rate >= tol_R1,
-                        f"min rate = {rate:.4f}  (theory = 2.0, threshold = {tol_R1})")
-        stop_annotating()
-        get_working_tape().clear_tape()
+    def check(label, ok, info=""):
+        tag = "PASS" if ok else "FAIL"
+        print(f"  [{tag}] {label}{('  '+info) if info else ''}")
         return ok
 
-    print(">>> TEST 1: gradient w.r.t. radial translation  delta_r")
-    results.append(("R1 gradient delta_r",
-                    run_R1_test("delta_r", 0, eps=0.05)))
+    def run_taylor(label, build_fn, h_list):
 
-    print("\n>>> TEST 2: gradient w.r.t. axial translation  delta_z")
-    results.append(("R1 gradient delta_z",
-                    run_R1_test("delta_z", 1, eps=0.05)))
+        print(f"\n  Taylor test: {label}")
+        Jhat, m0 = build_fn()
+        try:
+            info = taylor_to_dict(Jhat, m0, h_list)
+        except ZeroDivisionError:
+            print(f"    J constant in this direction (all residuals=0)")
+            print(f"    [PASS] R1 gradient  (trivially 0)")
+            print(f"    [PASS] R2 hessian   (trivially 0)")
+            stop_annotating()
+            get_working_tape().clear_tape()
+            return True, True
 
-    print("\n>>> TEST 3: gradient w.r.t. particle size  delta_a")
-    print("    (eps reduced to 5e-3 since the particle radius itself is 5e-2,")
-    print("     keeping the perturbation an order of magnitude smaller.)")
-    results.append(("R1 gradient delta_a",
-                    run_R1_test("delta_a", 2, eps=0.005)))
+        for key in ["R0", "R1", "R2"]:
+            print(f"    {key} rates: {[f'{r:.4f}' for r in info[key]['Rate']]}")
+            print(f"    {key} resid: {[f'{r:.4e}' for r in info[key]['Residual']]}")
 
-    # =====================================================================
-    #  Compute the AD Hessian and the FD Hessian *once*; TESTS 4 and 5
-    #  both inspect the resulting matrices.
-    # =====================================================================
-    _banner("BUILDING HESSIAN MATRICES FOR TESTS 4 & 5")
-    print("""
-  We need the full 3x3 Hessian of J on two independent paths:
+        r0_max = max(info["R0"]["Residual"])
+        r1_err = max(abs(r - 2.0) for r in info["R1"]["Rate"])
+        r1_max = max(info["R1"]["Residual"])
+        r2_err = max(abs(r - 3.0) for r in info["R2"]["Rate"])
+        r2_max = max(info["R2"]["Residual"])
 
-      H_AD[:, j] := pyadjoint reverse-over-forward Hessian-vector
-                    product, called as Jhat.hessian(e_j) for each
-                    coordinate direction e_j.  No eps appears.
-                    This is exactly the operator Newton on the
-                    Moore-Spence system would invoke.
+        # R1: gradient exact if residuals negligible vs R0 scale
+        r1_exact = r0_max > 1e-30 and r1_max < 1e-3 * r0_max
+        ok_r1 = r1_err <= 0.1 or r1_exact
 
-      H_FD[:, j] := centred FD of the AD-precise gradient,
+        # R2: Hessian exact (zero) if R2 residuals negligible vs R1 scale
+        r2_exact = r1_max > 1e-30 and r2_max < 1e-3 * r1_max
+        ok_r2 = r2_err <= 0.1 or r2_exact
 
-                       (grad J(m + eps·e_j) - grad J(m - eps·e_j)) / (2·eps)
+        r1_note = " (exact)" if r1_exact else "  (need<=0.1)"
+        r2_note = " (exact)" if r2_exact else "  (need<=0.1)"
+        print(f"    [{'PASS' if ok_r1 else 'FAIL'}] R1 gradient  max|rate-2|={r1_err:.4f}{r1_note}")
+        print(f"    [{'PASS' if ok_r2 else 'FAIL'}] R2 Taylor    max|rate-3|={r2_err:.4f}{r2_note}")
 
-                    The *gradient* is AD-precise (TESTS 1-3 just
-                    proved that), so eps only enters here through
-                    the FD truncation O(eps²) and floating-point
-                    roundoff in the difference.  At eps = 1e-3 we
-                    expect 4-6 digits of agreement on entries that
-                    are well above noise.
+        stop_annotating()
+        get_working_tape().clear_tape()
 
-  Both matrices are computed once below and then used by both tests.
-""")
+        print(f"    --- FD Hessian cross-check (eps=1e-4) ---")
+        eps_fd = 1e-4
+        m_arr = np.array([float(h_list[j].dat.data_ro[0]) for j in range(len(h_list))])
+        n_ctrl = len(h_list)
 
-    Jhat, m0, _ = _build_Jhat()
-    fd_eps = 1e-3
+        Jhat_h, _ = build_fn()
+        Jhat_h.derivative()
+        m_fns = [Function(R_space).assign(float(m_arr[j])) for j in range(n_ctrl)]
+        Hm_ad_raw = Jhat_h.hessian(m_fns)
+        Hm_ad = np.array([float(Hm_ad_raw[j].dat.data_ro[0]) for j in range(n_ctrl)])
+        stop_annotating()
+        get_working_tape().clear_tape()
 
-    # ---- AD Hessian: three Hessian-vector products
-    print("  Computing H_AD via Jhat.hessian()  (3 reverse-over-forward passes) ...")
-    H_AD = np.zeros((n_ctrl, n_ctrl))
-    for j in range(n_ctrl):
-        Jhat(m0)
-        Jhat.derivative()
-        h = [Function(R_space).assign(1.0 if k == j else 0.0)
-             for k in range(n_ctrl)]
-        H_col = Jhat.hessian(h)
-        for i in range(n_ctrl):
-            H_AD[i, j] = float(H_col[i].dat.data_ro[0])
+        Jhat_p, _ = build_fn()
+        ctrl_p = [Function(R_space).assign(eps_fd * m_arr[j]) for j in range(n_ctrl)]
+        Jhat_p(ctrl_p)  # replay forward model at perturbed point
+        dJ_p_raw = Jhat_p.derivative()
+        grad_p = np.array([float(dJ_p_raw[j].dat.data_ro[0]) for j in range(n_ctrl)])
+        stop_annotating()
+        get_working_tape().clear_tape()
 
-    # ---- FD Hessian: 6 forward+adjoint replays
-    print(f"  Computing H_FD via centred FD of grad J  (eps = {fd_eps:.0e},  6 replays) ...")
-    m0_vals = [float(m.dat.data_ro[0]) for m in m0]
-    H_FD = np.zeros((n_ctrl, n_ctrl))
-    for j in range(n_ctrl):
-        m_plus = [Function(R_space).assign(
-                      m0_vals[k] + (fd_eps if k == j else 0.0))
-                  for k in range(n_ctrl)]
-        Jhat(m_plus)
-        g_plus = np.array([float(g.dat.data_ro[0]) for g in Jhat.derivative()])
+        Jhat_m, _ = build_fn()
+        ctrl_m = [Function(R_space).assign(-eps_fd * m_arr[j]) for j in range(n_ctrl)]
+        Jhat_m(ctrl_m)  # replay forward model at perturbed point
+        dJ_m_raw = Jhat_m.derivative()
+        grad_m = np.array([float(dJ_m_raw[j].dat.data_ro[0]) for j in range(n_ctrl)])
+        stop_annotating()
+        get_working_tape().clear_tape()
 
-        m_minus = [Function(R_space).assign(
-                       m0_vals[k] - (fd_eps if k == j else 0.0))
-                   for k in range(n_ctrl)]
-        Jhat(m_minus)
-        g_minus = np.array([float(g.dat.data_ro[0]) for g in Jhat.derivative()])
+        Hm_fd = (grad_p - grad_m) / (2 * eps_fd)
 
-        H_FD[:, j] = (g_plus - g_minus) / (2.0 * fd_eps)
+        abs_diff = np.abs(Hm_ad - Hm_fd)
+        scale = max(np.max(np.abs(Hm_fd)), np.max(np.abs(Hm_ad)), 1e-30)
+        rel_diff = np.max(abs_diff) / scale
+        ok_fd = rel_diff < 1e-2
 
-    _print_matrix("H_AD  (pyadjoint reverse-over-forward)", H_AD)
-    _print_matrix(f"H_FD  (centred FD of grad J,  eps = {fd_eps:.0e})", H_FD)
-    _print_matrix("H_AD - H_FD", H_AD - H_FD)
+        print(f"    H*m (AD):  [{', '.join(f'{v:+.6e}' for v in Hm_ad)}]")
+        print(f"    H*m (FD):  [{', '.join(f'{v:+.6e}' for v in Hm_fd)}]")
+        print(f"    max|AD-FD|/scale = {rel_diff:.4e}")
+        print(f"    [{'PASS' if ok_fd else 'FAIL'}] FD cross-check  (need < 1%)")
 
-    # =====================================================================
-    #  TEST 4:  HESSIAN SYMMETRY  (Schwarz consistency check)
-    # =====================================================================
-    _banner("TEST 4:  HESSIAN SYMMETRY  (Schwarz consistency check)")
-    print("""
-  WHAT WE MEASURE
-  ---------------
-      sym(H_AD) := max_{i,j}  | H_AD[i,j] - H_AD[j,i] |
+        ok_r2_final = ok_r2 or ok_fd
+        return ok_r1, ok_r2_final
 
-  WHY THIS IS DIAGNOSTIC
-  ----------------------
-  For any twice-continuously-differentiable J, Schwarz' theorem
-  guarantees that the true Hessian is symmetric.  The Hessian-vector
-  product computed by pyadjoint is assembled by composing many
-  per-block reverse-over-forward operations.  If any of those blocks
-  is missing a Hessian contribution (e.g. a partial second derivative
-  in firedrake's mesh-coordinate path), the missing term will in
-  general show up as an *asymmetry* in H_AD: there is no reason that
-  a partial term, summed in only one ordering, would cancel exactly
-  with its mirror.
+    print("\n=== GROUP 1: correctness at xi=0 ===")
 
-  An H_AD that is symmetric on the order of machine precision is
-  therefore strong evidence that pyadjoint's Hessian path is
-  internally self-consistent and complete.  The H_FD matrix has its
-  own asymmetry from FD truncation noise, which is why we measure
-  symmetry only on H_AD.
+    with stop_annotating():
+        mesh3d.coordinates.assign(X_ref)
+        u_bar_nd, p_bar_nd, u_cyl_nd = build_3d_background_flow_differentiable(R_hat, H_hat, W_hat, G_val, mesh3d, tags, u_2d, p_2d)
+        xi_zero = Function(V_def).assign(0.0)
+        u_bar_d, p_bar_d, u_cyl_d = build_3d_background_flow_differentiable(R_hat, H_hat, W_hat, G_val, mesh3d, tags, u_2d, p_2d,
+                                                                            X_ref=X_ref, xi=xi_zero)
 
-  PASS CRITERION
-  --------------
-      sym(H_AD) <= 1e-12
+        for k, cn in enumerate(["u_r", "u_z", "u_theta"]):
+            e = np.max(np.abs(u_cyl_nd.dat.data_ro[:, k] - u_cyl_d.dat.data_ro[:, k]))
+            n = max(np.max(np.abs(u_cyl_nd.dat.data_ro[:, k])), 1e-15)
+            ok = check(f"u_cyl {cn} VOM==DiffEval", e/n < 1e-10, f"rel={e/n:.2e}")
+            results.append((f"G1 u_cyl {cn}", ok))
 
-  Twelve orders of magnitude below O(1) entries gives us "machine
-  precision" in double-precision floating point.  Anything above
-  ~1e-10 would be a warning sign.
-""")
+        coords = Function(V_3d).interpolate(SpatialCoordinate(mesh3d)).dat.data_ro
+        r_n = np.sqrt(coords[:,0]**2 + coords[:,1]**2)
+        cp, sp = coords[:,0]/r_n, coords[:,1]/r_n
+        for lbl, u_bar_ufl, u_cyl_fn in [("VOM", u_bar_nd, u_cyl_nd),
+                                           ("DE",  u_bar_d,  u_cyl_d)]:
+            c = u_cyl_fn.dat.data_ro
+            u_np = np.column_stack([cp*c[:,0]-sp*c[:,2], sp*c[:,0]+cp*c[:,2], c[:,1]])
+            u_fn = Function(V_3d).interpolate(u_bar_ufl).dat.data_ro
+            for k, cn in enumerate(["u_x", "u_y", "u_z"]):
+                n = max(np.max(np.abs(u_np[:,k])), 1e-15)
+                e = np.max(np.abs(u_fn[:,k] - u_np[:,k]))
+                ok = check(f"u_bar {lbl} rotation {cn}", e/n < 1e-12, f"rel={e/n:.2e}")
+                results.append((f"G1 {lbl} rot {cn}", ok))
 
-    sym_AD = float(np.max(np.abs(H_AD - H_AD.T)))
-    sym_FD = float(np.max(np.abs(H_FD - H_FD.T)))
-    print(f"  sym(H_AD)  =  {sym_AD:.3e}")
-    print(f"  sym(H_FD)  =  {sym_FD:.3e}    (FD noise reference, not under test)")
-    ok_sym = _pass_fail("AD Hessian symmetric (Schwarz)",
-                        sym_AD <= 1e-12,
-                        f"max |H_AD - H_AD^T| = {sym_AD:.3e}, threshold = 1e-12")
-    results.append(("Hessian symmetry (Schwarz)", ok_sym))
+        p_nd = Function(Q_3d).interpolate(p_bar_nd).dat.data_ro
+        p_d  = Function(Q_3d).interpolate(p_bar_d).dat.data_ro
+        ep = np.max(np.abs(p_nd - p_d)); np_p = max(np.max(np.abs(p_nd)), 1e-15)
+        ok = check("p_bar VOM==DiffEval", ep/np_p < 1e-10, f"rel={ep/np_p:.2e}")
+        results.append(("G1 p_bar", ok))
 
-    # =====================================================================
-    #  TEST 5:  AD HESSIAN  vs  FD-of-AD-gradient HESSIAN  (numerical)
-    # =====================================================================
-    _banner("TEST 5:  H_AD  vs  H_FD  (numerical agreement, max-norm)")
-    print("""
-  WHAT WE MEASURE
-  ---------------
-      max-norm relative error
-          := max_{i,j} |H_AD[i,j] - H_FD[i,j]|  /  max_{i,j} |H_FD[i,j]|
+        bc_nodes = DirichletBC(V_3d, Constant((0,0,0)), tags["walls"]).nodes
+        for lbl, u_cyl_fn in [("VOM", u_cyl_nd), ("DE", u_cyl_d)]:
+            w = np.max(np.abs(u_cyl_fn.dat.data_ro[bc_nodes]))
+            ok = check(f"no-slip {lbl}", w < 1e-14, f"max={w:.2e}")
+            results.append((f"G1 no-slip {lbl}", ok))
 
-  WHY MAX-NORM AND NOT PER-ELEMENT RELATIVE
-  -----------------------------------------
-  The Hessian has entries spanning many orders of magnitude:
-  diagonal entries are O(1) - O(100), while off-diagonal entries
-  that are *physically zero* by symmetry of the configuration sit
-  at the noise floor (O(1e-5) for AD, O(1e-6) for FD).  A naive
-  per-element relative error |H_AD[i,j] - H_FD[i,j]| / |H_FD[i,j]|
-  divides noise by noise on the zero entries and produces a huge
-  number that has nothing to do with correctness.
+        from background_flow import build_3d_background_flow
+        u_ref, p_ref = build_3d_background_flow(
+            R_hat, H_hat, W_hat, G_val, mesh3d, tags, u_2d, p_2d)
+        for lbl, u_bar_ufl in [("VOM", u_bar_nd), ("DE", u_bar_d)]:
+            u_fn = Function(V_3d).interpolate(u_bar_ufl).dat.data_ro
+            for k, cn in enumerate(["u_x", "u_y", "u_z"]):
+                n = max(np.max(np.abs(u_ref.dat.data_ro[:,k])), 1e-15)
+                e = np.max(np.abs(u_fn[:,k] - u_ref.dat.data_ro[:,k]))
+                ok = check(f"u_bar {lbl} vs ref {cn}", e/n < 1e-3, f"rel={e/n:.2e}")
+                results.append((f"G1 {lbl} vs ref {cn}", ok))
+        for lbl, p_ufl in [("VOM", p_bar_nd), ("DE", p_bar_d)]:
+            p_fn = Function(Q_3d).interpolate(p_ufl).dat.data_ro
+            n = max(np.max(np.abs(p_ref.dat.data_ro)), 1e-15)
+            e = np.max(np.abs(p_fn - p_ref.dat.data_ro))
+            ok = check(f"p_bar {lbl} vs ref", e/n < 1e-3, f"rel={e/n:.2e}")
+            results.append((f"G1 p {lbl} vs ref", ok))
 
-  The max-norm relative error scales every difference against the
-  *largest* entry in the matrix, so a 4e-5 difference on a 1e2
-  diagonal contributes 4e-7, while a 2e-5 difference on a noise-
-  level off-diagonal contributes 2e-7 — both are correctly rated
-  as "agrees on six digits of the matrix".  This is the standard
-  way to compare matrices in numerical linear algebra.
+    print("\n=== GROUP 2: BuildXiBlock derivatives ===")
+    print("    Functional: J = ∫|xi|²dx  (xi = displacement field)")
+    print("    xi is LINEAR in all controls → Hessian is exactly zero,")
+    print("    so R2 residuals should be at machine precision.")
 
-  WHY THE TWO METHODS SHOULD AGREE
-  --------------------------------
-  H_AD uses no eps anywhere, but its computation runs through
-  pyadjoint's per-block reverse-over-forward composition, which
-  has been a historical source of subtle bugs.
+    def build_xi_J():
+        set_working_tape(Tape())
+        continue_annotation()
+        dr = Function(R_space, name="delta_r").assign(0.0)
+        dz = Function(R_space, name="delta_z").assign(0.0)
+        da = Function(R_space, name="delta_a").assign(0.0)
+        xi = build_xi_diff(dr, dz, bump_fn, cos_th, sin_th, V_def, delta_a=da, d_hat_data=d_hat_data)
+        J = assemble(inner(xi, xi) * dx)
+        return ReducedFunctional(J, [Control(dr), Control(dz), Control(da)]), make_m0()
 
-  H_FD uses *only* the AD gradient (which TESTS 1-3 already
-  verified is correct) and combines it via centred finite differences.
-  The only sources of error are:
-      truncation : (eps² / 6) * |J''''|       ~ 1.7e-7 * |J''''|
-      roundoff   : (eps_grad) / eps           ~ 1e-10 / 1e-3 = 1e-7
-  giving 4-6 digits of agreement at fd_eps = 1e-3.
+    for idx, name in enumerate(ctrl_names):
+        ok1, ok2 = run_taylor(f"J=∫|xi|²dx / {name}", build_xi_J, make_h(idx))
 
-  The two methods are *independent* (they share only the AD gradient,
-  whose correctness is established by TESTS 1-3).  Agreement on 4+
-  matching digits at fd_eps = 1e-3 is overwhelming evidence that
-  H_AD is correct.
+        results += [(f"G2 R1 {name}", ok1), (f"G2 R2 {name}", ok2)]
+    ok1, ok2 = run_taylor(
+        "J=∫|xi|²dx / delta_r ",
+        build_xi_J, make_h_mixed())
+    results += [("G2 R1 mixed", ok1), ("G2 R2 mixed", ok2)]
 
-  PASS CRITERION
-  --------------
-      max-norm relative error  <=  1e-3
+    print("\n=== GROUP 3: DifferentiableFieldEvalBlock derivatives ===")
+    print("    Functional: J = ∫u_cyl[k]²ds(particle)  (background velocity component)")
+    print("    No mesh movement: xi shifts query points into the 2D background flow.")
+    print("    Hessian limited by DG0 interpolation of field gradients → rate ~2 expected.")
 
-  Far above the FD noise floor (~3e-6 in our setup) and far below
-  any plausible bug (which would typically produce O(1) errors in
-  affected entries).  Anything between 1e-3 and 1e-2 means we should
-  refine fd_eps and look more carefully; anything > 1e-2 is a real
-  problem to investigate.
-""")
+    def make_build_ucyl(comp):
+        def build():
+            set_working_tape(Tape())
+            continue_annotation()
+            with stop_annotating():
+                mesh3d.coordinates.assign(X_ref)
+            dr = Function(R_space, name="delta_r").assign(0.0)
+            dz = Function(R_space, name="delta_z").assign(0.0)
+            da = Function(R_space, name="delta_a").assign(0.0)
+            xi = build_xi_diff(dr, dz, bump_fn, cos_th, sin_th, V_def,
+                               delta_a=da, d_hat_data=d_hat_data)
+            _, _, u_cyl = build_3d_background_flow_differentiable(
+                R_hat, H_hat, W_hat, G_val, mesh3d, tags, u_2d, p_2d,
+                X_ref=X_ref, xi=xi)
+            J = assemble(u_cyl[comp]**2 * ds(tags["particle"], domain=mesh3d))
+            return (ReducedFunctional(J, [Control(dr), Control(dz), Control(da)]),
+                    make_m0())
+        return build
 
-    matrix_inf_norm = float(np.max(np.abs(H_FD)))
-    abs_diff_max    = float(np.max(np.abs(H_AD - H_FD)))
-    rel_max_norm    = abs_diff_max / max(matrix_inf_norm, 1e-300)
+    cyl_comp_labels = ["u_r (cyl[0])", "u_z (cyl[1])", "u_theta (cyl[2])"]
+    for ci, cn in enumerate(cyl_comp_labels):
+        for hi, hn in enumerate(ctrl_names):
+            ok1, ok2 = run_taylor(
+                f"J=∫{cn}²ds  [DiffFieldEval, no mesh move]  ctrl={hn}",
+                make_build_ucyl(ci), make_h(hi))
+            results += [(f"G3 {cn} R1 {hn}", ok1), (f"G3 {cn} R2 {hn}", ok2)]
 
-    print(f"  ||H_FD||_inf                =  {matrix_inf_norm:.6e}")
-    print(f"  max |H_AD[i,j] - H_FD[i,j]| =  {abs_diff_max:.6e}")
-    print(f"  max-norm relative error     =  {rel_max_norm:.3e}")
-    print(f"  -> agrees on roughly         {-int(math.floor(math.log10(max(rel_max_norm, 1e-300))))} digits")
+    # ══════════════════════════════════════════════════════════════════
+    #  GROUP 4: Per Cartesian velocity component – WITH mesh movement
+    # ══════════════════════════════════════════════════════════════════
+    print("\n" + "=" * 60)
+    print("  GROUP 4: Cartesian velocity components – with mesh move")
+    print("  Functional: J = ∫u_bar[k]²ds(particle)")
+    print("  Chain: xi -> mesh coords -> DiffFieldEval(u_cyl) -> rotation R(phi)·u_cyl")
+    print("  phi = atan2(y,x) depends on deformed mesh → shape derivative active")
+    print("=" * 60)
 
-    tol_hessian_max_norm = 1e-3
-    ok_num = _pass_fail("H_AD == H_FD  (max-norm relative)",
-                        rel_max_norm <= tol_hessian_max_norm,
-                        f"max-norm rel err = {rel_max_norm:.3e}, "
-                        f"threshold = {tol_hessian_max_norm:.0e}")
-    results.append(("Hessian numerical (H_AD vs H_FD)", ok_num))
+    cart_comp_names = ["u_x(bar0)", "u_y(bar1)", "u_z(bar2)"]
 
-    # Per-entry diagnostic table to help future debugging.  We separate
-    # entries that are above an absolute noise threshold from those that
-    # are below it (the latter only carry noise on both sides and per-
-    # element relative errors there are not meaningful).
-    print("""
-  Per-entry breakdown
-  -------------------
-  Entries are classified by their absolute magnitude in H_FD:
-      'signal' : |H_FD[i,j]|  >   1e-4 * ||H_FD||_inf
-      'noise'  : |H_FD[i,j]|  <=  1e-4 * ||H_FD||_inf
-  Per-element relative errors are reported only for 'signal' entries;
-  for 'noise' entries we just print the absolute values to show that
-  both methods agree they are zero up to floating-point dust.
-""")
-    threshold = 1e-4 * matrix_inf_norm
-    print(f"  signal threshold = {threshold:.3e}")
-    print()
-    print(f"  {'entry':>10} {'class':>7} {'H_AD':>15} {'H_FD':>15} "
-          f"{'|diff|':>12} {'rel':>10}")
-    for i in range(n_ctrl):
-        for j in range(n_ctrl):
-            cls = "signal" if abs(H_FD[i, j]) > threshold else "noise"
-            diff = abs(H_AD[i, j] - H_FD[i, j])
-            rel = diff / abs(H_FD[i, j]) if cls == "signal" else float("nan")
-            rel_str = f"{rel:.2e}" if cls == "signal" else "    --   "
-            print(f"  ({ctrl_names[i][6]},{ctrl_names[j][6]}) {cls:>11} "
-                  f"{H_AD[i, j]:+15.6e} {H_FD[i, j]:+15.6e} "
-                  f"{diff:12.3e} {rel_str:>10}")
+    def make_build_ubar(comp):
+        def build():
+            set_working_tape(Tape())
+            continue_annotation()
+            with stop_annotating():
+                mesh3d.coordinates.assign(X_ref)
+            dr = Function(R_space, name="delta_r").assign(0.0)
+            dz = Function(R_space, name="delta_z").assign(0.0)
+            da = Function(R_space, name="delta_a").assign(0.0)
+            xi = build_xi_diff(dr, dz, bump_fn, cos_th, sin_th, V_def,
+                               delta_a=da, d_hat_data=d_hat_data)
+            mesh3d.coordinates.assign(X_ref + xi)
+            u_bar, _, _ = build_3d_background_flow_differentiable(
+                R_hat, H_hat, W_hat, G_val, mesh3d, tags, u_2d, p_2d,
+                X_ref=X_ref, xi=xi)
+            J = assemble(u_bar[comp]**2 * ds(tags["particle"], domain=mesh3d))
+            return (ReducedFunctional(J, [Control(dr), Control(dz), Control(da)]),
+                    make_m0())
+        return build
 
-    stop_annotating()
-    get_working_tape().clear_tape()
+    for ci, cn in enumerate(cart_comp_names):
+        for hi, hn in enumerate(ctrl_names):
+            ok1, ok2 = run_taylor(
+                f"J=∫{cn}²ds  [DiffFieldEval+rotation, mesh move]  ctrl={hn}",
+                make_build_ubar(ci), make_h(hi))
+            results.append((f"G4 {cn} R1 {hn}", ok1))
+            results.append((f"G4 {cn} R2 {hn}", ok2))
 
-    # ----- 7) summary ---------------------------------------------------
-    _banner("SUMMARY")
-    n_pass = sum(1 for _, ok in results if ok)
+    # ══════════════════════════════════════════════════════════════════
+    #  GROUP 5: Pressure – WITH mesh movement
+    #  p_bar = p_cyl - G·R·theta(x,y).  The pressure values p_cyl
+    #  come from VOM transfer (fixed query points, off-tape), but
+    #  theta = atan2(y, x) depends on the mesh coordinates and thus
+    #  on xi.  This tests those geometry-dependent derivatives.
+    # ══════════════════════════════════════════════════════════════════
+    print("\n" + "=" * 60)
+    print("  GROUP 5: Pressure – with mesh move")
+    print("  Functional: J = ∫p_bar²ds(particle)")
+    print("  p_bar = p_cyl(fixed) - G·R·atan2(y,x)")
+    print("  p_cyl comes from off-tape VOM transfer (no AD through it),")
+    print("  but theta=atan2(y,x) depends on deformed coordinates → shape derivative")
+    print("=" * 60)
+
+    def build_p_J():
+        set_working_tape(Tape())
+        continue_annotation()
+        with stop_annotating():
+            mesh3d.coordinates.assign(X_ref)
+        dr = Function(R_space, name="delta_r").assign(0.0)
+        dz = Function(R_space, name="delta_z").assign(0.0)
+        da = Function(R_space, name="delta_a").assign(0.0)
+        xi = build_xi_diff(dr, dz, bump_fn, cos_th, sin_th, V_def,
+                           delta_a=da, d_hat_data=d_hat_data)
+        mesh3d.coordinates.assign(X_ref + xi)
+        _, p_bar, _ = build_3d_background_flow_differentiable(
+            R_hat, H_hat, W_hat, G_val, mesh3d, tags, u_2d, p_2d,
+            X_ref=X_ref, xi=xi)
+        J = assemble(p_bar**2 * ds(tags["particle"], domain=mesh3d))
+        return (ReducedFunctional(J, [Control(dr), Control(dz), Control(da)]),
+                make_m0())
+
+    for hi, hn in enumerate(ctrl_names):
+        ok1, ok2 = run_taylor(
+            f"J=∫p_bar²ds  [atan2 shape-deriv, mesh move]  ctrl={hn}",
+            build_p_J, make_h(hi))
+        results.append((f"G5 pressure R1 {hn}", ok1))
+        results.append((f"G5 pressure R2 {hn}", ok2))
+
+    # ══════════════════════════════════════════════════════════════════
+    #  GROUP 6: Full chain combined – WITH mesh movement
+    #  J = ∫ |u_bar|^2 ds(particle) — the functional actually used
+    #  in the optimisation.  Tested per control direction and mixed.
+    # ══════════════════════════════════════════════════════════════════
+    print("\n" + "=" * 60)
+    print("  GROUP 6: Full chain combined – with mesh move")
+    print("  Functional: J = ∫|u_bar|²ds(particle)  (as used in optimisation)")
+    print("  Full chain: xi -> mesh -> DiffFieldEval(u_cyl) -> rotation -> integrate")
+    print("=" * 60)
+
+    def build_full_J():
+        set_working_tape(Tape())
+        continue_annotation()
+        with stop_annotating():
+            mesh3d.coordinates.assign(X_ref)
+        dr = Function(R_space, name="delta_r").assign(0.0)
+        dz = Function(R_space, name="delta_z").assign(0.0)
+        da = Function(R_space, name="delta_a").assign(0.0)
+        xi = build_xi_diff(dr, dz, bump_fn, cos_th, sin_th, V_def,
+                           delta_a=da, d_hat_data=d_hat_data)
+        mesh3d.coordinates.assign(X_ref + xi)
+        u_bar, _, _ = build_3d_background_flow_differentiable(
+            R_hat, H_hat, W_hat, G_val, mesh3d, tags, u_2d, p_2d,
+            X_ref=X_ref, xi=xi)
+        J = assemble(inner(u_bar, u_bar) * ds(tags["particle"], domain=mesh3d))
+        return (ReducedFunctional(J, [Control(dr), Control(dz), Control(da)]),
+                make_m0())
+
+    for hi, hn in enumerate(ctrl_names):
+        ok1, ok2 = run_taylor(
+            f"J=∫|u_bar|²ds  [full chain, mesh move]  ctrl={hn}",
+            build_full_J, make_h(hi))
+        results.append((f"G6 full R1 {hn}", ok1))
+        results.append((f"G6 full R2 {hn}", ok2))
+
+    ok1, ok2 = run_taylor(
+        "J=∫|u_bar|²ds  [full chain, mesh move]  ctrl=all mixed",
+        build_full_J, make_h_mixed())
+    results.append(("G6 full R1 mixed", ok1))
+    results.append(("G6 full R2 mixed", ok2))
+
+    # ══════════════════════════════════════════════════════════════════
+    #  GROUP 7: Cartesian velocity components – NO mesh movement
+    #  Same rotation u_bar = R(phi)·u_cyl but with fixed geometry.
+    #  Derivatives flow only through u_cyl (DifferentiableFieldEvalBlock)
+    #  and the UFL rotation with constant phi.  Comparing with Group 4
+    #  reveals whether the shape-derivative part of the rotation is
+    #  implemented correctly.
+    # ══════════════════════════════════════════════════════════════════
+    print("\n" + "=" * 60)
+    print("  GROUP 7: Cartesian velocity components – no mesh move")
+    print("  Functional: J = ∫u_bar[k]²ds(particle)")
+    print("  Same rotation as Group 4 but mesh stays fixed (no shape derivative).")
+    print("  Difference to Group 4 isolates the shape-derivative contribution.")
+    print("=" * 60)
+
+    def make_build_ubar_nomove(comp):
+        def build():
+            set_working_tape(Tape())
+            continue_annotation()
+            with stop_annotating():
+                mesh3d.coordinates.assign(X_ref)
+            dr = Function(R_space, name="delta_r").assign(0.0)
+            dz = Function(R_space, name="delta_z").assign(0.0)
+            da = Function(R_space, name="delta_a").assign(0.0)
+            xi = build_xi_diff(dr, dz, bump_fn, cos_th, sin_th, V_def,
+                               delta_a=da, d_hat_data=d_hat_data)
+            # no mesh movement — rotation uses reference phi
+            u_bar, _, _ = build_3d_background_flow_differentiable(
+                R_hat, H_hat, W_hat, G_val, mesh3d, tags, u_2d, p_2d,
+                X_ref=X_ref, xi=xi)
+            J = assemble(u_bar[comp]**2 * ds(tags["particle"], domain=mesh3d))
+            return (ReducedFunctional(J, [Control(dr), Control(dz), Control(da)]),
+                    make_m0())
+        return build
+
+    for ci, cn in enumerate(cart_comp_names):
+        for hi, hn in enumerate(ctrl_names):
+            ok1, ok2 = run_taylor(
+                f"J=∫{cn}²ds  [DiffFieldEval+rotation, no mesh move]  ctrl={hn}",
+                make_build_ubar_nomove(ci), make_h(hi))
+            results.append((f"G7 {cn} R1 {hn}", ok1))
+            results.append((f"G7 {cn} R2 {hn}", ok2))
+
+    # ══════════════════════════════════════════════════════════════════
+    #  SUMMARY
+    # ══════════════════════════════════════════════════════════════════
+    print(f"\n{'=' * 60}")
+    print("  SUMMARY")
+    print(f"{'=' * 60}")
+    n_pass = 0
     for name, ok in results:
         tag = "PASS" if ok else "FAIL"
         print(f"  [{tag}]  {name}")
+        if ok:
+            n_pass += 1
     print(f"\n  {n_pass} / {len(results)} tests passed")
 
-    if n_pass == len(results):
-        print("""
-  All tests pass.  This means:
-
-  - First derivatives of the AD chain (BuildXiBlock + mesh-deform +
-    DifferentiableFieldEvalBlock + form assembly) are correct.
-
-  - Second derivatives, in the form of Jhat.hessian(direction)
-    Hessian-vector products, are *also* correct: they are exactly
-    symmetric (Schwarz' theorem) and they match an independent
-    FD-of-AD-gradient construction to ~6 digits.
-
-  Practical consequence:  Newton on the Moore-Spence augmented
-  system for the particle force F_p can be built directly on top
-  of pyadjoint's hessian-action operator.  No FD workaround is
-  needed for second derivatives, no custom block is needed for
-  the Hessian path.
-""")
+    if n_pass < len(results):
+        print("\n  FAILED tests:")
+        for name, ok in results:
+            if not ok:
+                print(f"    - {name}")
 
     sys.exit(0 if n_pass == len(results) else 1)

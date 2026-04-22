@@ -1,5 +1,9 @@
+import os
+os.environ["OMP_NUM_THREADS"] = "1"
+
 from tqdm import tqdm
 import matplotlib.patches as patches
+import matplotlib.pyplot as plt
 from scipy.interpolate import RectBivariateSpline
 from scipy.optimize import root
 import os
@@ -10,12 +14,12 @@ import numpy as np
 import gc
 import sys
 from petsc4py import PETSc
+from firedrake import *
 
-from nondimensionalization import *
-from background_flow import *
-from build_3d_geometry_gmsh import *
-from perturbed_flow import *
-
+from nondimensionalization import first_nondimensionalisation
+from background_flow import background_flow, build_3d_background_flow
+from build_3d_geometry_gmsh import make_curved_channel_section_with_spherical_hole
+from perturbed_flow import perturbed_flow
 
 
 
@@ -233,10 +237,10 @@ class F_p_grid:
                 eq_type = "saddle"
                 color = "yellow"
             elif np.all(real_parts < 0):
-                eq_type = "stable"
+                eq_type = "attracting"
                 color = "green"
             elif np.all(real_parts > 0):
-                eq_type = "unstable"
+                eq_type = "repelling"
                 color = "red"
             else:
                 eq_type = "unclassified"
@@ -253,7 +257,7 @@ class F_p_grid:
         return classified_equilibria
 
 
-    def plot(self, L_c_p, L_c, initial_guesses=None, classified_equilibria=None):
+    def plot(self, initial_guesses=None, classified_equilibria=None):
 
         R_grid, Z_grid = np.meshgrid(self.r_vals, self.z_vals, indexing='ij')
 
@@ -301,41 +305,46 @@ class F_p_grid:
                 ax.scatter(guesses[:, 0], guesses[:, 1], c='red', marker='x', s=100, linewidths=2, label='Initial Guesses', zorder=20)
 
 
+        margin = self.eps
+        ax.set_xlim(-self.W / 2 - margin, self.W / 2 + margin)
+        ax.set_ylim(-self.H / 2 - margin, self.H / 2 + margin)
+        ax.set_aspect('equal')
+
         if classified_equilibria is not None:
 
-            plotted_types = set()
+            # Marker size s (in points²) so that displayed circle diameter = 2*a in data coords
+            fig.canvas.draw()
+            p1 = ax.transData.transform((0, 0))
+            p2 = ax.transData.transform((2 * self.a, 0))
+            diameter_pixels = abs(p2[0] - p1[0])
+            diameter_pts = diameter_pixels * 72.0 / fig.dpi
+            s = np.pi * (diameter_pts / 2) ** 2
+
+            legend_handles = {}
 
             for eq in classified_equilibria:
                 r_eq, z_eq = eq["x_eq"]
                 color = eq["color"]
                 eq_type = eq["type"]
 
-                label = None
-                if eq_type not in plotted_types:
-                    label = f"Equilibrium ({eq_type})"
-                    plotted_types.add(eq_type)
+                ax.scatter(r_eq, z_eq, c=color, marker='o', s=s, edgecolors='black', linewidths=1.5, zorder=30)
 
-                ax.scatter(r_eq, z_eq, c=color, marker='o', s=150, edgecolors='black', linewidths=1.5, label=label, zorder=30)
+                if eq_type not in legend_handles:
+                    legend_handles[eq_type] = plt.Line2D([0], [0], marker='o', color='w', markerfacecolor=color,
+                                                         markeredgecolor='black', markeredgewidth=1.5, markersize=8,
+                                                         label=f"Equilibrium ({eq_type})", linestyle='None')
 
-        ax.legend(loc='upper right', framealpha=1.0, fontsize='small')
-
-        margin = self.eps
-        ax.set_xlim(-self.W / 2 - margin, self.W / 2 + margin)
-        ax.set_ylim(-self.H / 2 - margin, self.H / 2 + margin)
-        ax.set_aspect('equal')
+            ax.legend(handles=list(legend_handles.values()), loc='upper right', framealpha=1.0, fontsize='small')
         ax.set_xlabel("r")
         ax.set_ylabel("z")
 
-        # Just for visualisation purposes
-        a = (L_c_p/L_c) * self.a
-        R = (L_c_p/L_c) * self.R
-        H = (L_c_p/L_c) * self.H
-        W = (L_c_p/L_c) * self.W
+        # All values are already in first-nondim units (L_c = H/2)
+        particle_maxh_rel = self.particle_maxh / self.a
 
-        ax.set_title(f"Force_Map_a={a:.5f}_R={R:.0f}_W={W:.0f}_H={H:.0f}_Re{self.Re_p/(a**2)}_N_grid={self.N_grid}_particle_maxh_rel={self.particle_maxh}")
+        ax.set_title(f"Force_Map_a={self.a:.5f}_R={self.R:.0f}_W={self.W:.0f}_H={self.H:.0f}_Re={self.Re_p:.1f}_N_grid={self.N_grid}_particle_maxh_rel={particle_maxh_rel:.2f}")
         plt.tight_layout()
-        filename = f"images/Force_Map_a={a:.5f}_R={R:.0f}_W={W:.0f}_H={H:.0f}_Re{self.Re_p/(a**2)}_N_grid={self.N_grid}_particle_maxh_rel={self.particle_maxh}.png"
-        os.makedirs("images", exist_ok=True)
+        filename = f"../images/Sweep_a=0.01_to_0.20_R=500_H=W=2_ss=0.0025/images/Force_Map_a={self.a:.5f}_R={self.R:.0f}_W={self.W:.0f}_H={self.H:.0f}_Re={self.Re_p:.1f}_N_grid={self.N_grid}_particle_maxh_rel={particle_maxh_rel:.2f}.png"
+        os.makedirs("../images/Sweep_a=0.01_to_0.20_R=500_H=W=2_ss=0.0025/images", exist_ok=True)
         plt.savefig(filename)
         print(f"Plot saved to {filename}")
         plt.show()
@@ -384,36 +393,34 @@ def force_grid(R, H, W, Q, rho, mu, a, N_grid, particle_maxh_rel, global_maxh_re
     else:
         if rank == 0:
             print("Calculating 2D background flow...")
-            R_hat, H_hat, W_hat, L_c, U_c, Re_calc = first_nondimensionalisation(R, H, W, Q, rho, mu, print_values=True)
+            R_hat, H_hat, W_hat, L_c, U_c, Re = first_nondimensionalisation(R, H, W, Q, rho, mu, print_values=True)
 
-            bg = background_flow(R_hat, H_hat, W_hat, Re_calc, comm=MPI.COMM_SELF)
-            G_hat, U_m_hat, u_bar_2d_hat, p_bar_2d_hat = bg.solve_2D_background_flow()
+            bg = background_flow(R_hat, H_hat, W_hat, Re, comm=MPI.COMM_SELF)
+            G_hat, U_m_hat, u_bar_2d, p_bar_2d = bg.solve_2D_background_flow()
 
-            R_hat_hat, H_hat_hat, W_hat_hat, a_hat_hat, G_hat_hat, L_c_p, U_c_p, u_bar_2d_hat_hat, p_bar_2d_hat_hat, Re_p = second_nondimensionalisation(
-                R_hat, H_hat, W_hat, a, L_c, U_c, G_hat, Re_calc, u_bar_2d_hat, p_bar_2d_hat, U_m_hat)
+            a_hat = a / L_c
 
-            u_bar_2d_hat_hat_np = u_bar_2d_hat_hat.dat.data_ro.copy()
-            p_bar_2d_hat_hat_np = p_bar_2d_hat_hat.dat.data_ro.copy()
+            u_data_np = u_bar_2d.dat.data_ro.copy()
+            p_data_np = p_bar_2d.dat.data_ro.copy()
 
-            # Alle Parameter speichern, damit wir F_p_grid später aus dem Cache aufbauen können
             params = {
-                'R_hat_hat': R_hat_hat, 'H_hat_hat': H_hat_hat, 'W_hat_hat': W_hat_hat,
-                'a_hat_hat': a_hat_hat, 'G_hat_hat': G_hat_hat, 'Re_p': Re_p,
-                'L_c': L_c, 'L_c_p': L_c_p,
-                'L': 4 * max(H_hat_hat, W_hat_hat),
-                'particle_maxh': particle_maxh_rel * a_hat_hat,
-                'global_maxh': global_maxh_rel * min(H_hat_hat, W_hat_hat),
-                'eps': eps_rel * a_hat_hat
+                'R': R_hat, 'H': H_hat, 'W': W_hat,
+                'a': a_hat, 'G': G_hat, 'Re': Re,
+                'L_c': L_c,
+                'L': 4 * max(H_hat, W_hat),
+                'particle_maxh': particle_maxh_rel * a_hat,
+                'global_maxh': global_maxh_rel * min(H_hat, W_hat),
+                'eps': eps_rel * a_hat
             }
             print("Background flow calculation done. Broadcasting data...")
         else:
             params = None
-            u_bar_2d_hat_hat_np = None
-            p_bar_2d_hat_hat_np = None
+            u_data_np = None
+            p_data_np = None
 
         params = comm.bcast(params, root=0)
-        u_data_np = comm.bcast(u_bar_2d_hat_hat_np, root=0)
-        p_data_np = comm.bcast(p_bar_2d_hat_hat_np, root=0)
+        u_data_np = comm.bcast(u_data_np, root=0)
+        p_data_np = comm.bcast(p_data_np, root=0)
 
         if rank == 0:
             print("Starting parallel force grid calculation...")
@@ -423,8 +430,8 @@ def force_grid(R, H, W, Q, rho, mu, a, N_grid, particle_maxh_rel, global_maxh_re
 
         # F_p_grid für die echte Berechnung instanziieren
         f_grid_calc = F_p_grid(
-            params['R_hat_hat'], params['H_hat_hat'], params['W_hat_hat'],
-            params['a_hat_hat'], params['G_hat_hat'], params['Re_p'],
+            params['R'], params['H'], params['W'],
+            params['a'], params['G'], params['Re'],
             params['L'], params['particle_maxh'], params['global_maxh'], params['eps']
         )
 
@@ -464,8 +471,8 @@ def force_grid(R, H, W, Q, rho, mu, a, N_grid, particle_maxh_rel, global_maxh_re
         print("Running analysis (interpolation, equilibria, plot)...")
 
         f_grid = F_p_grid(
-            params['R_hat_hat'], params['H_hat_hat'], params['W_hat_hat'],
-            params['a_hat_hat'], params['G_hat_hat'], params['Re_p'],
+            params['R'], params['H'], params['W'],
+            params['a'], params['G'], params['Re'],
             params['L'], params['particle_maxh'], params['global_maxh'], params['eps']
         )
 
@@ -479,8 +486,7 @@ def force_grid(R, H, W, Q, rho, mu, a, N_grid, particle_maxh_rel, global_maxh_re
         initial_guesses = f_grid.generate_initial_guesses()
         classified_equilibria = f_grid.classify_equilibria_on_grid(initial_guesses)
 
-        f_grid.plot(params['L_c_p'], params['L_c'],
-                    classified_equilibria=classified_equilibria)
+        f_grid.plot(classified_equilibria=classified_equilibria)
 
         R_grid, Z_grid = np.meshgrid(r_vals, z_vals, indexing='ij')
 
@@ -522,7 +528,7 @@ def auto_start_mpi(n_procs=5):
 
 if __name__ == "__main__":
 
-    auto_start_mpi()
+    auto_start_mpi(4)
 
     from config_paper_parameters import *
 
