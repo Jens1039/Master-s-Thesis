@@ -23,8 +23,8 @@ def first_nondimensionalisation(R, H, W, Q, rho, mu, print_values=False):
         print("R_hat = ", R_hat)
         print("H_hat = ", H_hat)
         print("W_hat = ", W_hat)
-        print("L_c = ", L_c)
-        print("U_c = ", U_c)
+        # print("L_c = ", L_c)
+        # print("U_c = ", U_c)
         print("Re = ", Re)
 
     return R_hat, H_hat, W_hat, L_c, U_c, Re
