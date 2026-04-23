@@ -161,23 +161,6 @@ def estimate_eigenvectors(J):
 
 
 class XiHatBlock(Block):
-    """Tape-aware mesh deformation  xi = f(delta_r, delta_z, delta_a).
-
-    The map is LINEAR in the three R-space controls:
-        xi[n, 0] = (delta_r · cos_th + delta_a · d_hat[n, 0]) · bump[n]
-        xi[n, 1] = (delta_r · sin_th + delta_a · d_hat[n, 1]) · bump[n]
-        xi[n, 2] = (delta_z           + delta_a · d_hat[n, 2]) · bump[n]
-
-    Because the map is linear, the second derivative vanishes: the Hessian
-    component is simply the adjoint applied to the second-order seed.
-
-    This replaces ``xi.interpolate(as_vector([...]))`` which puts an
-    InterpolateBlock on the tape.  That block's Hessian path crashes in
-    pyadjoint/UFL when the expression mixes R-space Functions with CG1
-    expressions (BaseFormOperatorDerivative Sum bug).
-
-    Dependencies: idx 0 = delta_r, idx 1 = delta_z, idx 2 = delta_a.
-    """
 
     def __init__(self, delta_r, delta_z, delta_a, xi_out,
                  cos_th, sin_th, bump_data, d_hat_data, V_def):
@@ -277,12 +260,25 @@ def _build_xi_hat(delta_r, delta_z, delta_a, md):
     return xi
 
 
-def evaluate_forces_hat(delta_r_hat, delta_z_hat, delta_a_hat, mesh_data, compute_jacobian=True):
-    """Evaluate particle forces in hat coordinates with AD Jacobian.
+def evaluate_forces(delta_r_hat, delta_z_hat, delta_a_hat, mesh_data, *, jacobian=True, hessian_phi=None):
+    """Evaluate particle forces in hat coordinates with AD derivatives.
 
-    Returns F (2-vector) if compute_jacobian=False,
-    or (F, J) where J is (2x3) if compute_jacobian=True.
-    J columns: [dF/d(delta_r), dF/d(delta_z), dF/d(delta_a)].
+    Parameters
+    ----------
+    jacobian : bool
+        If False, return only F.
+    hessian_phi : array-like (2,) or None
+        If given, also compute d(J·phi)/dx via Hessian-vector products.
+
+    Returns
+    -------
+    F                              if jacobian=False
+    (F, J)                         if jacobian=True,  hessian_phi=None
+    (F, J, dJphi_dx)               if jacobian=True,  hessian_phi given
+
+    F        : (2,)  forces (F_x, F_z)
+    J        : (2,3) Jacobian [dF/d(delta_r), dF/d(delta_z), dF/d(delta_a)]
+    dJphi_dx : (2,3) d/dx_k [(J·phi)_i] from H_i · phi_extended
     """
 
     set_working_tape(Tape())
@@ -320,79 +316,11 @@ def evaluate_forces_hat(delta_r_hat, delta_z_hat, delta_a_hat, mesh_data, comput
     F_p_x, F_p_z = pf.F_p()
     F = np.array([float(F_p_x), float(F_p_z)])
 
-    if not compute_jacobian:
+    if not jacobian:
         stop_annotating()
         get_working_tape().clear_tape()
         gc.collect()
         return F
-
-    c_r = Control(delta_r)
-    c_z = Control(delta_z)
-    c_a = Control(delta_a)
-
-    Jhat_x = ReducedFunctional(F_p_x, [c_r, c_z, c_a])
-    Jhat_z = ReducedFunctional(F_p_z, [c_r, c_z, c_a])
-
-    dFx = Jhat_x.derivative()
-    dFz = Jhat_z.derivative()
-
-    J = np.zeros((2, 3))
-    for j in range(3):
-        J[0, j] = float(dFx[j].dat.data_ro[0])
-        J[1, j] = float(dFz[j].dat.data_ro[0])
-
-    stop_annotating()
-    get_working_tape().clear_tape()
-    gc.collect()
-    return F, J
-
-
-def evaluate_forces_jac_hessian_hat(delta_r_hat, delta_z_hat, delta_a_hat, mesh_data, phi):
-    """Evaluate F, J, and d(J·phi)/dx via reverse + Hessian-vector AD.
-
-    For each force component F_i (i = x, z), pyadjoint's Hessian-vector
-    product H_i · m_dot with m_dot = (phi[0], phi[1], 0) evaluates to
-        d/dx [ sum_j dF_i/dx_j · phi_j ] = d/dx [ (J·phi)_i ]
-    which is exactly the column-block dG2/dx that Moore-Spence needs,
-    without any finite differences.
-
-    Returns
-    -------
-    F        : (2,)  forces (F_x, F_z)
-    J        : (2,3) Jacobian [dF/d(delta_r), dF/d(delta_z), dF/d(delta_a)]
-    dJphi_dx : (2,3) entries d/dx_k [(J·phi)_i] from H_i · phi_extended.
-               Rows = force components, cols = [d/dr, d/dz, d/da].
-    """
-
-    set_working_tape(Tape())
-    continue_annotation()
-
-    md = mesh_data
-    mesh3d = md['mesh3d']
-    R_space = FunctionSpace(mesh3d, "R", 0)
-
-    delta_r = Function(R_space, name="delta_r").assign(delta_r_hat)
-    delta_z = Function(R_space, name="delta_z").assign(delta_z_hat)
-    delta_a = Function(R_space, name="delta_a").assign(delta_a_hat)
-
-    xi = _build_xi_hat(delta_r, delta_z, delta_a, md)
-    mesh3d.coordinates.assign(md['X_ref'] + xi)
-    check_mesh_quality(mesh3d, ref_signs=md['ref_signs'])
-
-    u_bar_3d, p_bar_3d, u_cyl_3d = build_3d_background_flow_differentiable(
-        md['R_hat'], md['H_hat'], md['W_hat'], md['G_hat'],
-        mesh3d, md['tags'], md['u_bar_2d_hat'], md['p_bar_tilde_2d_hat'],
-        X_ref=md['X_ref'], xi=xi)
-
-    # Tape-connected total radius (see evaluate_forces_hat for rationale).
-    pf = perturbed_flow_differentiable(
-        md['R_hat'], md['H_hat'], md['W_hat'], md['L_hat'],
-        (md['a_hat_init'], delta_a), md['Re'],
-        mesh3d, md['tags'], u_bar_3d, p_bar_3d,
-        md['X_ref'], xi, u_cyl_3d)
-
-    F_p_x, F_p_z = pf.F_p()
-    F = np.array([float(F_p_x), float(F_p_z)])
 
     c_r = Control(delta_r)
     c_z = Control(delta_z)
@@ -402,15 +330,22 @@ def evaluate_forces_jac_hessian_hat(delta_r_hat, delta_z_hat, delta_a_hat, mesh_
     rf_x = ReducedFunctional(F_p_x, controls)
     rf_z = ReducedFunctional(F_p_z, controls)
 
-    # First-order: full Jacobian via reverse AD
     dFx = rf_x.derivative()
     dFz = rf_z.derivative()
+
     J = np.zeros((2, 3))
     for j in range(3):
         J[0, j] = float(dFx[j].dat.data_ro[0])
         J[1, j] = float(dFz[j].dat.data_ro[0])
 
+    if hessian_phi is None:
+        stop_annotating()
+        get_working_tape().clear_tape()
+        gc.collect()
+        return F, J
+
     # Hessian-vector seed: phi extended with 0 for the a-direction
+    phi = hessian_phi
     phi_r_fn = Function(R_space).assign(float(phi[0]))
     phi_z_fn = Function(R_space).assign(float(phi[1]))
     phi_a_fn = Function(R_space).assign(0.0)
@@ -436,22 +371,24 @@ def evaluate_forces_jac_hessian_hat(delta_r_hat, delta_z_hat, delta_a_hat, mesh_
     return F, J, dJphi_dx
 
 
+def _ms_trial(dr_init, dz_init, da_init, phi_start, l_vec, md, r_ref, z_ref, a_ref, L_c, tol, max_iter):
+    """Single Moore-Spence trial with a given starting phi.
 
-def _ms_trial_ad(dr_init, dz_init, da_init, phi_start, l_vec, md, r_ref, z_ref, a_ref, L_c, tol, max_iter):
-    """Single Moore-Spence trial with a given starting phi (AD Hessian, TR+LM).
-    Returns (r, z, a, phi, converged, final_residual)."""
+    Uses trust-region with backtracking (shrink Delta on reject).
+    Returns (r, z, a, phi, converged, final_residual).
+    """
 
     dr, dz, da = float(dr_init), float(dz_init), float(da_init)
     phi = phi_start.copy()
-    Delta, Delta_max = 1e-3, 1.0
+    Delta, Delta_max = 1e-2, 1.0
     eta_accept, eta_good = 0.1, 0.75
     res = float('inf')
 
     for k in range(max_iter):
 
         # All entries of DG via AD: 1 forward + 2 reverse + 2 H·v
-        F_base, J_full, dJphi_dx = evaluate_forces_jac_hessian_hat(
-            dr, dz, da, md, phi)
+        F_base, J_full, dJphi_dx = evaluate_forces(
+            dr, dz, da, md, hessian_phi=phi)
         J_sp = J_full[:, :2]
         dF_da = J_full[:, 2]
 
@@ -462,12 +399,12 @@ def _ms_trial_ad(dr_init, dz_init, da_init, phi_start, l_vec, md, r_ref, z_ref, 
         res = np.linalg.norm(G)
 
         eigs = np.linalg.eigvals(J_sp)
-        eig_min = eigs[np.argmin(np.abs(eigs))]
+        eigenvalue = eigs[np.argmin(np.abs(eigs))]
         r_cur, z_cur, a_cur = r_ref + dr, z_ref + dz, a_ref + da
         print(f"\n  Iter {k:2d} | r = {r_cur:+.8f}  z = {z_cur:+.8f}  a = {a_cur:.8f}")
         print(f"         | |G| = {res:.4e}  |F| = {np.linalg.norm(G1):.4e}"
               f"  |J*phi| = {np.linalg.norm(G2):.4e}"
-              f"  eig_min = {eig_min:+.4e}")
+              f"  eigenvalue = {eigenvalue:+.4e}")
 
         if res < tol:
             a_phys = a_cur * L_c
@@ -476,7 +413,7 @@ def _ms_trial_ad(dr_init, dz_init, da_init, phi_start, l_vec, md, r_ref, z_ref, 
             print(f"     z_off_hat = {z_cur:.10f}")
             print(f"     a_hat     = {a_cur:.10f}  (a = {a_phys * 1e6:.4f} um)")
             print(f"     phi       = ({phi[0]:.8f}, {phi[1]:.8f})")
-            print(f"     sigma_min = {sv.min():.6e}")
+            print(f"     eigenvalue = {eigenvalue:+.6e}")
             return r_cur, z_cur, a_cur, phi, True, res
 
         # Assemble DG (5x5) — every block from AD
@@ -489,30 +426,22 @@ def _ms_trial_ad(dr_init, dz_init, da_init, phi_start, l_vec, md, r_ref, z_ref, 
         DG[2:4, 3:5] = J_sp                # dG2/dphi
         DG[4, 3:5]   = l_vec               # dG3/dphi
 
-        D = np.ones(5)
-        DG_s = DG.copy()
-
         cond_DG = np.linalg.cond(DG)
-        cond_DG_s = np.linalg.cond(DG_s)
         print(f"         | cond(DG) = {cond_DG:.2e}")
 
-        if cond_DG_s > 1e14:
+        if cond_DG > 1e14:
             print("  !! DG ill-conditioned — aborting.")
             return r_cur, z_cur, a_cur, phi, False, res
 
         try:
-            dy_s = np.linalg.solve(DG_s, -G)
+            dy = np.linalg.solve(DG, -G)
         except np.linalg.LinAlgError:
             print("  !! DG singular — aborting.")
             return r_cur, z_cur, a_cur, phi, False, res
 
-        dy = dy_s / D
-
         print(f"         | step: dr={dy[0]:+.4e}  dz={dy[1]:+.4e}  da={dy[2]:+.4e}")
 
-        # ── Trust-region globalization with LM fallback ──
-        # dy_s is the equilibrated step (dimensionless after column scaling).
-        # The TR radius Delta is measured in this scaled space.
+        # ── Helper: evaluate |G| at a candidate step (cheap: only F and J) ──
 
         def _eval_step(dy_candidate):
             dr_t = dr + dy_candidate[0]
@@ -522,71 +451,21 @@ def _ms_trial_ad(dr_init, dz_init, da_init, phi_start, l_vec, md, r_ref, z_ref, 
             if a_ref + da_t <= 0:
                 return float('nan'), False
             try:
-                F_t, J_t = evaluate_forces_hat(dr_t, dz_t, da_t, md)
+                F_t, J_t = evaluate_forces(dr_t, dz_t, da_t, md)
                 G_t = np.concatenate([F_t, J_t[:, :2] @ phi_t,
                                       [np.dot(l_vec, phi_t) - 1.0]])
                 return float(np.linalg.norm(G_t)), True
             except MeshFlippedError:
                 return float('nan'), False
 
-        '''
-        step_norm_s = np.linalg.norm(dy_s)
-        if step_norm_s > Delta:
-            dy_s_try = dy_s * (Delta / step_norm_s)
-            dy_try = dy_s_try / D
-            print(f"         | TR: step clipped {step_norm_s:.4e} -> {Delta:.4e}"
-                  f"  (dr={dy_try[0]:+.4e}  dz={dy_try[1]:+.4e}  da={dy_try[2]:+.4e})")
-        else:
-            dy_try = dy_s / D
-        '''
+        def _compute_rho(dy_try, res_try, step_ok):
+            G_pred = G + DG @ dy_try
+            pred = res**2 - np.linalg.norm(G_pred)**2
+            if step_ok and abs(pred) > 1e-30:
+                return (res**2 - res_try**2) / pred
+            return -1.0 if not step_ok else (1.0 if res_try <= res else -1.0)
 
-        step_norm_phys = np.linalg.norm(dy[:3])  # nur r, z, a
-        if step_norm_phys > Delta:
-            dy_try = dy * (Delta / step_norm_phys)
-            print(f"         | TR: physical step clipped {step_norm_phys:.4e} -> {Delta:.4e}")
-        else:
-            dy_try = dy.copy()
-
-        # Predicted reduction from the linear model
-        G_pred = G + DG @ dy_try
-        pred = res**2 - np.linalg.norm(G_pred)**2
-
-        # Evaluate actual reduction of the Newton step
-        res_try, step_ok = _eval_step(dy_try)
-        if step_ok:
-            ared = res**2 - res_try**2
-            rho = ared / pred if abs(pred) > 1e-30 else (1.0 if ared >= 0 else -1.0)
-        else:
-            rho = -1.0
-
-        print(f"         | TR: |G_try|={res_try if step_ok else float('nan'):.4e}"
-              f"  rho={rho:+.4f}  Delta={Delta:.4e}")
-
-        accepted = (rho >= eta_accept and step_ok)
-
-        # Optional LM fallback when the Newton step is rejected
-        if not accepted:
-            # Normal equations (DG_s^T DG_s + lam*I) dy_s = -DG_s^T G
-            # always yield a descent direction for |G|^2.
-            lam = 1e-6 * np.linalg.norm(DG_s)**2
-            for _lm_it in range(8):
-                A = DG_s.T @ DG_s + lam * np.eye(5)
-                b = -DG_s.T @ G
-                try:
-                    dy_s_lm = np.linalg.solve(A, b)
-                except np.linalg.LinAlgError:
-                    lam *= 10.0
-                    continue
-                dy_lm = dy_s_lm / D
-                res_lm, ok_lm = _eval_step(dy_lm)
-                if ok_lm and res_lm < res:
-                    print(f"         | LM(lam={lam:.2e}): |G_try|={res_lm:.4e}  ACCEPTED")
-                    dy_try = dy_lm
-                    res_try = res_lm
-                    accepted = True
-                    break
-                print(f"         | LM(lam={lam:.2e}): |G_try|={res_lm:.4e}  reject")
-                lam *= 10.0
+        accepted, dy_try, rho, Delta = _globalize_tr(dy, Delta, eta_accept, eta_good, Delta_max, _eval_step, _compute_rho)
 
         if accepted:
             dr += dy_try[0]
@@ -594,15 +473,9 @@ def _ms_trial_ad(dr_init, dz_init, da_init, phi_start, l_vec, md, r_ref, z_ref, 
             da += dy_try[2]
             phi_new = phi + dy_try[3:5]
             phi = phi_new / np.dot(l_vec, phi_new)
-            print(f"         | TR: step ACCEPTED")
+            print(f"         | step ACCEPTED")
         else:
-            print(f"         | TR: step REJECTED (TR + all LM attempts failed)")
-
-        # Update trust-region radius based on Newton rho
-        if rho < 0.25:
-            Delta = max(Delta * 0.25, 1e-8)
-        elif rho > eta_good and step_norm_phys >= 0.95 * Delta:
-            Delta = min(Delta * 2.0, Delta_max)
+            print(f"         | step REJECTED")
 
         gc.collect()
 
@@ -610,8 +483,43 @@ def _ms_trial_ad(dr_init, dz_init, da_init, phi_start, l_vec, md, r_ref, z_ref, 
     return r_cur, z_cur, a_cur, phi, False, res
 
 
-def moore_spence_solve_hat_ad(r_off_hat_eq, z_off_hat_eq, a_hat_init, shared_data, *, tol=1e-8, max_iter=20, md=None,
-                               dr_init=0.0, dz_init=0.0, da_init=0.0):
+def _globalize_tr(dy, Delta, eta_accept, eta_good, Delta_max, _eval_step, _compute_rho):
+    """Trust-region with backtracking: shrink Delta until step is accepted.
+
+    The Newton direction dy is computed once (expensive).  The inner loop
+    only clips and re-evaluates (cheap: only F and J per attempt).
+    Returns (accepted, dy_try, rho, Delta_updated).
+    """
+
+    for attempt in range(20):
+        step_norm_phys = np.linalg.norm(dy[:3])
+        at_boundary = step_norm_phys > Delta
+        if at_boundary:
+            dy_try = dy * (Delta / step_norm_phys)
+        else:
+            dy_try = dy.copy()
+
+        res_try, step_ok = _eval_step(dy_try)
+        rho = _compute_rho(dy_try, res_try, step_ok)
+
+        print(f"         | TR-BT attempt {attempt}: |G_try|={res_try if step_ok else float('nan'):.4e}"
+              f"  rho={rho:+.4f}  Delta={Delta:.4e}")
+
+        if rho >= eta_accept and step_ok:
+            if rho > eta_good and at_boundary:
+                Delta = min(Delta * 2.0, Delta_max)
+            return True, dy_try, rho, Delta
+
+        Delta *= 0.5
+        if Delta < 1e-12:
+            print("         | TR-BT: Delta too small — giving up.")
+            break
+
+    return False, dy.copy(), -1.0, Delta
+
+
+def moore_spence_solve(r_off_hat_eq, z_off_hat_eq, a_hat_init, shared_data, *, tol=1e-12, max_iter=20, md=None,
+                       dr_init=0.0, dz_init=0.0, da_init=0.0):
 
     R_hat, H_hat, W_hat, L_c, U_c, Re, G_hat, U_m_hat, u_2d, p_2d = shared_data
     r_ref = float(r_off_hat_eq) - float(dr_init)
@@ -622,35 +530,33 @@ def moore_spence_solve_hat_ad(r_off_hat_eq, z_off_hat_eq, a_hat_init, shared_dat
         md = setup_moving_mesh_hat(r_ref, z_ref, a_ref, R_hat, H_hat, W_hat,
                                    Re, G_hat, U_m_hat, u_2d, p_2d)
 
-    F0, J0_full = evaluate_forces_hat(float(dr_init), float(dz_init), float(da_init), md)
+    F0, J0_full = evaluate_forces(float(dr_init), float(dz_init), float(da_init), md)
     eigpairs = estimate_eigenvectors(J0_full[:, :2])
 
-    results = []
-    for trial_idx, (mu, phi_ev) in enumerate(eigpairs):
-        l_vec = phi_ev.copy()
-        phi_start = phi_ev / np.dot(l_vec, phi_ev)
+    # The eigenvector to the smallest-magnitude eigenvalue is the natural
+    # starting guess: that eigenvalue is closest to zero and will cross
+    # zero at the bifurcation point.
+    mu, phi_ev = eigpairs[0]
+    l_vec = phi_ev.copy()
+    phi_start = phi_ev / np.dot(l_vec, phi_ev)
 
-        print("\n" + "=" * 65)
-        print(f"  MOORE-SPENCE AD — trial {trial_idx+1}/{len(eigpairs)}"
-              f"  mu={mu:+.4e}  phi=({phi_ev[0]:+.4f}, {phi_ev[1]:+.4f})")
-        print(f"  Start: r={r_off_hat_eq:.6f} z={z_off_hat_eq:.6f} a={a_hat_init:.6f}")
-        print("=" * 65)
+    print("\n" + "=" * 65)
+    print(f"  MOORE-SPENCE (TR)"
+          f"  mu={mu:+.4e}  phi=({phi_ev[0]:+.4f}, {phi_ev[1]:+.4f})")
+    print(f"  Start: r={r_off_hat_eq:.6f} z={z_off_hat_eq:.6f} a={a_hat_init:.6f}")
+    print("=" * 65)
 
-        result = _ms_trial_ad(float(dr_init), float(dz_init), float(da_init),
-                              phi_start, l_vec, md, r_ref, z_ref, a_ref, L_c, tol, max_iter)
-        results.append(result)
-
-    converged = [r for r in results if r[4]]
-    best = min(converged, key=lambda x: x[5]) if converged else min(results, key=lambda x: x[5])
-    r_bif, z_bif, a_bif, phi_bif, ok, final_res = best
+    r_bif, z_bif, a_bif, phi_bif, ok, final_res = _ms_trial(
+        float(dr_init), float(dz_init), float(da_init),
+        phi_start, l_vec, md, r_ref, z_ref, a_ref, L_c, tol, max_iter)
 
     print(f"\n  {'=' * 50}")
-    print(f"  Best: converged={ok}  |G|={final_res:.4e}  a={a_bif:.8f}")
+    print(f"  converged={ok}  |G|={final_res:.4e}  a={a_bif:.8f}")
     print(f"  {'=' * 50}")
     return r_bif, z_bif, a_bif, phi_bif, ok
 
 
-def newton_root_refine_hat(r_off_hat_init, z_off_hat_init, a_hat, shared_data, *, tol=1e-12, max_iter=15):
+def newton_root_refine(r_off_hat_init, z_off_hat_init, a_hat, shared_data, *, tol=1e-12, max_iter=15):
 
     print("\n" + "=" * 65)
     print(f"  Newton Root Refinement (a_hat = {a_hat:.6f})")
@@ -663,7 +569,7 @@ def newton_root_refine_hat(r_off_hat_init, z_off_hat_init, a_hat, shared_data, *
     dr, dz = 0.0, 0.0
 
     for k in range(max_iter):
-        F, J_full = evaluate_forces_hat(dr, dz, 0.0, md)
+        F, J_full = evaluate_forces(dr, dz, 0.0, md)
         J = J_full[:, :2]
 
         res = np.linalg.norm(F)
@@ -681,9 +587,8 @@ def newton_root_refine_hat(r_off_hat_init, z_off_hat_init, a_hat, shared_data, *
         alpha = 1.0
         for ls in range(10):
             try:
-                F_try = evaluate_forces_hat(
-                    dr + alpha * dx_n[0], dz + alpha * dx_n[1], 0.0,
-                    md, compute_jacobian=False)
+                F_try = evaluate_forces(dr + alpha * dx_n[0], dz + alpha * dx_n[1], 0.0,
+                                            md, jacobian=False)
             except MeshFlippedError:
                 print(f"         | line search: flipped elements at alpha={alpha:.4e}, halving")
                 alpha *= 0.5
@@ -697,19 +602,19 @@ def newton_root_refine_hat(r_off_hat_init, z_off_hat_init, a_hat, shared_data, *
 
         gc.collect()
 
-    raise RuntimeError(
-        f"Newton refinement did not converge at a_hat = {a_hat} "
-        f"after {max_iter} iterations (|F| = {res:.4e})."
-    )
+    r_cur = r_off_hat_init + dr
+    z_cur = z_off_hat_init + dz
+    print(f"  WARNING: Newton refinement did not converge at a_hat = {a_hat} "
+          f"after {max_iter} iterations (|F| = {res:.4e}). Continuing anyway.")
+    return r_cur, z_cur, md, dr, dz
 
 
 if __name__ == "__main__":
 
     # Initial guess from the bifurcation diagramm
-    r_off_hat_init = 0.6098
-    z_off_hat_init = 0.0274
-    a_hat_start = 0.1375
-
+    r_off_hat_init = 0.6135
+    z_off_hat_init = 0.0026
+    a_hat_start = 0.1325
 
     R_hat, H_hat, W_hat, L_c, U_c, Re = first_nondimensionalisation(R, H, W, Q, rho, mu, print_values=True)
 
@@ -722,170 +627,13 @@ if __name__ == "__main__":
     shared_data = (R_hat, H_hat, W_hat, L_c, U_c, Re, G_hat, U_m_hat, u_bar_2d_hat, p_bar_tilde_2d_hat)
 
     # refine initial guess to ensure starting MS with a root
-    r_hat, z_hat, md_newton, dr_newton, dz_newton = newton_root_refine_hat(r_off_hat_init, z_off_hat_init, a_hat_start, shared_data,
+    r_hat, z_hat, md_newton, dr_newton, dz_newton = newton_root_refine(r_off_hat_init, z_off_hat_init, a_hat_start, shared_data,
                                                                             tol=1e-12, max_iter=15)
 
-    # ══════════════════════════════════════════════════════════════════
-    #  DIAGNOSTIC MOORE-SPENCE: manual iteration with full diagnostics
-    #  Remove this block and replace with moore_spence_solve_hat_ad()
-    #  once convergence is understood.
-    # ══════════════════════════════════════════════════════════════════
+    r_bif, z_bif, a_bif, phi_bif, converged = moore_spence_solve(r_hat, z_hat, a_hat_start, shared_data,
+                                                md=md_newton, dr_init=dr_newton, dz_init=dz_newton, da_init=0.0)
 
-    md = md_newton
-    r_ref = r_hat - dr_newton
-    z_ref = z_hat - dz_newton
-    a_ref = a_hat_start
-
-    F0, J0_full = evaluate_forces_hat(dr_newton, dz_newton, 0.0, md)
-    eigpairs = estimate_eigenvectors(J0_full[:, :2])
-
-    for trial_idx, (mu_start, phi_ev) in enumerate(eigpairs):
-        l_vec = phi_ev.copy()
-        phi = phi_ev / np.dot(l_vec, phi_ev)
-        dr, dz, da = float(dr_newton), float(dz_newton), 0.0
-
-        print("\n" + "=" * 70)
-        print(f"  DIAGNOSTIC MS — trial {trial_idx+1}/{len(eigpairs)}"
-              f"  mu={mu_start:+.4e}  phi=({phi_ev[0]:+.4f}, {phi_ev[1]:+.4f})")
-        print("=" * 70)
-
-        MS_MAX_ITER = 10
-        Delta = 1e-2
-        for k in range(MS_MAX_ITER):
-            F_base, J_full, dJphi_dx = evaluate_forces_jac_hessian_hat(dr, dz, da, md, phi)
-            J_sp = J_full[:, :2]
-            dF_da = J_full[:, 2]
-            G1 = F_base
-            G2 = J_sp @ phi
-            G3_val = np.dot(l_vec, phi) - 1.0
-            G = np.concatenate([G1, G2, [G3_val]])
-            res = np.linalg.norm(G)
-            r_cur, z_cur, a_cur = r_ref + dr, z_ref + dz, a_ref + da
-
-            print(f"\n  Iter {k:2d} | r={r_cur:+.8f} z={z_cur:+.8f} a={a_cur:.8f}")
-            print(f"         | |G|={res:.4e}  F_x={G1[0]:+.4e}  F_z={G1[1]:+.4e}")
-            print(f"         | (J*phi)_x={G2[0]:+.4e}  (J*phi)_z={G2[1]:+.4e}")
-
-            dr_n, dz_n = dr, dz
-            for nit in range(10):
-                F_n, J_n = evaluate_forces_hat(dr_n, dz_n, da, md)
-                if np.linalg.norm(F_n) < 1e-12: break
-                try:
-                    dx = np.linalg.solve(J_n[:, :2], -F_n)
-                    dr_n += dx[0]; dz_n += dx[1]
-                except np.linalg.LinAlgError: break
-            print(f"         | DIAG1: Newton root at a={a_cur:.6f}: "
-                  f"r={r_ref+dr_n:+.8f} z={z_ref+dz_n:+.8f}  "
-                  f"|F|={np.linalg.norm(F_n):.4e}  "
-                  f"dist=({dr_n-dr:+.4e}, {dz_n-dz:+.4e})")
-
-            eig_vals, eig_vecs = np.linalg.eig(J_sp)
-            idx_sort = np.argsort(np.abs(eig_vals))
-            v_null = eig_vecs[:, idx_sort[0]].real
-            v_null = v_null / np.linalg.norm(v_null)
-            cos_ang = min(abs(np.dot(phi / np.linalg.norm(phi), v_null)), 1.0)
-            angle_deg = np.degrees(np.arccos(cos_ang))
-            print(f"         | DIAG2: eigs(J_sp) = [{eig_vals[idx_sort[0]].real:+.4e}, "
-                  f"{eig_vals[idx_sort[1]].real:+.4e}]")
-            print(f"         |        v_null = ({v_null[0]:+.4f}, {v_null[1]:+.4f})  "
-                  f"phi = ({phi[0]:+.4f}, {phi[1]:+.4f})  "
-                  f"angle(phi, v_null) = {angle_deg:.2f} deg")
-
-            try:
-                newton_step_F = np.linalg.solve(J_sp, -F_base)
-                print(f"         | DIAG4: F-Newton step: dr={newton_step_F[0]:+.4e} "
-                      f"dz={newton_step_F[1]:+.4e} |step|={np.linalg.norm(newton_step_F):.4e}")
-            except np.linalg.LinAlgError:
-                print(f"         | DIAG4: F-Newton step: J_sp singular")
-
-            DG = np.zeros((5, 5))
-            DG[0:2, 0:2] = J_sp;  DG[0:2, 2] = dF_da
-            DG[2:4, 0] = dJphi_dx[:, 0];  DG[2:4, 1] = dJphi_dx[:, 1];  DG[2:4, 2] = dJphi_dx[:, 2]
-            DG[2:4, 3:5] = J_sp;  DG[4, 3:5] = l_vec
-
-
-            D = np.ones(5)
-            DG_s = DG / D[np.newaxis, :]
-
-            print(f"         | cond(DG)={np.linalg.cond(DG):.2e}  "
-                  f"cond(DG_s)={np.linalg.cond(DG_s):.2e}")
-
-            try:
-                dy = np.linalg.solve(DG_s, -G) / D
-            except np.linalg.LinAlgError:
-                print("  !! DG singular"); break
-
-            print(f"         | MS step: dr={dy[0]:+.4e} dz={dy[1]:+.4e} "
-                  f"da={dy[2]:+.4e} dphi=({dy[3]:+.4e}, {dy[4]:+.4e})")
-
-            print(f"         | DG matrix:")
-            for row in range(5):
-                print(f"         |   [{' '.join(f'{DG[row,j]:+10.4e}' for j in range(5))}]")
-
-            Delta_max = 1.0
-            eta_accept, eta_good = 0.1, 0.75
-
-            def _eval_step_diag(dy_c):
-                phi_t = phi + dy_c[3:5]
-                if a_ref + da + dy_c[2] <= 0: return float('nan'), False, None
-                try:
-                    F_t, J_t = evaluate_forces_hat(dr+dy_c[0], dz+dy_c[1], da+dy_c[2], md)
-                    G_t = np.concatenate([F_t, J_t[:,:2] @ phi_t, [np.dot(l_vec, phi_t)-1.0]])
-                    return float(np.linalg.norm(G_t)), True, G_t
-                except MeshFlippedError:
-                    return float('nan'), False, None
-
-            step_norm = np.linalg.norm(dy[:3])
-            if step_norm > Delta:
-                dy_try = dy * (Delta / step_norm)
-                print(f"         | TR: clipped {step_norm:.4e} -> {Delta:.4e}")
-            else:
-                dy_try = dy.copy()
-
-            G_pred = G + DG @ dy_try
-            print(f"         | DIAG5: pred G = [F_x={G_pred[0]:+.4e} F_z={G_pred[1]:+.4e} "
-                  f"Jphi_x={G_pred[2]:+.4e} Jphi_z={G_pred[3]:+.4e} norm={G_pred[4]:+.4e}]")
-
-            pred = res**2 - np.linalg.norm(G_pred)**2
-            res_try, step_ok, G_try = _eval_step_diag(dy_try)
-            rho = (res**2 - res_try**2) / pred if (step_ok and abs(pred) > 1e-30) else -1.0
-
-            if G_try is not None:
-                print(f"         | actual G = [F_x={G_try[0]:+.4e} F_z={G_try[1]:+.4e} "
-                      f"Jphi_x={G_try[2]:+.4e} Jphi_z={G_try[3]:+.4e} norm={G_try[4]:+.4e}]")
-            print(f"         | |G_try|={res_try if step_ok else float('nan'):.4e} vs |G|={res:.4e}"
-                  f"  rho={rho:+.4f}  Delta={Delta:.4e}")
-
-            accepted = rho >= eta_accept and step_ok
-
-            if not accepted:
-                lam = 1e-6 * np.linalg.norm(DG_s)**2
-                for _ in range(8):
-                    try:
-                        dy_lm = np.linalg.solve(DG_s.T @ DG_s + lam*np.eye(5), -DG_s.T @ G) / D
-                    except np.linalg.LinAlgError:
-                        lam *= 10; continue
-                    res_lm, ok_lm, _ = _eval_step_diag(dy_lm)
-                    if ok_lm and res_lm < res:
-                        print(f"         | LM(lam={lam:.2e}): |G|={res_lm:.4e} ACCEPTED")
-                        dy_try = dy_lm; accepted = True; break
-                    print(f"         | LM(lam={lam:.2e}): |G|={res_lm:.4e} reject")
-                    lam *= 10
-
-            if accepted:
-                dr += dy_try[0]; dz += dy_try[1]; da += dy_try[2]
-                phi_new = phi + dy_try[3:5]
-                phi = phi_new / np.dot(l_vec, phi_new)
-                print(f"         | ACCEPTED")
-                # DIAG 6
-                print(f"         | DIAG6: phi=({phi[0]:+.6f}, {phi[1]:+.6f})")
-            else:
-                print(f"         | REJECTED")
-
-            if rho < 0.25:
-                Delta = max(Delta * 0.25, 1e-8)
-            elif rho > eta_good and step_norm >= 0.95 * Delta:
-                Delta = min(Delta * 2.0, Delta_max)
-
-        print(f"\n  End trial {trial_idx+1}")
-        print("=" * 70)
+    if converged:
+        print(f"\nBifurcation point: r={r_bif:.10f}  z={z_bif:.10f}  a={a_bif:.10f}")
+    else:
+        print(f"\nMoore-Spence did not converge.")

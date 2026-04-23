@@ -70,15 +70,15 @@ from perturbed_flow_return_UFL import perturbed_flow_differentiable
 # ---------------------------------------------------------------------------
 def _get_opt_fns():
     """Return (setup_moving_mesh_hat, _build_xi_hat,
-               check_mesh_quality, evaluate_forces_jac_hessian_hat,
-               moore_spence_solve_hat_ad)."""
+               check_mesh_quality, evaluate_forces,
+               moore_spence_solve)."""
     import optimization_of_branch_points as opt
     return (
         opt.setup_moving_mesh_hat,
         opt._build_xi_hat,
         opt.check_mesh_quality,
-        opt.evaluate_forces_jac_hessian_hat,
-        opt.moore_spence_solve_hat_ad,
+        opt.evaluate_forces,
+        opt.moore_spence_solve,
     )
 
 
@@ -331,14 +331,14 @@ def compute_DG_at_bif(r_bif, z_bif, a_bif, phi_bif, l_vec,
     -------
     DG : (5, 5) numpy array
     """
-    (_, _, _, evaluate_forces_jac_hessian_hat, _) = _get_opt_fns()
+    (_, _, _, evaluate_forces, _) = _get_opt_fns()
 
     dr = float(r_bif - r_ref)
     dz = float(z_bif - z_ref)
     da = float(a_bif - a_ref)
 
-    F_base, J_full, dJphi_dx = evaluate_forces_jac_hessian_hat(
-        dr, dz, da, mesh_data, phi_bif)
+    F_base, J_full, dJphi_dx = evaluate_forces(
+        dr, dz, da, mesh_data, hessian_phi=phi_bif)
 
     J_sp    = J_full[:, :2]
     dF_da   = J_full[:, 2]
@@ -569,7 +569,7 @@ def compute_shape_gradient(r_bif, z_bif, a_bif, phi_bif, l_vec, a_target,
         mesh2d.coordinates.assign(X_ref_2d + T_2d)
 
     # Restore 3D mesh to bifurcation position + current channel shape.
-    # (moore_spence_solve_hat_ad will reassign via its own tape, but setting
+    # (moore_spence_solve will reassign via its own tape, but setting
     # a clean state here avoids surprises in the line-search calls.)
     (_, _build_xi_hat_loc, _, _, _) = _get_opt_fns()
     with stop_annotating():
@@ -728,7 +728,7 @@ def run_shape_optimization(a_target, shared_data, mesh_data_init,
         'history'    – list of per-step dicts {'step', 'a_bif', 'J', 'alpha'}
         'converged'  – bool
     """
-    (setup_moving_mesh_hat, _, _, _, moore_spence_solve_hat_ad) = _get_opt_fns()
+    (setup_moving_mesh_hat, _, _, _, moore_spence_solve) = _get_opt_fns()
 
     R_hat, H_hat, W_hat, L_c, U_c, Re, G_hat_0, U_m_hat_0, \
         u_bar_2d_0, p_bar_2d_0 = shared_data
@@ -889,7 +889,7 @@ def run_shape_optimization(a_target, shared_data, mesh_data_init,
             try:
                 with stop_annotating():
                     r_try, z_try, a_try, phi_try, conv_try = \
-                        moore_spence_solve_hat_ad(
+                        moore_spence_solve(
                             r_bif, z_bif, a_bif, shared_try,
                             tol=ms_tol, max_iter=ms_max_iter,
                             md=md_try,
@@ -998,7 +998,7 @@ def run_from_main(a_target=0.10, max_steps=50, tol_J=1e-8,
     from nondimensionalization import first_nondimensionalisation
     from background_flow_return_UFL import background_flow_differentiable
     from optimization_of_branch_points import (
-        setup_moving_mesh_hat, moore_spence_solve_hat_ad,
+        setup_moving_mesh_hat, moore_spence_solve,
         newton_root_refine_hat,
     )
 
@@ -1030,7 +1030,7 @@ def run_from_main(a_target=0.10, max_steps=50, tol_J=1e-8,
     # --- Find bifurcation by Moore-Spence ---
     print("\n  Running Moore-Spence to find bifurcation point...")
     with stop_annotating():
-        r_bif, z_bif, a_bif, phi_bif, conv_ms = moore_spence_solve_hat_ad(
+        r_bif, z_bif, a_bif, phi_bif, conv_ms = moore_spence_solve(
             r_eq, z_eq, a0, shared_data,
             tol=ms_tol, max_iter=ms_max_iter,
             md=md0, dr_init=dr0, dz_init=dz0,

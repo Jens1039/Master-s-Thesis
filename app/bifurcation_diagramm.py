@@ -10,7 +10,7 @@ from mpi4py import MPI
 import plotly.graph_objects as go
 
 
-from nondimensionalization import *
+from nondimensionalization import first_nondimensionalisation
 from find_equilbrium_points import *
 
 warnings.filterwarnings("ignore", category=FutureWarning)
@@ -19,7 +19,7 @@ warnings.filterwarnings("ignore", message=".*import SLEPc.*", category=UserWarni
 comm = MPI.COMM_WORLD
 rank = comm.Get_rank()
 
-a_hat_values = np.round(np.arange(0.1375, 0.1376, 0.0025), 7)
+a_hat_values = np.round(np.arange(0.134, 0.137, 0.00025), 7)
 
 RESULTS_FILE = "../images/Sweep_a=0.01_to_0.20_R=500_H=W=2_ss=0.0025/bifurcation_results.json"
 PLOT_MODE = "3d"  # allowed: "3d", "2d_r", "2d_z"
@@ -226,62 +226,47 @@ if __name__ == "__main__":
             R, H, W, Q, rho, mu, print_values=True
         )
         bg = background_flow(R_hat, H_hat, W_hat, Re, comm=MPI.COMM_SELF)
-        G_hat, U_m_hat, u_bar_2d_hat, p_bar_2d_hat = bg.solve_2D_background_flow()
+        G_hat, U_m_hat, u_bar_2d, p_bar_2d = bg.solve_2D_background_flow()
 
-        scalar_bg = (R_hat, H_hat, W_hat, L_c, U_c, Re, G_hat, U_m_hat)
+        u_data_np = u_bar_2d.dat.data_ro.copy()
+        p_data_np = p_bar_2d.dat.data_ro.copy()
+
+        scalar_bg = (R_hat, H_hat, W_hat, L_c, U_c, Re, G_hat)
         print("Background flow done.")
     else:
         scalar_bg = None
+        u_data_np = None
+        p_data_np = None
 
     scalar_bg = comm.bcast(scalar_bg, root=0)
-    (R_hat, H_hat, W_hat, L_c, U_c, Re, G_hat, U_m_hat) = scalar_bg
+    u_data_np = comm.bcast(u_data_np, root=0)
+    p_data_np = comm.bcast(p_data_np, root=0)
+    (R_hat, H_hat, W_hat, L_c, U_c, Re, G_hat) = scalar_bg
 
     bifurcation_data = []
 
     for a_hat in a_hat_values:
         a_phys = float(a_hat) * (H / 2)
+        a_hat_nd = a_phys / L_c
 
         if rank == 0:
             print(f"\n{'='*60}")
             print(f"  a_hat = {a_hat:.5f}  |  a = {a_phys * 1e6:.2f} µm")
             print(f"{'='*60}")
-
-        iter_params   = None
-        u_hh_np = None
-        p_hh_np = None
-
-        if rank == 0:
-            (R_hh, H_hh, W_hh, a_hh, G_hh, L_c_p, U_c_p,
-             u_hh, p_hh, Re_p) = second_nondimensionalisation(
-                R_hat, H_hat, W_hat, a_phys,
-                L_c, U_c, G_hat, Re,
-                u_bar_2d_hat, p_bar_2d_hat, U_m_hat,
-            )
-            u_hh_np = u_hh.dat.data_ro.copy()
-            p_hh_np = p_hh.dat.data_ro.copy()
-            iter_params = (R_hh, H_hh, W_hh, a_hh, G_hh, L_c_p, Re_p)
-
-        iter_params = comm.bcast(iter_params, root=0)
-        u_hh_np     = comm.bcast(u_hh_np,    root=0)
-        p_hh_np     = comm.bcast(p_hh_np,    root=0)
-
-        (R_hh, H_hh, W_hh, a_hh, G_hh, L_c_p, Re_p) = iter_params
-
-        if rank == 0:
             print("  Computing force grid ...")
 
         force_grid = F_p_grid(
-            R_hh, H_hh, W_hh, a_hh, G_hh, Re_p,
-            L=4 * max(H_hh, W_hh),
-            particle_maxh=particle_maxh_rel * a_hh,
-            global_maxh=global_maxh_rel * min(H_hh, W_hh),
-            eps=0.2 * a_hh,
+            R_hat, H_hat, W_hat, a_hat_nd, G_hat, Re,
+            L=4 * max(H_hat, W_hat),
+            particle_maxh=particle_maxh_rel * a_hat_nd,
+            global_maxh=global_maxh_rel * min(H_hat, W_hat),
+            eps=0.2 * a_hat_nd,
         )
 
         grid_values = force_grid.compute_F_p_grid_ensemble(
             N_grid=N_grid,
-            u_bg_data_np=u_hh_np,
-            p_bg_data_np=p_hh_np,
+            u_bg_data_np=u_data_np,
+            p_bg_data_np=p_data_np,
         )
 
         if rank == 0:
@@ -289,21 +274,19 @@ if __name__ == "__main__":
             initial_guesses      = force_grid.generate_initial_guesses()
             classified_equilibria = force_grid.classify_equilibria_on_grid(initial_guesses)
 
-            force_grid.plot(L_c_p, L_c, classified_equilibria=classified_equilibria)
+            force_grid.plot(classified_equilibria=classified_equilibria)
 
             print(f"  Found {len(classified_equilibria)} equilibrium/a.")
 
             for eq in classified_equilibria:
                 r_eq, z_eq = eq["x_eq"]
-                r_norm = float(r_eq) * (L_c_p / L_c)
-                z_norm = float(z_eq) * (L_c_p / L_c)
 
                 bifurcation_data.append({
                     "a_hat":  float(a_hat),
                     "r_raw":  float(r_eq),
                     "z_raw":  float(z_eq),
-                    "r_norm": r_norm,
-                    "z_norm": z_norm,
+                    "r_norm": float(r_eq),
+                    "z_norm": float(z_eq),
                     "type":   eq["type"],
                     "color":  eq["color"],
                 })
