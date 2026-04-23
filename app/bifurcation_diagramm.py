@@ -21,7 +21,7 @@ rank = comm.Get_rank()
 
 a_hat_values = np.round(np.arange(0.134, 0.137, 0.00025), 7)
 
-RESULTS_FILE = "../images/Sweep_a=0.01_to_0.20_R=500_H=W=2_ss=0.0025/bifurcation_results.json"
+RESULTS_FILE = "../images/Sweep_a=0.134_to_0.137_R=500_H=W=2_ss=0.0025/bifurcation_results.json"
 PLOT_MODE = "3d"  # allowed: "3d", "2d_r", "2d_z"
 
 
@@ -58,15 +58,15 @@ def plot_bifurcation_diagram(data, plot_mode="3d", save=True, show=True):
         return
 
     type_styles = {
-        "stable":       {"symbol": "circle", "color": "green",  "label": "Stable equilibrium"},
-        "unstable":     {"symbol": "circle", "color": "red",    "label": "Unstable equilibrium"},
+        "attracting":   {"symbol": "circle", "color": "green",  "label": "Attracting (stable)"},
+        "repelling":    {"symbol": "circle", "color": "red",    "label": "Repelling (unstable)"},
         "saddle":       {"symbol": "circle", "color": "orange", "label": "Saddle point"},
         "unclassified": {"symbol": "x",      "color": "gray",   "label": "Unclassified"},
     }
 
     fig = go.Figure()
 
-    for eq_type in ["stable", "unstable", "saddle", "unclassified"]:
+    for eq_type in ["attracting", "repelling", "saddle", "unclassified"]:
         points = [entry for entry in data if entry.get("type", "unclassified") == eq_type]
         if len(points) == 0:
             continue
@@ -185,7 +185,7 @@ def plot_bifurcation_diagram(data, plot_mode="3d", save=True, show=True):
     if save:
         a_min = min(a_hat_values)
         a_max = max(a_hat_values)
-        out_dir = "../images/Sweep_a=0.01_to_0.20_R=500_H=W=2_ss=0.0025/images"
+        out_dir = "../images/Sweep_a=0.134_to_0.137_R=500_H=W=2_ss=0.0025"
         os.makedirs(out_dir, exist_ok=True)
         html_path = (
             f"{out_dir}/Bifurcation_diagram_{plot_mode}_a_min={a_min:.3f}_a_max={a_max:.3f}"
@@ -204,7 +204,7 @@ if __name__ == "__main__":
 
     auto_start_mpi()
 
-    os.makedirs("../images/Sweep_a=0.01_to_0.20_R=500_H=W=2_ss=0.0025/images", exist_ok=True)
+    os.makedirs("../images/Sweep_a=0.134_to_0.137_R=500_H=W=2_ss=0.0025", exist_ok=True)
 
     use_cache = False
     if rank == 0:

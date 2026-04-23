@@ -1,192 +1,42 @@
 import os
 os.environ["OMP_NUM_THREADS"] = "1"
 
-"""
-Algorithm 4.1 from Boulle, Farrell, Paganini (2021):
-'Control of Bifurcation Structures Using Shape Optimization'
-
-Design variable
----------------
-T_2d ∈ VectorFunctionSpace(mesh2d_ref, 'CG', 1)
-    Deformation of the 2D cross-section of the curved channel.
-    Initially zero (rectangular cross-section).  The actual cross-section
-    at shape-optimisation step k is the image of the reference rectangle
-    under the map  (s, t) -> (s + T_r(s,t), t + T_z(s,t)).
-
-Objective
----------
-J(Omega) = (a*(Omega) - a_target)^2
-    a*(Omega) = bifurcation parameter (particle radius) at which the
-                pitchfork bifurcation of equilibrium positions occurs.
-
-Shape gradient (implicit function theorem)
-------------------------------------------
-1. Find y* = (r*, z*, a*, phi*) via Moore-Spence on domain Omega.
-2. Adjoint:  DG_y^T * lambda = [0, 0, 2*(a* - a_target), 0, 0]^T
-3. Shape tape: T_2d -> u_bar_2d(T_2d) -> G1(y*, T_2d) -> lambda[0:2]^T * F
-4. shape_grad = ReducedFunctional(lambda[0:2]^T * F, [T_2d]).derivative()
-
-APPROXIMATION:
-Only the G1 = F (particle force) contribution is included in the shape
-gradient.  The G2 = J_sp @ phi contribution — which requires mixed second
-derivatives d^2F / (d(r,z) d(T_2d)) — is neglected.  At convergence of
-Moore-Spence, |G1| ≈ 0 and |G2| ≈ 0, so the sensitivity of G2 to T_2d
-is a higher-order correction.  The G1 contribution through the background
-flow change dominates and drives the bifurcation parameter shift.
-
-The shape gradient captures two contributions from T_2d:
-  (a) background flow change: T_2d → deformed mesh2d → NS solve → u_bar_2d
-  (b) 3D domain geometry change: T_2d → xi_channel (via VOM lift) →
-      mesh3d.coordinates (AssignBlock) → Stokes form → forces
-
-5. Riesz representative: solve H^1 problem
-       a_elast(V_rep, W) = -shape_grad(W)  for all W in V_2d
-6. Armijo line search + mesh update.
-7. Rebuild background flow on deformed mesh.  Re-solve Moore-Spence.
-"""
-
-import gc
-import math
-import numpy as np
-
 from firedrake import *
+import gc
 from firedrake.adjoint import stop_annotating, annotate_tape, continue_annotation
-from pyadjoint import (
-    get_working_tape, set_working_tape, Tape,
-    ReducedFunctional, Control,
+from pyadjoint import (get_working_tape, set_working_tape, Tape, ReducedFunctional, Control)
+
+from background_flow_differentiable import (
+    background_flow_differentiable, build_3d_background_flow_differentiable,
+    vom_transfer, _compute_inv_perm,
 )
-
-from background_flow_return_UFL import (
-    build_3d_background_flow_differentiable,
-    vom_transfer,
-    _compute_inv_perm,
+from perturbed_flow_differentiable import (
+    perturbed_flow_differentiable, setup_moving_mesh_hat, _build_xi_hat,
+    check_mesh_quality, evaluate_forces,
 )
-from perturbed_flow_return_UFL import perturbed_flow_differentiable
+from locate_bifurcation_points import moore_spence_solve
 
 
 # ---------------------------------------------------------------------------
-#  Lazy imports from the main optimisation module (avoids circular dependency
-#  when shape_optimization.py is imported stand-alone).
-# ---------------------------------------------------------------------------
-def _get_opt_fns():
-    """Return (setup_moving_mesh_hat, _build_xi_hat,
-               check_mesh_quality, evaluate_forces,
-               moore_spence_solve)."""
-    import optimization_of_branch_points as opt
-    return (
-        opt.setup_moving_mesh_hat,
-        opt._build_xi_hat,
-        opt.check_mesh_quality,
-        opt.evaluate_forces,
-        opt.moore_spence_solve,
-    )
-
-
-# ---------------------------------------------------------------------------
-#  2D background flow on a (possibly deformed) mesh — annotation-aware
+#  Solve 2D background flow on an external mesh
 # ---------------------------------------------------------------------------
 
-def solve_2D_bg_flow_on_tape(mesh2d, R_hat, H_hat, W_hat, Re_float):
+def _solve_bg_on_mesh(mesh2d, R_hat, H_hat, W_hat, Re_float):
     """Solve the 2D Dean-flow background NS problem on *mesh2d*.
 
-    Annotation-aware: when called with pyadjoint annotation ON this creates
-    a ``NonlinearVariationalSolver`` solve block on the tape, making
-    ``u_bar`` and ``p_bar_tilde`` tape-dependent on the mesh coordinates
-    (and hence on any Control that drives those coordinates).
+    Delegates to ``background_flow_differentiable.solve_2D_background_flow``
+    (CG3/CG2 elements, identical solver parameters).
 
-    ``mesh2d.coordinates`` should already be deformed before calling
-    (e.g. via ``mesh2d.coordinates.assign(X_ref_2d + T_2d)``).
+    Annotation-aware: when called with pyadjoint annotation ON this creates
+    a ``NonlinearVariationalSolver`` solve block on the tape.
 
     Returns
     -------
-    G_hat_val : float  (the pressure-gradient eigenvalue; NOT on tape)
-    U_m_hat   : float  (max azimuthal velocity; NOT on tape)
-    u_bar     : Function on mesh2d  (on tape if annotation is active)
-    p_bar_tilde : Function on mesh2d  (on tape if annotation is active)
+    G_hat_val, U_m_hat, u_bar, p_bar_tilde
     """
-    V_bg    = VectorFunctionSpace(mesh2d, "CG", 2, dim=3)
-    Q_bg    = FunctionSpace(mesh2d, "CG", 1)
-    G_space = FunctionSpace(mesh2d, "R", 0)
-    W_mixed = V_bg * Q_bg * G_space
-
-    w       = Function(W_mixed)
-    Re_cst  = Constant(Re_float)
-    R_cst   = Constant(R_hat)
-    W_half  = Constant(0.5 * W_hat)
-
-    u, p, G = split(w)
-    v, q, g = TestFunctions(W_mixed)
-
-    u_r      = u[0];  u_theta = u[2];  u_z = u[1]
-    v_r      = v[0];  v_theta = v[2];  v_z = v[1]
-
-    x = SpatialCoordinate(mesh2d)
-    r = x[0] - W_half          # radial offset from channel axis
-
-    def del_r(f): return Dx(f, 0)
-    def del_z(f): return Dx(f, 1)
-
-    Rr = R_cst + r              # distance from toroidal centre
-
-    F_cont   = q * (del_r(u_r) + del_z(u_z) + u_r / Rr) * Rr * dx
-    F_r      = ((u_r * del_r(u_r) + u_z * del_z(u_r)
-                 - u_theta**2 / Rr) * v_r
-                + del_r(p) * v_r
-                + (1.0 / Re_cst) * dot(grad(u_r), grad(v_r))
-                + (1.0 / Re_cst) * (u_r / Rr**2) * v_r
-                ) * Rr * dx
-    F_theta  = ((u_r * del_r(u_theta) + u_z * del_z(u_theta)
-                 + u_r * u_theta / Rr) * v_theta
-                - (G * R_cst / Rr) * v_theta
-                + (1.0 / Re_cst) * dot(grad(u_theta), grad(v_theta))
-                + (1.0 / Re_cst) * (u_theta / Rr**2) * v_theta
-                ) * Rr * dx
-    F_z      = ((u_r * del_r(u_z) + u_z * del_z(u_z)) * v_z
-                + del_z(p) * v_z
-                + (1.0 / Re_cst) * dot(grad(u_z), grad(v_z))
-                ) * Rr * dx
-    F_G      = (u_theta - 1.0) * g * dx
-
-    F_total  = F_r + F_theta + F_z + F_cont + F_G
-
-    no_slip  = DirichletBC(W_mixed.sub(0), Constant((0.0, 0.0, 0.0)),
-                           "on_boundary")
-    nullspace = MixedVectorSpaceBasis(
-        W_mixed,
-        [W_mixed.sub(0),
-         VectorSpaceBasis(constant=True, comm=W_mixed.comm),
-         W_mixed.sub(2)],
-    )
-
-    problem = NonlinearVariationalProblem(F_total, w, bcs=[no_slip])
-    solver  = NonlinearVariationalSolver(
-        problem, nullspace=nullspace,
-        solver_parameters={
-            "snes_type": "newtonls",
-            "snes_linesearch_type": "l2",
-            "mat_type": "matfree",
-            "ksp_type": "fgmres",
-            "pc_type": "fieldsplit",
-            "pc_fieldsplit_type": "schur",
-            "pc_fieldsplit_schur_fact_type": "full",
-            "pc_fieldsplit_0_fields": "0,1",
-            "pc_fieldsplit_1_fields": "2",
-            "fieldsplit_0": {
-                "ksp_type": "preonly", "pc_type": "python",
-                "pc_python_type": "firedrake.AssembledPC",
-                "assembled_pc_type": "lu",
-                "assembled_pc_factor_mat_solver_type": "mumps"},
-            "fieldsplit_1": {"ksp_type": "preonly", "pc_type": "none"},
-        },
-    )
-    solver.solve()          # GenericSolveBlock on tape if annotation is ON
-
-    u_bar       = w.subfunctions[0]
-    p_bar_tilde = w.subfunctions[1]
-    G_hat_val   = float(w.subfunctions[2].dat.data_ro[0])
-    U_m_hat     = float(np.max(u_bar.dat.data_ro[:, 2]))
-
-    return G_hat_val, U_m_hat, u_bar, p_bar_tilde
+    bg = background_flow_differentiable(R_hat, H_hat, W_hat, Re_float)
+    bg.mesh2d = mesh2d
+    return bg.solve_2D_background_flow()
 
 
 # ---------------------------------------------------------------------------
@@ -331,8 +181,6 @@ def compute_DG_at_bif(r_bif, z_bif, a_bif, phi_bif, l_vec,
     -------
     DG : (5, 5) numpy array
     """
-    (_, _, _, evaluate_forces, _) = _get_opt_fns()
-
     dr = float(r_bif - r_ref)
     dz = float(z_bif - z_ref)
     da = float(a_bif - a_ref)
@@ -401,8 +249,6 @@ def eval_forces_with_bg_on_tape(r_off, z_off, a_hat,
     -------
     F_p_x, F_p_z : AdjFloat   (on tape)
     """
-    (_, _build_xi_hat, check_mesh_quality, _, _) = _get_opt_fns()
-
     md     = mesh_data
     mesh3d = md['mesh3d']
 
@@ -535,7 +381,7 @@ def compute_shape_gradient(r_bif, z_bif, a_bif, phi_bif, l_vec, a_target,
 
     # Solve background NS flow on deformed mesh (GenericSolveBlock on tape)
     print("  [Shape] Solving 2D background flow on deformed mesh...")
-    G_hat_val, _, u_bar_2d_new, p_bar_2d_new = solve_2D_bg_flow_on_tape(
+    G_hat_val, _, u_bar_2d_new, p_bar_2d_new = _solve_bg_on_mesh(
         mesh2d, R_hat, H_hat, W_hat, Re_float)
     print(f"  [Shape] G_hat = {G_hat_val:.6e}")
 
@@ -571,14 +417,13 @@ def compute_shape_gradient(r_bif, z_bif, a_bif, phi_bif, l_vec, a_target,
     # Restore 3D mesh to bifurcation position + current channel shape.
     # (moore_spence_solve will reassign via its own tape, but setting
     # a clean state here avoids surprises in the line-search calls.)
-    (_, _build_xi_hat_loc, _, _, _) = _get_opt_fns()
     with stop_annotating():
         mesh3d_r = mesh_data['mesh3d']
         R_sp     = FunctionSpace(mesh3d_r, "R", 0)
         dr_r = Function(R_sp).assign(float(r_bif - r_ref))
         dz_r = Function(R_sp).assign(float(z_bif - z_ref))
         da_r = Function(R_sp).assign(float(a_bif - a_ref))
-        xi_restore = _build_xi_hat_loc(dr_r, dz_r, da_r, mesh_data)
+        xi_restore = _build_xi_hat(dr_r, dz_r, da_r, mesh_data)
         mesh3d_r.coordinates.assign(mesh_data['X_ref'] + xi_restore)
 
     return shape_grad, lambda_adj
@@ -728,8 +573,6 @@ def run_shape_optimization(a_target, shared_data, mesh_data_init,
         'history'    – list of per-step dicts {'step', 'a_bif', 'J', 'alpha'}
         'converged'  – bool
     """
-    (setup_moving_mesh_hat, _, _, _, moore_spence_solve) = _get_opt_fns()
-
     R_hat, H_hat, W_hat, L_c, U_c, Re, G_hat_0, U_m_hat_0, \
         u_bar_2d_0, p_bar_2d_0 = shared_data
 
@@ -867,7 +710,7 @@ def run_shape_optimization(a_target, shared_data, mesh_data_init,
             try:
                 with stop_annotating():
                     G_try, U_m_try, u_bar_try, p_bar_try = \
-                        solve_2D_bg_flow_on_tape(
+                        _solve_bg_on_mesh(
                             mesh2d, R_hat, H_hat, W_hat, Re)
             except Exception as e:
                 print(f"  [LS bt={bt}] Background flow failed: {e}")
@@ -989,18 +832,9 @@ def run_from_main(a_target=0.10, max_steps=50, tol_J=1e-8,
 
     All parameters can be overridden at the call site.
     """
-    # --- Local imports to avoid polluting module namespace ---
-    import sys
-    import os
-    sys.path.insert(0, os.path.dirname(__file__))
-
     from config_paper_parameters import R, H, W, Q, rho, mu
     from nondimensionalization import first_nondimensionalisation
-    from background_flow_return_UFL import background_flow_differentiable
-    from optimization_of_branch_points import (
-        setup_moving_mesh_hat, moore_spence_solve,
-        newton_root_refine_hat,
-    )
+    from locate_bifurcation_points import newton_root_refine
 
     # --- Non-dimensionalisation ---
     R_hat, H_hat, W_hat, L_c, U_c, Re = first_nondimensionalisation(
@@ -1018,7 +852,7 @@ def run_from_main(a_target=0.10, max_steps=50, tol_J=1e-8,
     # --- Initial equilibrium (on-axis, slightly off-centre) ---
     r0, z0, a0 = 0.61, 0.0, 0.135
     print(f"\n  Newton refinement at a_hat = {a0}...")
-    r_eq, z_eq, md0, dr0, dz0 = newton_root_refine_hat(
+    r_eq, z_eq, md0, dr0, dz0 = newton_root_refine(
         r0, z0, a0, shared_data, tol=1e-10, max_iter=15)
 
     # The 3D mesh (md0) was built at (r0, z0, a0); dr0/dz0 are the displacements
@@ -1068,6 +902,7 @@ def run_from_main(a_target=0.10, max_steps=50, tol_J=1e-8,
 
 
 if __name__ == "__main__":
+
     result = run_from_main(
         a_target=0.10,
         max_steps=50,

@@ -254,8 +254,15 @@ if __name__ == "__main__":
     R_hat = 500
     H_hat = 2
     W_hat = 2
-    a_hat = 0.05
+    a_hat = 0.13606788
     Re = 1.0
+
+    r_off = 0.61282900
+    z_off = 0.04137774
+
+    L_hat = 4 * max(H_hat, W_hat)
+    particle_maxh = 0.06 * a_hat
+    global_maxh = 0.2 * min(H_hat, W_hat)
 
     from background_flow import *
     from build_3d_geometry_gmsh import make_curved_channel_section_with_spherical_hole
@@ -263,12 +270,8 @@ if __name__ == "__main__":
     bg = background_flow(R_hat, H_hat, W_hat, Re)
     G_val, U_m_hat, u_bar, p_bar_tilde = bg.solve_2D_background_flow()
 
-    L_hat = 4 * max(H_hat, W_hat)
-    particle_maxh = 0.2 * a_hat
-    global_maxh = 0.2 * min(H_hat, W_hat)
-
     mesh3d, tags = make_curved_channel_section_with_spherical_hole(R_hat, H_hat, W_hat, L_hat, a_hat,
-                                                                   particle_maxh, global_maxh, r_off=0.0, z_off=0.0)
+                                                                   particle_maxh, global_maxh, r_off=r_off, z_off=z_off)
 
     u_bar_3d, p_bar_3d = build_3d_background_flow(R_hat, H_hat, W_hat, G_val, mesh3d, tags, u_bar, p_bar_tilde)
 
