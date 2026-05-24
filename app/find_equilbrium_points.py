@@ -1,6 +1,7 @@
 import os
 os.environ["OMP_NUM_THREADS"] = "1"
 
+from firedrake import *
 from tqdm import tqdm
 import matplotlib.patches as patches
 import matplotlib.pyplot as plt
@@ -13,26 +14,24 @@ from mpi4py import MPI
 import numpy as np
 import gc
 import sys
-from petsc4py import PETSc
-from firedrake import *
 
-from nondimensionalization import first_nondimensionalisation
+from nondimensionalization import nondimensionalisation
 from background_flow import background_flow, build_3d_background_flow
-from build_3d_geometry_gmsh import make_curved_channel_section_with_spherical_hole
+from build_3d_geometry_gmsh import make_curved_channel_section_with_spherical_hole, make_curved_channel_section_from_boundary
 from perturbed_flow import perturbed_flow
-
+from config_lab_parameters import *
 
 
 class F_p_grid:
 
-    def __init__(self, R, H, W, a, G, Re_p, L, particle_maxh, global_maxh, eps):
+    def __init__(self, R, H, W, a, G, Re, L, particle_maxh, global_maxh, eps, boundary_pts_2d=None, T_2d_data=None, mesh_n=128):
 
         self.R = R
         self.H = H
         self.W = W
         self.a = a
         self.G = G
-        self.Re_p = Re_p
+        self.Re = Re
         self.L = L
 
         self.particle_maxh = particle_maxh
@@ -44,8 +43,18 @@ class F_p_grid:
         self.z_min = -H / 2 + a + eps
         self.z_max = H / 2 - a - eps
 
-        self.mesh_nx = 120
-        self.mesh_ny = 120
+        self.mesh_nx = mesh_n
+        self.mesh_ny = mesh_n
+
+        self.boundary_pts_2d = (None if boundary_pts_2d is None
+                                else np.asarray(boundary_pts_2d, dtype=float))
+        self.T_2d_data = (None if T_2d_data is None
+                          else np.asarray(T_2d_data, dtype=float))
+
+        if (self.T_2d_data is not None) != (self.boundary_pts_2d is not None):
+            raise ValueError(
+                "boundary_pts_2d and T_2d_data must be provided together."
+            )
 
         self._current_mesh = None
         self._original_coords = None
@@ -63,8 +72,28 @@ class F_p_grid:
         global_rank = COMM_WORLD.rank
         global_size = COMM_WORLD.size
 
-        mesh2d_local = RectangleMesh(self.mesh_nx, self.mesh_ny, self.W, self.H, quadrilateral=False, comm=my_comm)
+        mesh2d_local = RectangleMesh(self.mesh_nx, self.mesh_ny, self.W, self.H, quadrilateral=False, diagonal="crossed", comm=my_comm)
 
+        # If a shape-optimized cross-section was provided, deform the local 2D
+        # mesh with the same T_2d so the background-flow interpolation happens
+        # on the actual geometry rather than the rectangular reference.
+        if self.T_2d_data is not None:
+            V_def_local = VectorFunctionSpace(mesh2d_local, "CG", 1, dim=2)
+            T_local = Function(V_def_local)
+            if T_local.dat.data.shape != self.T_2d_data.shape:
+                raise ValueError(
+                    f"T_2d_data shape {self.T_2d_data.shape} does not match "
+                    f"local VectorFunctionSpace(CG1, dim=2) shape "
+                    f"{T_local.dat.data.shape}.  Ensure mesh_n matches "
+                    f"n_grid_2d used during shape optimisation."
+                )
+            T_local.dat.data[:] = self.T_2d_data
+            mesh2d_local.coordinates.assign(mesh2d_local.coordinates + T_local)
+
+        # Must match background_flow.solve_2D_background_flow's
+        # CG2 (velocity) / CG1 (pressure) Taylor-Hood — otherwise the
+        # broadcast u_bg_data_np / p_bg_data_np do not fit the local
+        # function spaces and the ``dat.data[:] = ...`` assignment fails.
         V_local = VectorFunctionSpace(mesh2d_local, "CG", 2, dim=3)
         Q_local = FunctionSpace(mesh2d_local, "CG", 1)
 
@@ -105,16 +134,73 @@ class F_p_grid:
             if (i, j) in computed:
                 continue
 
-            mesh3d, tags = make_curved_channel_section_with_spherical_hole(self.R, self.H, self.W, self.L, self.a,
-                                                                           self.particle_maxh, self.global_maxh,
-                                                                           r_off=r_loc, z_off=z_loc,
-                                                                           comm=my_comm)
+            # Verbose per-task logging (rank 0) so a stalled task
+            # tells us exactly which (r, z) it died on.
+            if global_rank == 0:
+                print(f"[rank 0] task ({i},{j})  r={r_loc:+.4f}  "
+                      f"z={z_loc:+.4f}  -> mesh ...", flush=True)
 
-            u_3d, p_3d = build_3d_background_flow(self.R, self.H, self.W, self.G, mesh3d, tags, u_bg_local, p_bg_local)
+            try:
+                if self.boundary_pts_2d is not None:
+                    mesh3d, tags = make_curved_channel_section_from_boundary(
+                        self.R, self.H, self.W, self.L, self.a,
+                        self.boundary_pts_2d,
+                        self.particle_maxh, self.global_maxh,
+                        x_off=r_loc, z_off=z_loc,
+                        comm=my_comm,
+                    )
+                else:
+                    mesh3d, tags = make_curved_channel_section_with_spherical_hole(self.R, self.H, self.W, self.L, self.a,
+                                                                                   self.particle_maxh, self.global_maxh,
+                                                                                   x_off=r_loc, z_off=z_loc,
+                                                                                   comm=my_comm)
+            except Exception as e:
+                print(f"[rank {global_rank}] mesh build FAILED at "
+                      f"({i},{j}) r={r_loc:+.4f} z={z_loc:+.4f}: {e}",
+                      flush=True)
+                computed[(i, j)] = (i, j, np.nan, np.nan)
+                if ckpt_file is not None:
+                    with open(ckpt_file, 'wb') as f:
+                        pickle.dump(computed, f)
+                continue
 
-            pf = perturbed_flow(self.R, self.H, self.W, self.L, self.a, self.Re_p, mesh3d, tags, u_3d, p_3d)
+            import time as _time
+            try:
+                if global_rank == 0:
+                    print(f"[rank 0]   ... mesh built  -> 3D bg flow ...",
+                          flush=True)
+                t0 = _time.time()
+                u_3d, p_3d = build_3d_background_flow(self.R, self.H, self.W, self.G, mesh3d, tags, u_bg_local, p_bg_local)
+                if global_rank == 0:
+                    print(f"[rank 0]   ... 3D bg ({_time.time()-t0:.1f}s)  "
+                          f"-> perturbed_flow init ...", flush=True)
 
-            F_r, F_z = pf.F_p()
+                t0 = _time.time()
+                pf = perturbed_flow(self.R, self.H, self.W, self.L, self.a, self.Re, mesh3d, tags, u_3d, p_3d)
+                if global_rank == 0:
+                    print(f"[rank 0]   ... pf init ({_time.time()-t0:.1f}s)  "
+                          f"-> F_p() ...", flush=True)
+
+                t0 = _time.time()
+                F_r, F_z = pf.F_p()
+                if global_rank == 0:
+                    print(f"[rank 0]   ... F_p() ({_time.time()-t0:.1f}s)  "
+                          f"-> F = ({float(F_r):+.3e}, {float(F_z):+.3e})",
+                          flush=True)
+            except Exception as e:
+                print(f"[rank {global_rank}] solve FAILED at "
+                      f"({i},{j}) r={r_loc:+.4f} z={z_loc:+.4f}: {e}",
+                      flush=True)
+                computed[(i, j)] = (i, j, np.nan, np.nan)
+                try:
+                    del mesh3d, tags
+                except Exception:
+                    pass
+                gc.collect()
+                if ckpt_file is not None:
+                    with open(ckpt_file, 'wb') as f:
+                        pickle.dump(computed, f)
+                continue
 
             # Clean up all heavy objects before saving
             del pf, mesh3d, tags, u_3d, p_3d
@@ -257,7 +343,7 @@ class F_p_grid:
         return classified_equilibria
 
 
-    def plot(self, initial_guesses=None, classified_equilibria=None):
+    def plot(self, initial_guesses=None, classified_equilibria=None, boundary_pts_2d=None):
 
         R_grid, Z_grid = np.meshgrid(self.r_vals, self.z_vals, indexing='ij')
 
@@ -281,9 +367,25 @@ class F_p_grid:
         ax.contour(Rf, Zf, Fr_f, levels=[0], colors="black", linewidths=2)
         ax.contour(Rf, Zf, Fz_f, levels=[0], colors="white", linewidths=2)
 
-        wall_rect = patches.Rectangle((-self.W / 2, -self.H / 2), self.W, self.H,
-                                      linewidth=3, edgecolor='black', facecolor='none', zorder=10)
-        ax.add_patch(wall_rect)
+        if boundary_pts_2d is None:
+            boundary_pts_2d = self.boundary_pts_2d
+
+        if boundary_pts_2d is not None:
+            # (s, t) in [0, W] x [0, H] -> (r, z) in [-W/2, W/2] x [-H/2, H/2]
+            b = np.asarray(boundary_pts_2d, dtype=float)
+            b_rz = np.column_stack([b[:, 0] - self.W / 2.0,
+                                    b[:, 1] - self.H / 2.0])
+            b_closed = np.vstack([b_rz, b_rz[0:1]])
+            ax.plot(b_closed[:, 0], b_closed[:, 1],
+                    color='black', linewidth=3, zorder=10,
+                    label='Deformed wall')
+            ax.add_patch(patches.Polygon(b_closed, closed=True,
+                                         fill=False, edgecolor='black',
+                                         linewidth=0, zorder=9))
+        else:
+            wall_rect = patches.Rectangle((-self.W / 2, -self.H / 2), self.W, self.H,
+                                          linewidth=3, edgecolor='black', facecolor='none', zorder=10)
+            ax.add_patch(wall_rect)
 
         ax.add_patch(patches.Rectangle((-self.W / 2, -self.H / 2), exclusion_dist, self.H,
                                        facecolor='gray', alpha=0.3, hatch='///'))
@@ -341,9 +443,9 @@ class F_p_grid:
         # All values are already in first-nondim units (L_c = H/2)
         particle_maxh_rel = self.particle_maxh / self.a
 
-        ax.set_title(f"Force_Map_a={self.a:.5f}_R={self.R:.0f}_W={self.W:.0f}_H={self.H:.0f}_Re={self.Re_p:.1f}_N_grid={self.N_grid}_particle_maxh_rel={particle_maxh_rel:.2f}")
+        ax.set_title(f"Force_Map_a={self.a:.5f}_R={self.R:.0f}_W={self.W:.0f}_H={self.H:.0f}_Re={self.Re:.1f}_N_grid={self.N_grid}_particle_maxh_rel={particle_maxh_rel:.2f}")
         plt.tight_layout()
-        filename = f"../images/Sweep_a=0.01_to_0.20_R=500_H=W=2_ss=0.0025/images/Force_Map_a={self.a:.5f}_R={self.R:.0f}_W={self.W:.0f}_H={self.H:.0f}_Re={self.Re_p:.1f}_N_grid={self.N_grid}_particle_maxh_rel={particle_maxh_rel:.2f}.png"
+        filename = f"../images/Sweep_a=0.01_to_0.20_R=500_H=W=2_ss=0.0025/images/Force_Map_a={self.a:.5f}_R={self.R:.0f}_W={self.W:.0f}_H={self.H:.0f}_Re={self.Re:.1f}_N_grid={self.N_grid}_particle_maxh_rel={particle_maxh_rel:.2f}.png"
         os.makedirs("../images/Sweep_a=0.01_to_0.20_R=500_H=W=2_ss=0.0025/images", exist_ok=True)
         plt.savefig(filename)
         print(f"Plot saved to {filename}")
@@ -393,12 +495,10 @@ def force_grid(R, H, W, Q, rho, mu, a, N_grid, particle_maxh_rel, global_maxh_re
     else:
         if rank == 0:
             print("Calculating 2D background flow...")
-            R_hat, H_hat, W_hat, L_c, U_c, Re = first_nondimensionalisation(R, H, W, Q, rho, mu, print_values=True)
+            R_hat, H_hat, W_hat, a_hat, L_c, U_c, Re = nondimensionalisation(R, H, W, a, Q, rho, mu, print_values=True)
 
             bg = background_flow(R_hat, H_hat, W_hat, Re, comm=MPI.COMM_SELF)
             G_hat, U_m_hat, u_bar_2d, p_bar_2d = bg.solve_2D_background_flow()
-
-            a_hat = a / L_c
 
             u_data_np = u_bar_2d.dat.data_ro.copy()
             p_data_np = p_bar_2d.dat.data_ro.copy()
@@ -501,10 +601,7 @@ def force_grid(R, H, W, Q, rho, mu, a, N_grid, particle_maxh_rel, global_maxh_re
 
 
 def auto_start_mpi(n_procs=5):
-    """
-        Restart the script using mpiexec if not already running under MPI.
-        Convenience function for local execution.
-    """
+
     os.environ["PATH"] = "/opt/homebrew/bin:" + os.environ.get("PATH", "")
     os.environ["MPICC"] = "/opt/homebrew/bin/mpicc"
     os.environ["MPICXX"] = "/opt/homebrew/bin/mpicxx"
@@ -530,9 +627,8 @@ if __name__ == "__main__":
 
     auto_start_mpi(4)
 
-    from config_paper_parameters import *
-
     if MPI.COMM_WORLD.Get_rank() == 0:
         print("particle_maxh_rel = ", particle_maxh_rel)
+        print("global_maxh_rel = ", global_maxh_rel)
 
     force_grid(R, H, W, Q, rho, mu, a, N_grid, particle_maxh_rel, global_maxh_rel, eps_rel)

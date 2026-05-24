@@ -2,16 +2,13 @@ import os
 os.environ["OMP_NUM_THREADS"] = "1"
 
 import json
-import sys
 import warnings
-import numpy as np
-import matplotlib.pyplot as plt
-from mpi4py import MPI
 import plotly.graph_objects as go
 
-
-from nondimensionalization import first_nondimensionalisation
+from nondimensionalization import nondimensionalisation
 from find_equilbrium_points import *
+from config_paper_parameters import *
+
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", message=".*import SLEPc.*", category=UserWarning)
@@ -19,36 +16,15 @@ warnings.filterwarnings("ignore", message=".*import SLEPc.*", category=UserWarni
 comm = MPI.COMM_WORLD
 rank = comm.Get_rank()
 
+a_hat_start = 0.134
+a_hat_end = 0.137
+a_hat_stepsize = 0.0025
+
 a_hat_values = np.round(np.arange(0.134, 0.137, 0.00025), 7)
 
-RESULTS_FILE = "../images/Sweep_a=0.134_to_0.137_R=500_H=W=2_ss=0.0025/bifurcation_results.json"
-PLOT_MODE = "3d"  # allowed: "3d", "2d_r", "2d_z"
+RESULTS_FILE = f"../images/bifurcation_results_{a_hat_start, a_hat_end, a_hat_stepsize}.json"
 
-
-def auto_start_mpi(n_procs=5):
-
-    os.environ["PATH"] = "/opt/homebrew/bin:" + os.environ.get("PATH", "")
-    os.environ["MPICC"]  = "/opt/homebrew/bin/mpicc"
-    os.environ["MPICXX"] = "/opt/homebrew/bin/mpicxx"
-    os.environ["CC"]     = "/opt/homebrew/bin/mpicc"
-    os.environ["CXX"]    = "/opt/homebrew/bin/mpicxx"
-
-    is_mpi = (
-        "OMPI_COMM_WORLD_RANK" in os.environ
-        or "PMI_RANK" in os.environ
-        or "SLURM_PROCID" in os.environ
-    )
-    if not is_mpi:
-        cmd = ["mpiexec", "-n", str(n_procs), sys.executable, "-u"] + sys.argv
-        print(f"Executing: {' '.join(cmd)}\n")
-        os.execv("/opt/homebrew/bin/mpiexec", ["/opt/homebrew/bin/mpiexec"] + cmd[1:])
-
-
-def plot_bifurcation_diagram(data, plot_mode="3d", save=True, show=True):
-
-    valid_modes = {"3d", "2d_r", "2d_z"}
-    if plot_mode not in valid_modes:
-        raise ValueError(f"Unsupported plot_mode '{plot_mode}'. Allowed: {sorted(valid_modes)}")
+def plot_bifurcation_diagram(data, save=True, show=True):
 
     if go is None:
         raise ImportError("plotly is required for this plot. Install with: pip install plotly")
@@ -76,111 +52,45 @@ def plot_bifurcation_diagram(data, plot_mode="3d", save=True, show=True):
         r_vals = [entry["r_norm"] for entry in points]
         z_vals = [entry["z_norm"] for entry in points]
 
-        if plot_mode == "3d":
-            fig.add_trace(go.Scatter3d(
-                x=x_vals,
-                y=r_vals,
-                z=z_vals,
-                mode="markers",
-                name=style["label"],
-                marker=dict(
-                    size=6,
-                    color=style["color"],
-                    symbol=style["symbol"],
-                    line=dict(color="black", width=1),
-                    opacity=0.9,
-                ),
-                hovertemplate=(
-                    "a/(H/2): %{x:.4f}<br>"
-                    "r/(H/2): %{y:.4f}<br>"
-                    "z/(H/2): %{z:.4f}<br>"
-                    f"type: {eq_type}<extra></extra>"
-                ),
-            ))
-        elif plot_mode == "2d_r":
-            fig.add_trace(go.Scatter(
-                x=x_vals,
-                y=r_vals,
-                mode="markers",
-                name=style["label"],
-                marker=dict(
-                    size=9,
-                    color=style["color"],
-                    symbol=style["symbol"],
-                    line=dict(color="black", width=1),
-                    opacity=0.9,
-                ),
-                hovertemplate=(
-                    "a/(H/2): %{x:.4f}<br>"
-                    "r/(H/2): %{y:.4f}<br>"
-                    f"type: {eq_type}<extra></extra>"
-                ),
-            ))
-        else:
-            fig.add_trace(go.Scatter(
-                x=x_vals,
-                y=z_vals,
-                mode="markers",
-                name=style["label"],
-                marker=dict(
-                    size=9,
-                    color=style["color"],
-                    symbol=style["symbol"],
-                    line=dict(color="black", width=1),
-                    opacity=0.9,
-                ),
-                hovertemplate=(
-                    "a/(H/2): %{x:.4f}<br>"
-                    "z/(H/2): %{y:.4f}<br>"
-                    f"type: {eq_type}<extra></extra>"
-                ),
-            ))
+        fig.add_trace(go.Scatter3d(
+            x=x_vals,
+            y=r_vals,
+            z=z_vals,
+            mode="markers",
+            name=style["label"],
+            marker=dict(
+                size=6,
+                color=style["color"],
+                symbol=style["symbol"],
+                line=dict(color="black", width=1),
+                opacity=0.9,
+            ),
+            hovertemplate=(
+                "a/(H/2): %{x:.4f}<br>"
+                "r/(H/2): %{y:.4f}<br>"
+                "z/(H/2): %{z:.4f}<br>"
+                f"type: {eq_type}<extra></extra>"
+            ),
+        ))
 
     W_hat = W / (H / 2)
     H_hat = H / (H / 2)
     x_min = min(a_hat_values) - 0.005
     x_max = max(a_hat_values) + 0.005
 
-    if plot_mode == "3d":
-        fig.update_layout(
-            title="Bifurcation Diagram (3D): particle size vs equilibrium positions",
-            scene=dict(
-                xaxis_title="Relative particle size a/(H/2)",
-                yaxis_title="Equilibrium r/(H/2)",
-                zaxis_title="Equilibrium z/(H/2)",
-                xaxis=dict(range=[x_min, x_max]),
-                yaxis=dict(range=[-W_hat / 2, W_hat / 2]),
-                zaxis=dict(range=[-H_hat / 2, H_hat / 2]),
-            ),
-            legend=dict(x=0.01, y=0.99),
-            template="plotly_white",
-        )
-    elif plot_mode == "2d_r":
-        fig.add_hline(y=W_hat / 2, line_dash="dash", line_color="black")
-        fig.add_hline(y=-W_hat / 2, line_dash="dash", line_color="black")
-        fig.add_hline(y=0.0, line_dash="dot", line_color="gray")
-        fig.update_layout(
-            title="Bifurcation Diagram (2D projection on r-axis)",
+    fig.update_layout(
+        title="Bifurcation Diagram (3D): particle size vs equilibrium positions",
+        scene=dict(
             xaxis_title="Relative particle size a/(H/2)",
             yaxis_title="Equilibrium r/(H/2)",
+            zaxis_title="Equilibrium z/(H/2)",
             xaxis=dict(range=[x_min, x_max]),
             yaxis=dict(range=[-W_hat / 2, W_hat / 2]),
-            legend=dict(x=0.01, y=0.99),
-            template="plotly_white",
-        )
-    else:
-        fig.add_hline(y=H_hat / 2, line_dash="dash", line_color="black")
-        fig.add_hline(y=-H_hat / 2, line_dash="dash", line_color="black")
-        fig.add_hline(y=0.0, line_dash="dot", line_color="gray")
-        fig.update_layout(
-            title="Bifurcation Diagram (2D projection on z-axis)",
-            xaxis_title="Relative particle size a/(H/2)",
-            yaxis_title="Equilibrium z/(H/2)",
-            xaxis=dict(range=[x_min, x_max]),
-            yaxis=dict(range=[-H_hat / 2, H_hat / 2]),
-            legend=dict(x=0.01, y=0.99),
-            template="plotly_white",
-        )
+            zaxis=dict(range=[-H_hat / 2, H_hat / 2]),
+        ),
+        legend=dict(x=0.01, y=0.99),
+        template="plotly_white",
+    )
 
     if save:
         a_min = min(a_hat_values)
@@ -188,7 +98,7 @@ def plot_bifurcation_diagram(data, plot_mode="3d", save=True, show=True):
         out_dir = "../images/Sweep_a=0.134_to_0.137_R=500_H=W=2_ss=0.0025"
         os.makedirs(out_dir, exist_ok=True)
         html_path = (
-            f"{out_dir}/Bifurcation_diagram_{plot_mode}_a_min={a_min:.3f}_a_max={a_max:.3f}"
+            f"{out_dir}/Bifurcation_diagram_3d_a_min={a_min:.3f}_a_max={a_max:.3f}"
             f"_R={R:.0f}_W={W:.0f}_H={H:.0f}_N_grid={N_grid}.html"
         )
         fig.write_html(html_path)
@@ -199,8 +109,6 @@ def plot_bifurcation_diagram(data, plot_mode="3d", save=True, show=True):
 
 
 if __name__ == "__main__":
-
-    from config_paper_parameters import *
 
     auto_start_mpi()
 
@@ -216,15 +124,14 @@ if __name__ == "__main__":
             print(f"Loading cached results from {RESULTS_FILE} ...")
             with open(RESULTS_FILE, "r") as f:
                 bifurcation_data = json.load(f)
-            plot_bifurcation_diagram(bifurcation_data, plot_mode=PLOT_MODE, save=True, show=True)
+            plot_bifurcation_diagram(bifurcation_data, save=True, show=True)
         comm.Barrier()
         sys.exit(0)
 
     if rank == 0:
         print("Computing background flow (shared across all particle sizes)...")
-        R_hat, H_hat, W_hat, L_c, U_c, Re = first_nondimensionalisation(
-            R, H, W, Q, rho, mu, print_values=True
-        )
+        R_hat, H_hat, W_hat, a_hat, L_c, U_c, Re = nondimensionalisation(R, H, W, a, Q, rho, mu, print_values=True)
+
         bg = background_flow(R_hat, H_hat, W_hat, Re, comm=MPI.COMM_SELF)
         G_hat, U_m_hat, u_bar_2d, p_bar_2d = bg.solve_2D_background_flow()
 
@@ -296,4 +203,4 @@ if __name__ == "__main__":
             print(f"  Results written to {RESULTS_FILE} ({len(bifurcation_data)} entries total)")
 
     if rank == 0:
-        plot_bifurcation_diagram(bifurcation_data, plot_mode=PLOT_MODE, save=True, show=True)
+        plot_bifurcation_diagram(bifurcation_data, save=True, show=True)

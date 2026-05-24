@@ -1,20 +1,25 @@
 import os
 os.environ["OMP_NUM_THREADS"] = "1"
 
-import numpy as np
 from firedrake import *
+import numpy as np
+
+from background_flow import *
+from build_3d_geometry_gmsh import make_curved_channel_section_with_spherical_hole
+from config_paper_parameters import *
+from nondimensionalization import nondimensionalisation
 
 
 class perturbed_flow:
 
-    def __init__(self, R, H, W, L, a, Re_p, mesh3d, tags, u_bar, p_bar):
+    def __init__(self, R, H, W, L, a, Re, mesh3d, tags, u_bar, p_bar):
 
         self.R = R
         self.H = H
         self.W = W
         self.a = a
         self.L = L
-        self.Re_p = Re_p
+        self.Re = Re
 
         self.u_bar = u_bar
         self.p_bar = p_bar
@@ -95,30 +100,30 @@ class perturbed_flow:
         return v_0, q_0
 
 
-    def F_minus_1(self, v_0, q_0, mesh3d):
+    def F_0(self, v_0, q_0, mesh3d):
 
         # In the paper n points into the centre of the particle
         # FacetNormal(mesh) always points out of the mesh => Therefore they both point in the same direction
         n = FacetNormal(mesh3d)
         sigma = -q_0 * Identity(3) + (grad(v_0) + grad(v_0).T)
         traction = dot(-n, sigma)
-        components = [assemble(traction[i] * ds(self.tags["particle"])) for i in range(3)]
-        F_minus_1 = np.array([float(c) for c in components])
-        return F_minus_1
+        components = [assemble(traction[i] * ds(self.tags["particle"], degree=8)) for i in range(3)]
+        F_0 = np.array([float(c) for c in components])
+        return F_0
 
 
-    def T_minus_1(self, v_0_a, q_0_a, mesh3d):
+    def T_0(self, v_0_a, q_0_a, mesh3d):
 
         n = FacetNormal(mesh3d)
         sigma = -q_0_a * Identity(3) + (grad(v_0_a) + grad(v_0_a).T)
         traction = dot(-n, sigma)
         moment_density = cross((self.x - self.x_p), traction)
-        components = [assemble(moment_density[i] * ds(self.tags["particle"])) for i in range(3)]
-        T_minus_1 = np.array([float(c) for c in components])
-        return T_minus_1
+        components = [assemble(moment_density[i] * ds(self.tags["particle"], degree=8)) for i in range(3)]
+        T_0 = np.array([float(c) for c in components])
+        return T_0
 
 
-    def compute_F_0(self, v_0_a, v_0_s, u_x, u_z, u_bar_a, u_bar_s, Theta_np):
+    def compute_F_1(self, v_0_a, v_0_s, u_x, u_z, u_bar_a, u_bar_s, Theta_np):
 
         x_p_np = np.array(self.x_p.values())
         e_x_prime_np = np.array(self.e_x_prime.values())
@@ -158,21 +163,22 @@ class perturbed_flow:
 
         fluid_stress_term = fluid_stress_integral_x * e_x_prime_np + fluid_stress_integral_z * e_z_np
 
-        F_0 = fluid_stress_term + inertial_term + centrifugal_term
+        F_1 = fluid_stress_term + inertial_term + centrifugal_term
 
-        return F_0
+        return F_1
 
 
     def F_p(self):
-
         u_bar_a = dot(self.u_bar, self.e_theta_prime) * self.e_theta_prime
-        u_bar_s = dot(self.u_bar, self.e_r_prime) * self.e_r_prime + dot(self.u_bar, self.e_z_prime) * self.e_z_prime
+        u_bar_s = (dot(self.u_bar, self.e_r_prime) * self.e_r_prime
+                   + dot(self.u_bar, self.e_z_prime) * self.e_z_prime)
 
+        # --- Five basis fields for the linearity decomposition ---
         bcs_Theta = cross(self.e_z_prime, self.x)
         bcs_Omega_p_x = cross(self.e_x_prime, self.x - self.x_p)
         bcs_Omega_p_y = cross(self.e_y_prime, self.x - self.x_p)
         bcs_Omega_p_z = cross(self.e_z_prime, self.x - self.x_p)
-        bcs_bg = -u_bar_a
+        bcs_bg = -u_bar_a  # axial part of the background-driven BC
 
         v_0_a_Theta, q_0_a_Theta = self.Stokes_solver_3d(bcs_Theta)
         v_0_a_Omega_p_x, q_0_a_Omega_p_x = self.Stokes_solver_3d(bcs_Omega_p_x)
@@ -180,43 +186,53 @@ class perturbed_flow:
         v_0_a_Omega_p_z, q_0_a_Omega_p_z = self.Stokes_solver_3d(bcs_Omega_p_z)
         v_0_a_bg, q_0_a_bg = self.Stokes_solver_3d(bcs_bg)
 
-        F_minus_1_a_Theta = self.F_minus_1(v_0_a_Theta, q_0_a_Theta, self.mesh3d)
-        F_minus_1_a_Omega_p_x = self.F_minus_1(v_0_a_Omega_p_x, q_0_a_Omega_p_x, self.mesh3d)
-        F_minus_1_a_Omega_p_y = self.F_minus_1(v_0_a_Omega_p_y, q_0_a_Omega_p_y, self.mesh3d)
-        F_minus_1_a_Omega_p_z = self.F_minus_1(v_0_a_Omega_p_z, q_0_a_Omega_p_z, self.mesh3d)
-        F_minus_1_a_Omega_bg = self.F_minus_1(v_0_a_bg, q_0_a_bg, self.mesh3d)
+        # --- CHANGED: secondary solve moved up so it can enter the closure ---
+        v_0_s, q_0_s = self.Stokes_solver_3d(-u_bar_s)
 
-        T_minus_1_a_Theta = self.T_minus_1(v_0_a_Theta, q_0_a_Theta, self.mesh3d)
-        T_minus_1_a_Omega_p_x = self.T_minus_1(v_0_a_Omega_p_x, q_0_a_Omega_p_x, self.mesh3d)
-        T_minus_1_a_Omega_p_y = self.T_minus_1(v_0_a_Omega_p_y, q_0_a_Omega_p_y, self.mesh3d)
-        T_minus_1_a_Omega_p_z = self.T_minus_1(v_0_a_Omega_p_z, q_0_a_Omega_p_z, self.mesh3d)
-        T_minus_1_a_Omega_bg = self.T_minus_1(v_0_a_bg, q_0_a_bg, self.mesh3d)
+        # --- Forces for all basis fields, including the secondary one ---
+        F_0_a_Theta = self.F_0(v_0_a_Theta, q_0_a_Theta, self.mesh3d)
+        F_0_a_Omega_p_x = self.F_0(v_0_a_Omega_p_x, q_0_a_Omega_p_x, self.mesh3d)
+        F_0_a_Omega_p_y = self.F_0(v_0_a_Omega_p_y, q_0_a_Omega_p_y, self.mesh3d)
+        F_0_a_Omega_p_z = self.F_0(v_0_a_Omega_p_z, q_0_a_Omega_p_z, self.mesh3d)
+        F_0_a_Omega_bg = self.F_0(v_0_a_bg, q_0_a_bg, self.mesh3d)
+        F_0_s = self.F_0(v_0_s, q_0_s, self.mesh3d)
+
+        # --- Torques for all basis fields, including the secondary one ---
+        T_0_a_Theta = self.T_0(v_0_a_Theta, q_0_a_Theta, self.mesh3d)
+        T_0_a_Omega_p_x = self.T_0(v_0_a_Omega_p_x, q_0_a_Omega_p_x, self.mesh3d)
+        T_0_a_Omega_p_y = self.T_0(v_0_a_Omega_p_y, q_0_a_Omega_p_y, self.mesh3d)
+        T_0_a_Omega_p_z = self.T_0(v_0_a_Omega_p_z, q_0_a_Omega_p_z, self.mesh3d)
+        T_0_a_Omega_bg = self.T_0(v_0_a_bg, q_0_a_bg, self.mesh3d)
+        T_0_s = self.T_0(v_0_s, q_0_s, self.mesh3d)
 
         e_x_np = np.array(self.e_x_prime.values())
         e_y_np = np.array(self.e_y_prime.values())
         e_z_np = np.array(self.e_z_prime.values())
 
+        # --- Closure matrix: unchanged (the basis fields don't see the secondary BC) ---
         A = np.array([
+            [np.dot(e_y_np, F_0_a_Theta), np.dot(e_y_np, F_0_a_Omega_p_z),
+             np.dot(e_y_np, F_0_a_Omega_p_x), np.dot(e_y_np, F_0_a_Omega_p_y)],
 
-            [np.dot(e_y_np, F_minus_1_a_Theta), np.dot(e_y_np, F_minus_1_a_Omega_p_z),
-             np.dot(e_y_np, F_minus_1_a_Omega_p_x), np.dot(e_y_np, F_minus_1_a_Omega_p_y)],
+            [np.dot(e_x_np, T_0_a_Theta), np.dot(e_x_np, T_0_a_Omega_p_z),
+             np.dot(e_x_np, T_0_a_Omega_p_x), np.dot(e_x_np, T_0_a_Omega_p_y)],
 
-            [np.dot(e_x_np, T_minus_1_a_Theta), np.dot(e_x_np, T_minus_1_a_Omega_p_z),
-             np.dot(e_x_np, T_minus_1_a_Omega_p_x), np.dot(e_x_np, T_minus_1_a_Omega_p_y)],
+            [np.dot(e_y_np, T_0_a_Theta), np.dot(e_y_np, T_0_a_Omega_p_z),
+             np.dot(e_y_np, T_0_a_Omega_p_x), np.dot(e_y_np, T_0_a_Omega_p_y)],
 
-            [np.dot(e_y_np, T_minus_1_a_Theta), np.dot(e_y_np, T_minus_1_a_Omega_p_z),
-             np.dot(e_y_np, T_minus_1_a_Omega_p_x), np.dot(e_y_np, T_minus_1_a_Omega_p_y)],
-
-            [np.dot(e_z_np, T_minus_1_a_Theta), np.dot(e_z_np, T_minus_1_a_Omega_p_z),
-             np.dot(e_z_np, T_minus_1_a_Omega_p_x), np.dot(e_z_np, T_minus_1_a_Omega_p_y)]
+            [np.dot(e_z_np, T_0_a_Theta), np.dot(e_z_np, T_0_a_Omega_p_z),
+             np.dot(e_z_np, T_0_a_Omega_p_x), np.dot(e_z_np, T_0_a_Omega_p_y)]
         ])
 
+        # Full background contribution = axial-bg + secondary
+        F_0_bg = F_0_a_Omega_bg + F_0_s
+        T_0_bg = T_0_a_Omega_bg + T_0_s
 
         b = -np.array([
-            np.dot(e_y_np, F_minus_1_a_Omega_bg),
-            np.dot(e_x_np, T_minus_1_a_Omega_bg),
-            np.dot(e_y_np, T_minus_1_a_Omega_bg),
-            np.dot(e_z_np, T_minus_1_a_Omega_bg)
+            np.dot(e_y_np, F_0_bg),
+            np.dot(e_x_np, T_0_bg),
+            np.dot(e_y_np, T_0_bg),
+            np.dot(e_z_np, T_0_bg),
         ])
 
         Theta_and_Omega_p = np.linalg.solve(A, b)
@@ -226,56 +242,52 @@ class perturbed_flow:
         Omega_p_x = float(Theta_and_Omega_p[2])
         Omega_p_y = float(Theta_and_Omega_p[3])
 
+        # --- Assemble the (axial part of the) leading-order disturbance ---
         v_0_a = Function(v_0_a_Theta.function_space())
+        v_0_a.interpolate(Constant(Theta) * v_0_a_Theta
+                          + Constant(Omega_p_x) * v_0_a_Omega_p_x
+                          + Constant(Omega_p_y) * v_0_a_Omega_p_y
+                          + Constant(Omega_p_z) * v_0_a_Omega_p_z
+                          + v_0_a_bg)
 
-        v_0_a.interpolate(Constant(Theta) * v_0_a_Theta +
-                          Constant(Omega_p_x) * v_0_a_Omega_p_x +
-                          Constant(Omega_p_y) * v_0_a_Omega_p_y +
-                          Constant(Omega_p_z) * v_0_a_Omega_p_z +
-                          v_0_a_bg)
+        # Assemble the full leading-order force from the basis-field forces
+        F_0_a = (Theta * F_0_a_Theta
+                 + Omega_p_x * F_0_a_Omega_p_x
+                 + Omega_p_y * F_0_a_Omega_p_y
+                 + Omega_p_z * F_0_a_Omega_p_z
+                 + F_0_a_Omega_bg)
+        F_0_total = F_0_a + F_0_s
 
-        v_0_s, q_0_s = self.Stokes_solver_3d(-u_bar_s)
-
-        F_minus_1_s = self.F_minus_1(v_0_s, q_0_s, self.mesh3d)
-
+        # --- Auxiliary Stokes fields for the reciprocal-theorem volume integrals ---
         u_hat_x, _ = self.Stokes_solver_3d(self.e_x_prime)
         u_hat_z, _ = self.Stokes_solver_3d(self.e_z_prime)
 
-        F_0 = self.compute_F_0(v_0_a, v_0_s, u_hat_x, u_hat_z, u_bar_a, u_bar_s, Theta)
+        # First-order corrections (background, inertial, centrifugal)
+        F_1 = self.compute_F_1(v_0_a, v_0_s, u_hat_x, u_hat_z, u_bar_a, u_bar_s, Theta)
 
-        F_p_x = np.dot(e_x_np, 1/self.Re_p * F_minus_1_s + F_0)
-        F_p_z = np.dot(e_z_np, 1/self.Re_p * F_minus_1_s + F_0)
+        F_p_x = np.dot(e_x_np, 1 / self.Re * F_0_total + F_1)
+        F_p_z = np.dot(e_z_np, 1 / self.Re * F_0_total + F_1)
 
         return F_p_x, F_p_z
 
 
 if __name__ == "__main__":
 
-    R_hat = 500
-    H_hat = 2
-    W_hat = 2
-    a_hat = 0.13606788
-    Re = 1.0
+    R_hat, H_hat, W_hat, a_hat, L_c, U_c, Re = nondimensionalisation(R, H, W, a, Q, rho, mu)
 
-    r_off = 0.61282900
-    z_off = 0.04137774
-
-    L_hat = 4 * max(H_hat, W_hat)
-    particle_maxh = 0.06 * a_hat
-    global_maxh = 0.2 * min(H_hat, W_hat)
-
-    from background_flow import *
-    from build_3d_geometry_gmsh import make_curved_channel_section_with_spherical_hole
+    x_off = 0.0
+    z_off = 0.0
 
     bg = background_flow(R_hat, H_hat, W_hat, Re)
     G_val, U_m_hat, u_bar, p_bar_tilde = bg.solve_2D_background_flow()
 
-    mesh3d, tags = make_curved_channel_section_with_spherical_hole(R_hat, H_hat, W_hat, L_hat, a_hat,
-                                                                   particle_maxh, global_maxh, r_off=r_off, z_off=z_off)
+    mesh3d, tags = make_curved_channel_section_with_spherical_hole(R_hat, H_hat, W_hat, L_rel * max(H_hat, W_hat), a_hat,
+                                                                   particle_maxh_rel * a_hat, global_maxh_rel * min(H_hat, W_hat),
+                                                                   x_off=x_off, z_off=z_off)
 
     u_bar_3d, p_bar_3d = build_3d_background_flow(R_hat, H_hat, W_hat, G_val, mesh3d, tags, u_bar, p_bar_tilde)
 
-    pf = perturbed_flow(R_hat, H_hat, W_hat, L_hat, a_hat, Re, mesh3d, tags, u_bar_3d, p_bar_3d)
+    pf = perturbed_flow(R_hat, H_hat, W_hat, L_rel * max(H_hat, W_hat), a_hat, Re, mesh3d, tags, u_bar_3d, p_bar_3d)
 
     F_p_x, F_p_z = pf.F_p()
 

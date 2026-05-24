@@ -1,20 +1,24 @@
 import os
 os.environ["OMP_NUM_THREADS"] = "1"
 
-import gc
-import math
-
 from firedrake import *
-from firedrake.adjoint import stop_annotating, annotate_tape, taylor_test, continue_annotation
-from pyadjoint import Block, AdjFloat, get_working_tape, ReducedFunctional, Control, Tape, set_working_tape, continue_annotation, taylor_to_dict
+from firedrake.adjoint import stop_annotating, annotate_tape, taylor_test, continue_annotation, AdjFloat, get_working_tape, ReducedFunctional, Control, Tape, set_working_tape, taylor_to_dict
 from firedrake.adjoint_utils.blocks.solving import GenericSolveBlock, solve_init_params
-import ufl
 from firedrake.adjoint_utils.blocks.assembly import AssembleBlock
 from firedrake.adjoint_utils.blocks.block_utils import isconstant
+from pyadjoint import Block
+from pyadjoint.adjfloat import AdjFloatExprBlock
+import ufl
 from ufl.domain import as_domain
+import gc
+import math
+import numpy as np
 
-from background_flow_differentiable import background_flow_differentiable, build_3d_background_flow_differentiable, build_xi_diff
+from background_flow_differentiable import background_flow_differentiable, build_3d_background_flow_differentiable
 from build_3d_geometry_gmsh import make_curved_channel_section_with_spherical_hole
+from background_flow import background_flow, build_3d_background_flow
+from perturbed_flow import perturbed_flow
+from config_paper_parameters import *
 
 # ---------------------------------------------------------------------------
 #  Monkey-patch: fix AssembleBlock.evaluate_hessian_component
@@ -126,8 +130,6 @@ AssembleBlock.evaluate_hessian_component = _patched_evaluate_hessian_component
 #  Similarly the linear term ``codegen(diff=(idx,))(*inputs) * hessian_input``
 #  crashes when hessian_input is None.  Both must be guarded.
 # ---------------------------------------------------------------------------
-from pyadjoint.adjfloat import AdjFloatExprBlock
-
 def _patched_adjfloat_expr_hessian(self, inputs, hessian_inputs, adj_inputs, block_variable, idx, relevant_dependencies, prepared=None):
     hessian_input, = hessian_inputs
     adj_input, = adj_inputs
@@ -150,15 +152,6 @@ AdjFloatExprBlock.evaluate_hessian_component = _patched_adjfloat_expr_hessian
 
 
 class CrossProductBCBlock(Block):
-    """Tape block for bc = cross(e_vec, X_ref + xi - offset).
-
-    The operation is linear in xi (CG1 vector), output lives in V_out (CG2 vector).
-    The CG1→CG2 mapping is handled by firedrake's interpolation infrastructure:
-    we precompute `base = cross(e, X_ref - offset)` at CG2 dofs, and the
-    xi-dependent part is `cross(e, xi)` interpolated from CG1 to CG2.
-
-    Dependencies: idx=0 → xi (CG1 vector Function)
-    """
 
     def __init__(self, xi_fn, out_fn, e_vec, X_ref_CG2_data, offset, V_xi, V_out, M):
         super().__init__()
@@ -346,25 +339,6 @@ class NumpyLinSolveBlock(Block):
 
 
 class RScalarBlock(Block):
-    """Tape-aware extraction of the single value of a Function on R-space.
-
-    The idiomatic ``assemble(fn * dx) / assemble(Constant(1.0) * dx)``
-    pattern puts the R-space coefficient inside a UFL form, which breaks
-    pyadjoint's Hessian pass via a UFL ``replace`` failure inside
-    firedrake's tsfc-interface.  Worse, the implicit mesh-coordinate
-    adjoint contributions from the numerator and denominator
-    AssembleBlocks do not numerically cancel under the chain rule when
-    the mesh changes (e.g. via a sphere-radius scaling delta_a),
-    producing wrong first derivatives.
-
-    This block bypasses both issues by reading ``fn.dat.data[0]``
-    directly in ``recompute_component`` and providing exact reverse / TLM
-    / Hessian routines that carry only the R-space adjoint, with no
-    spurious mesh contribution.  The map ``fn -> AdjFloat(fn[0])`` is
-    linear, so its second derivative vanishes; only the linear part of
-    the second-order seed propagates back through
-    ``evaluate_hessian_component``.
-    """
 
     def __init__(self, fn, out):
         super().__init__()
@@ -403,40 +377,6 @@ class RScalarBlock(Block):
 
 
 class CylProjectBlock(Block):
-    """Tape-aware azimuthal/symmetric BC projection.
-
-    Computes either the azimuthal or symmetric Stokes BC from the
-    cylindrical velocity field and the rotation angles:
-
-        mode="azim":  bc_bg = -dot(u_bar_bc, e_theta_bc) * e_theta_bc
-            Since dot(u_bar_bc, e_theta_bc) = u_theta = u_cyl[:, 2],
-            and e_theta_bc = [-sin_phi, cos_phi, 0]:
-            out[:, 0] =  u_cyl[:, 2] * sin_phi[:]
-            out[:, 1] = -u_cyl[:, 2] * cos_phi[:]
-            out[:, 2] =  0
-
-        mode="sym":  bc_sym = -(u_r * e_r_bc + u_z * e_z)
-            out[:, 0] = -u_cyl[:, 0] * cos_phi[:]
-            out[:, 1] = -u_cyl[:, 0] * sin_phi[:]
-            out[:, 2] = -u_cyl[:, 1]
-
-    The map is bilinear in (cos_phi/sin_phi, u_cyl): the pure second
-    derivatives vanish, only the cross-partials between the trig
-    functions and u_cyl components are non-zero.  This is the same
-    structure as V0aCombineBlock but for CG2 scalar × CG2 vector
-    instead of R-space scalar × CG2 vector.
-
-    This block replaces ``bc.interpolate(-u_bar_a_bc)`` (resp.
-    ``-u_bar_s_bc``) which involves a product of two tape-tracked
-    Functions inside a single Interpolate — exactly the case that
-    crashes pyadjoint's Hessian pass with ``ZeroBaseForm has no
-    ufl_shape``.
-
-    Dependencies:
-        idx 0: cos_phi  (CG2 scalar Function)
-        idx 1: sin_phi  (CG2 scalar Function)
-        idx 2: u_cyl_3d (CG2 vector Function, 3 components)
-    """
 
     def __init__(self, cos_phi, sin_phi, u_cyl, out, mode):
         super().__init__()
@@ -974,6 +914,14 @@ class CachedStokesSolveBlock(GenericSolveBlock):
         For DirichletBC dependencies, extract the velocity subfunction
         from our corrected adj_sol2_bdy (pointwise copy, no L2 Riesz).
         """
+        # ``prepared`` is None whenever this block has no SOA contribution
+        # (e.g. ``tlm_output is None`` because the Stokes solve's BCs do not
+        # depend on the TLM direction — happens for the bc_ex/bc_ez solves
+        # when m_dot has zero entries on dr/dz).  Pyadjoint's parent class
+        # crashes with a subscript error in that case, so short-circuit here.
+        if prepared is None:
+            return None
+
         c = block_variable.output
 
         if not isinstance(c, firedrake.DirichletBC):
@@ -1075,12 +1023,7 @@ def numpy_lin_solve_to_R(A_adj_floats, b_adj_floats, R_space, n):
 
 
 def r_scalar(fn):
-    """Convert a Function on an R-space to an AdjFloat on the tape.
 
-    Used in F_p() to lift the linear-solve outputs Theta_fn / Omega_*_fn
-    out of the centrifugal and fluid_stress forms before they are used
-    quadratically.  See RScalarBlock for the rationale.
-    """
     val = AdjFloat(float(fn.dat.data_ro[0]))
     if annotate_tape():
         block = RScalarBlock(fn, val)
@@ -1089,11 +1032,7 @@ def r_scalar(fn):
 
 
 def cyl_project(cos_phi_fn, sin_phi_fn, u_cyl, V, mode):
-    """Tape-aware computation of the azimuthal or symmetric Stokes BC.
 
-    See CylProjectBlock for the mathematical definition.
-    ``mode`` must be ``"azim"`` or ``"sym"``.
-    """
     out = Function(V, name=f"bc_{'bg' if mode == 'azim' else 'sym'}")
     c = cos_phi_fn.dat.data_ro
     s = sin_phi_fn.dat.data_ro
@@ -1113,13 +1052,7 @@ def cyl_project(cos_phi_fn, sin_phi_fn, u_cyl, V, mode):
 
 
 def combine_v_0_a(T_fn, Ox_fn, Oy_fn, Oz_fn, v_T, v_Ox, v_Oy, v_Oz, v_bg, V):
-    """Tape-aware construction of
-        v_0_a = T*v_T + Ox*v_Ox + Oy*v_Oy + Oz*v_Oz + v_bg
-    on the function space ``V``.  Replaces the equivalent
-    ``Function.interpolate(...)`` call so the resulting tape has a
-    custom block whose Hessian path is exact (see V0aCombineBlock for
-    the rationale).
-    """
+
     out = Function(V, name="v_0_a")
     with stop_annotating():
         T = float(T_fn.dat.data_ro[0])
@@ -1595,16 +1528,15 @@ def estimate_eigenvectors(J):
 class XiHatBlock(Block):
 
     def __init__(self, delta_r, delta_z, delta_a, xi_out,
-                 cos_th, sin_th, bump_data, d_hat_data, V_def):
+                 basis_r, basis_z, basis_a, V_def):
         super().__init__()
         self.add_dependency(delta_r)
         self.add_dependency(delta_z)
         self.add_dependency(delta_a)
         self.add_output(xi_out.create_block_variable())
-        self.cos_th = cos_th
-        self.sin_th = sin_th
-        self.bump = bump_data       # (n_nodes,)
-        self.d_hat = d_hat_data     # (n_nodes, 3)
+        self.basis_r = basis_r       # (n_nodes, 3)
+        self.basis_z = basis_z       # (n_nodes, 3)
+        self.basis_a = basis_a       # (n_nodes, 3)
         self.V_def = V_def
 
     def recompute_component(self, inputs, block_variable, idx, prepared):
@@ -1612,51 +1544,39 @@ class XiHatBlock(Block):
         dz = float(inputs[1].dat.data_ro[0])
         da = float(inputs[2].dat.data_ro[0])
         out = block_variable.output
-        b, d = self.bump, self.d_hat
         with stop_annotating():
-            out.dat.data[:, 0] = (dr * self.cos_th + da * d[:, 0]) * b
-            out.dat.data[:, 1] = (dr * self.sin_th + da * d[:, 1]) * b
-            out.dat.data[:, 2] = (dz               + da * d[:, 2]) * b
+            out.dat.data[:] = (dr * self.basis_r
+                               + dz * self.basis_z
+                               + da * self.basis_a)
         return out
 
     def evaluate_adj_component(self, inputs, adj_inputs, block_variable, idx,
                                prepared=None):
         if adj_inputs[0] is None:
             return None
-        a = np.asarray(adj_inputs[0].dat.data_ro)   # (n_nodes, 3)
-        b, d = self.bump, self.d_hat
+        a_in = np.asarray(adj_inputs[0].dat.data_ro)   # (n_nodes, 3)
         with stop_annotating():
             R_space = inputs[idx].function_space()
             out = Cofunction(R_space.dual())
             if idx == 0:    # delta_r
-                out.dat.data[0] = float(np.sum(
-                    self.cos_th * b * a[:, 0] + self.sin_th * b * a[:, 1]))
+                out.dat.data[0] = float(np.sum(self.basis_r * a_in))
             elif idx == 1:  # delta_z
-                out.dat.data[0] = float(np.sum(b * a[:, 2]))
+                out.dat.data[0] = float(np.sum(self.basis_z * a_in))
             elif idx == 2:  # delta_a
-                out.dat.data[0] = float(np.sum(
-                    d[:, 0] * b * a[:, 0] + d[:, 1] * b * a[:, 1]
-                    + d[:, 2] * b * a[:, 2]))
+                out.dat.data[0] = float(np.sum(self.basis_a * a_in))
         return out
 
     def evaluate_tlm_component(self, inputs, tlm_inputs, block_variable, idx,
                                prepared=None):
-        b, d = self.bump, self.d_hat
         with stop_annotating():
             out = Function(self.V_def)
             data = np.zeros_like(out.dat.data)
             if tlm_inputs[0] is not None:
-                ddr = float(tlm_inputs[0].dat.data_ro[0])
-                data[:, 0] += ddr * self.cos_th * b
-                data[:, 1] += ddr * self.sin_th * b
+                data += float(tlm_inputs[0].dat.data_ro[0]) * self.basis_r
             if tlm_inputs[1] is not None:
-                ddz = float(tlm_inputs[1].dat.data_ro[0])
-                data[:, 2] += ddz * b
+                data += float(tlm_inputs[1].dat.data_ro[0]) * self.basis_z
             if tlm_inputs[2] is not None:
-                dda = float(tlm_inputs[2].dat.data_ro[0])
-                data[:, 0] += dda * d[:, 0] * b
-                data[:, 1] += dda * d[:, 1] * b
-                data[:, 2] += dda * d[:, 2] * b
+                data += float(tlm_inputs[2].dat.data_ro[0]) * self.basis_a
             out.dat.data[:] = data
         return out
 
@@ -1671,23 +1591,85 @@ class XiHatBlock(Block):
             inputs, hessian_inputs, block_variable, idx, prepared)
 
 
+def _solve_ale_basis_hat(mesh3d, V_def, tags, theta_half, particle_center, a_hat_init):
+
+    cx, cy, cz = particle_center
+    cos_th = math.cos(theta_half)
+    sin_th = math.sin(theta_half)
+
+    with stop_annotating():
+        # ── Cell-volume-weighted stiffness ──
+        DG0 = FunctionSpace(mesh3d, "DG", 0)
+        vol_fn = Function(DG0)
+        vol_fn.interpolate(CellVolume(mesh3d))
+        v_arr_cell = np.asarray(vol_fn.dat.data_ro)
+        v_max = float(v_arr_cell.max())
+        mu_field = Function(DG0, name="mu_ale")
+        mu_field.dat.data[:] = v_max / np.maximum(v_arr_cell, 1e-300)
+        lam_field = Function(DG0, name="lam_ale")
+        lam_field.dat.data[:] = 0.5 * mu_field.dat.data_ro   # nu ≈ 0.25
+
+        u = TrialFunction(V_def)
+        v = TestFunction(V_def)
+        eps_u = sym(grad(u))
+        sig_u = 2 * mu_field * eps_u + lam_field * tr(eps_u) * Identity(3)
+        a_form = inner(sig_u, sym(grad(v))) * dx
+        L_form = inner(Constant((0.0, 0.0, 0.0)), v) * dx
+
+        zero3 = Constant((0.0, 0.0, 0.0))
+        bc_walls  = DirichletBC(V_def, zero3, tags['walls'])
+        bc_inlet  = DirichletBC(V_def, zero3, tags['inlet'])
+        bc_outlet = DirichletBC(V_def, zero3, tags['outlet'])
+        bcs_outer = [bc_walls, bc_inlet, bc_outlet]
+
+        sp = {"ksp_type": "cg", "pc_type": "gamg", "ksp_rtol": 1e-10,
+              "ksp_max_it": 200}
+
+        # basis_r
+        xi_r = Function(V_def, name="xi_basis_r")
+        bc_r = DirichletBC(V_def, Constant((cos_th, sin_th, 0.0)), tags['particle'])
+        solve(a_form == L_form, xi_r, bcs=[bc_r] + bcs_outer, solver_parameters=sp)
+
+        # basis_z
+        xi_z = Function(V_def, name="xi_basis_z")
+        bc_z = DirichletBC(V_def, Constant((0.0, 0.0, 1.0)), tags['particle'])
+        solve(a_form == L_form, xi_z, bcs=[bc_z] + bcs_outer, solver_parameters=sp)
+
+        # basis_a — radial sphere expansion
+        xi_a = Function(V_def, name="xi_basis_a")
+        X = SpatialCoordinate(mesh3d)
+        a_const = Constant(a_hat_init)
+        bc_a_expr = as_vector([(X[0] - cx) / a_const,
+                               (X[1] - cy) / a_const,
+                               (X[2] - cz) / a_const])
+        bc_a = DirichletBC(V_def, bc_a_expr, tags['particle'])
+        solve(a_form == L_form, xi_a, bcs=[bc_a] + bcs_outer, solver_parameters=sp)
+
+        basis_r_data = np.asarray(xi_r.dat.data_ro).copy()
+        basis_z_data = np.asarray(xi_z.dat.data_ro).copy()
+        basis_a_data = np.asarray(xi_a.dat.data_ro).copy()
+
+    print(f"  ALE basis solved: |basis_r|_max = {np.linalg.norm(basis_r_data, axis=1).max():.4e}, "
+          f"|basis_z|_max = {np.linalg.norm(basis_z_data, axis=1).max():.4e}, "
+          f"|basis_a|_max = {np.linalg.norm(basis_a_data, axis=1).max():.4e}")
+
+    return basis_r_data, basis_z_data, basis_a_data
+
+
 def _build_xi_hat(delta_r, delta_z, delta_a, md):
-    """Build mesh deformation via custom tape block (Hessian-safe).
-    Replaces the original ``xi.interpolate(as_vector([...]))`` which crashes
-    pyadjoint's Hessian on InterpolateBlocks mixing R-space and CG1 coefficients.
-    """
+
     xi = Function(md['V_def'], name="xi")
-    b, d = md['bump_data'], md['d_hat_data']
+    br = md['basis_r_data']
+    bz = md['basis_z_data']
+    ba = md['basis_a_data']
     dr = float(delta_r.dat.data_ro[0])
     dz = float(delta_z.dat.data_ro[0])
     da = float(delta_a.dat.data_ro[0])
     with stop_annotating():
-        xi.dat.data[:, 0] = (dr * md['cos_th'] + da * d[:, 0]) * b
-        xi.dat.data[:, 1] = (dr * md['sin_th'] + da * d[:, 1]) * b
-        xi.dat.data[:, 2] = (dz                + da * d[:, 2]) * b
+        xi.dat.data[:] = dr * br + dz * bz + da * ba
     if annotate_tape():
         block = XiHatBlock(delta_r, delta_z, delta_a, xi,
-                           md['cos_th'], md['sin_th'], b, d, md['V_def'])
+                           br, bz, ba, md['V_def'])
         get_working_tape().add_block(block)
     return xi
 
@@ -1714,51 +1696,133 @@ def setup_moving_mesh_hat(r_off_hat_init, z_off_hat_init, a_hat_init, R_hat, H_h
         X_ref = Function(V_def)
         X_ref.interpolate(SpatialCoordinate(mesh3d))
 
-    cx, cy, cz = tags["particle_center"]
-    dist = sqrt((X_ref[0] - cx)**2 + (X_ref[1] - cy)**2 + (X_ref[2] - cz)**2)
-
-    # The bump function is 1 on sphere surface and then linearly decays to 0 at r_cut
-    r_cut = Constant(0.5 * min(H_hat, W_hat))
-    a_c = Constant(a_hat_init)
-    bump = max_value(Constant(0.0), 1.0 - max_value(Constant(0.0), dist - a_c) / (r_cut - a_c))
-
-    # Unit direction from sphere center (for radial sphere scaling).
-    # Safe because dist >= a_hat_init > 0 on all mesh nodes.
-    d_hat_x = (X_ref[0] - cx) / dist
-    d_hat_y = (X_ref[1] - cy) / dist
-    d_hat_z = (X_ref[2] - cz) / dist
-
+    particle_center = tags["particle_center"]
     theta_half = tags["theta"] / 2.0
 
     ref_signs = check_mesh_quality(mesh3d)
 
-    # Pre-evaluate bump and d_hat to numpy arrays (off-tape) for XiHatBlock.
-    with stop_annotating():
-        V_scalar = FunctionSpace(mesh3d, "CG", 1)
-        bump_fn = Function(V_scalar, name="bump_eval")
-        bump_fn.interpolate(bump)
-        bump_data = bump_fn.dat.data_ro.copy()
-        d_hat_fn = Function(V_def, name="d_hat_eval")
-        d_hat_fn.interpolate(as_vector([d_hat_x, d_hat_y, d_hat_z]))
-        d_hat_data = d_hat_fn.dat.data_ro.copy()
-
     print(f"Mesh in hat coords: R={R_hat:.2f}, H={H_hat:.2f}, W={W_hat:.2f}, a={a_hat_init:.4f}, L={L_hat:.2f}")
+
+    # Linear-elasticity ALE: pre-solve once for three basis displacement
+    # fields (one per control: dr, dz, da). Cell-volume-weighted stiffness
+    # keeps small cells near the particle nearly rigid; the bulk absorbs
+    # the deformation. At run time xi is a linear combination of these
+    # fields, evaluated cheaply per evaluate_forces call.
+    basis_r_data, basis_z_data, basis_a_data = _solve_ale_basis_hat(
+        mesh3d, V_def, tags, theta_half, particle_center, a_hat_init)
+
+    # Static channel-wall deformation (T_2d lifted to 3D). Default zero;
+    # owners that perform shape optimization update this in-place to keep
+    # the 3D geometry consistent with the deformed 2D cross-section.
+    # `xi_baseline` is the cumulative absorbed particle motion across past
+    # accepted shape-opt steps. Updated by `reset_ale_basis_for_step` to
+    # snap the rest state of the linear ALE basis, so MS in the next step
+    # starts at (dr,dz,da)=0 with a freshly linearised basis.
+    with stop_annotating():
+        xi_channel  = Function(V_def, name="xi_channel_static")
+        xi_baseline = Function(V_def, name="xi_baseline_static")
 
     return {
         'mesh3d': mesh3d, 'tags': tags,
         'X_ref': X_ref, 'V_def': V_def,
-        'bump': bump,
-        'bump_data': bump_data, 'd_hat_data': d_hat_data,
-        'd_hat_x': d_hat_x, 'd_hat_y': d_hat_y, 'd_hat_z': d_hat_z,
-        'cos_th': math.cos(theta_half),
-        'sin_th': math.sin(theta_half),
+        'basis_r_data': basis_r_data,
+        'basis_z_data': basis_z_data,
+        'basis_a_data': basis_a_data,
         'R_hat': R_hat, 'H_hat': H_hat, 'W_hat': W_hat,
         'L_hat': L_hat, 'a_hat_init': a_hat_init,
         'G_hat': G_hat, 'Re': Re, 'U_m_hat': U_m_hat,
         'u_bar_2d_hat': u_bar_2d_hat,
         'p_bar_tilde_2d_hat': p_bar_tilde_2d_hat,
         'ref_signs': ref_signs,
+        'xi_channel':  xi_channel,
+        'xi_baseline': xi_baseline,
     }
+
+
+def reset_ale_basis_for_step(md, dr_absorb, dz_absorb, da_absorb):
+    """Snap the linear ALE basis around a new (r,z,a) rest state.
+
+    The ALE basis ``(basis_r, basis_z, basis_a)`` was solved once at a
+    reference configuration. As ``(dr,dz,da)`` drift away from zero,
+    the linear superposition ``xi_particle = dr·basis_r + ...`` becomes
+    less accurate (quadratic-in-drift error), causing FE-noise to bleed
+    into the force residual. After an accepted shape-opt step we call
+    this function to:
+
+    1. Absorb the accepted particle motion into ``md['xi_baseline']``,
+       so subsequent ``evaluate_forces`` calls still produce the same
+       physical mesh state.
+    2. Update the spherical-hole centre and reference radius to where
+       the particle now is.
+    3. Move ``mesh3d.coordinates`` to the new rest state (X_ref +
+       xi_baseline + xi_channel; particle delta = 0).
+    4. Re-solve the three linear-elasticity ALE basis fields at this
+       new rest state.
+
+    The next ``evaluate_forces`` call should be invoked with
+    ``(dr,dz,da) = (0,0,0)`` and will reproduce the current mesh state
+    exactly, plus a freshly-linearised basis for further small motion.
+    No remeshing — same Gmsh topology, same node count, same tags.
+    """
+    # 1. Absorb (dr,dz,da) at the OLD basis into xi_baseline (off-tape add).
+    with stop_annotating():
+        snap = (
+            dr_absorb * md['basis_r_data']
+            + dz_absorb * md['basis_z_data']
+            + da_absorb * md['basis_a_data']
+        )
+        md['xi_baseline'].dat.data[:] += snap
+
+        # 2. Move mesh3d to the new rest state (no further xi_particle).
+        # mesh3d.coords = X_ref + xi_baseline + xi_channel — numerically
+        # identical to the pre-snap mesh state at the accepted bif.
+        mesh3d = md['mesh3d']
+        rest = Function(md['V_def'])
+        rest.assign(md['xi_baseline'] + md['xi_channel'])
+        mesh3d.coordinates.assign(md['X_ref'] + rest)
+
+        # 3. Compute the new particle-hole centre and update the reference
+        # particle radius.
+        #
+        # ── particle_center (NOT updated in md['tags']) ──
+        # The Stokes form's centrifugal term reads x_p = Constant(tags
+        # ['particle_center']) at construction time. If we updated
+        # tags['particle_center'], F_cent ∝ x_p would shift by O(drift)
+        # and break |F|=0 at the accepted bif. So keep md['tags']
+        # ['particle_center'] unchanged. ``new_center`` below is used
+        # *only* as the BC parameter for basis_a in the re-solve.
+        #
+        # ── a_hat_init (DO update md['a_hat_init']) ──
+        # The form computes a_val = md['a_hat_init'] + delta_a, used as
+        # the particle radius in the centrifugal force F_cent ∝ a_val³.
+        # Pre-snap delta_a = drift_da, a_val = a_hat_init_orig + drift_da
+        # = a_bif. Post-snap delta_a = 0 (we absorbed drift). To keep
+        # a_val = a_bif across the snap (and hence F_cent unchanged),
+        # we must set md['a_hat_init'] += drift_da. Without this update,
+        # a_val jumps by O(drift_da) at the snap boundary and |F| at
+        # the bif becomes O(drift_da · 3·a²) ≈ a few × 10⁻⁷.
+        cos_th = math.cos(md['tags']['theta'] / 2.0)
+        sin_th = math.sin(md['tags']['theta'] / 2.0)
+        cx, cy, cz = md['tags']['particle_center']
+        new_center = (
+            cx + cos_th * dr_absorb,
+            cy + sin_th * dr_absorb,
+            cz + dz_absorb,
+        )
+        new_a_init = float(md['a_hat_init']) + float(da_absorb)
+        md['a_hat_init'] = new_a_init    # ← critical: keep form's a_val invariant
+
+        # 4. Re-solve ALE basis at the new rest state. basis_a's BC uses
+        # new_center / new_a_init for clean radial expansion of the
+        # current surface.
+        theta_half = md['tags']['theta'] / 2.0
+        basis_r, basis_z, basis_a = _solve_ale_basis_hat(
+            mesh3d, md['V_def'], md['tags'], theta_half,
+            new_center, new_a_init,
+        )
+        md['basis_r_data'] = basis_r
+        md['basis_z_data'] = basis_z
+        md['basis_a_data'] = basis_a
 
 
 def evaluate_forces(delta_r_hat, delta_z_hat, delta_a_hat, mesh_data, *, jacobian=True, hessian_phi=None):
@@ -1774,7 +1838,13 @@ def evaluate_forces(delta_r_hat, delta_z_hat, delta_a_hat, mesh_data, *, jacobia
     delta_z = Function(R_space, name="delta_z").assign(delta_z_hat)
     delta_a = Function(R_space, name="delta_a").assign(delta_a_hat)
 
-    xi = _build_xi_hat(delta_r, delta_z, delta_a, md)
+    xi_particle = _build_xi_hat(delta_r, delta_z, delta_a, md)
+    # Total mesh deformation = absorbed-baseline (past accepted particle
+    # motions, snap-and-reset) + current linear-ALE particle motion +
+    # cumulative T_2d channel deformation. xi_baseline and xi_channel are
+    # off-tape; xi_particle carries the tape gradient through (dr,dz,da).
+    xi = Function(md['V_def'], name="xi_total")
+    xi.assign(md['xi_baseline'] + xi_particle + md['xi_channel'])
     mesh3d.coordinates.assign(md['X_ref'] + xi)
     check_mesh_quality(mesh3d, ref_signs=md['ref_signs'])
 
@@ -1844,37 +1914,134 @@ def evaluate_forces(delta_r_hat, delta_z_hat, delta_a_hat, mesh_data, *, jacobia
 
 if __name__ == "__main__":
 
-    from nondimensionalization import first_nondimensionalisation
-    from config_paper_parameters import R, H, W, Q, rho, mu, particle_maxh_rel, global_maxh_rel
+    test_points = [
+        (0.61282900, 0.04137774, 0.13606788),
+        (0.55,       0.00,       0.12),
+        (0.65,       0.05,       0.10),
+    ]
 
-    R_hat, H_hat, W_hat, L_c, U_c, Re = first_nondimensionalisation(R, H, W, Q, rho, mu, print_values=True)
+    bg_diff = background_flow_differentiable(R_hat, H_hat, W_hat, Re)
+    G_hat, U_m_hat, u_bar_2d, p_bar_2d = bg_diff.solve_2D_background_flow()
 
-    bg = background_flow_differentiable(R_hat, H_hat, W_hat, Re)
-    G_hat, U_m_hat, u_bar_2d, p_bar_tilde_2d = bg.solve_2D_background_flow()
+    bg_orig = background_flow(R_hat, H_hat, W_hat, Re)
+    G_orig, U_m_orig, u_bar_orig, p_bar_orig = bg_orig.solve_2D_background_flow()
 
-    r_off = 0.132500
-    z_off = 0.0269060194
-    a_hat = 0.1341246983
+    print("Cross-comparison original vs differentiable at multiple points")
 
-    md = setup_moving_mesh_hat(r_off, z_off, a_hat, R_hat, H_hat, W_hat, Re, G_hat, U_m_hat,
-                               u_bar_2d, p_bar_tilde_2d, particle_maxh_rel, global_maxh_rel)
+    for i, (r_off_i, z_off_i, a_hat_i) in enumerate(test_points):
+        print(f"\n--- Point {i}: r_off={r_off_i}, z_off={z_off_i}, a={a_hat_i} ---")
 
-    F, J = evaluate_forces(0.0, 0.0, 0.0, md)
-    J_sp = J[:, :2]
+        # Original (must be off-tape: PointEvaluator crashes under annotation)
+        with stop_annotating():
+            mesh3d_i, tags_i = make_curved_channel_section_with_spherical_hole(
+                R_hat, H_hat, W_hat, L_hat, a_hat_i,
+                particle_maxh_rel * a_hat_i, global_maxh_rel * min(H_hat, W_hat),
+                r_off_i, z_off_i)
 
-    print("r_off: ", r_off)
-    print("z_off: ", z_off)
-    print("a_hat: ", a_hat)
+            u_bar_3d_i, p_bar_3d_i = build_3d_background_flow(
+                R_hat, H_hat, W_hat, G_orig, mesh3d_i, tags_i, u_bar_orig, p_bar_orig)
 
-    print(f"\nF_p_x = {F[0]:.6e}")
-    print(f"F_p_z = {F[1]:.6e}")
-    print(f"|F|   = {np.linalg.norm(F):.6e}")
+            pf_i = perturbed_flow(R_hat, H_hat, W_hat, L_hat, a_hat_i, Re,
+                                  mesh3d_i, tags_i, u_bar_3d_i, p_bar_3d_i)
+            Fx_orig, Fz_orig = pf_i.F_p()
 
-    print(f"\nJacobian (2x2 spatial part):")
-    print(f"  dF_x/dr = {J_sp[0,0]:+.6e}   dF_x/dz = {J_sp[0,1]:+.6e}")
-    print(f"  dF_z/dr = {J_sp[1,0]:+.6e}   dF_z/dz = {J_sp[1,1]:+.6e}")
+        with stop_annotating():
+            md_i = setup_moving_mesh_hat(
+                r_off_i, z_off_i, a_hat_i, R_hat, H_hat, W_hat, Re, G_hat, U_m_hat,
+                u_bar_2d, p_bar_2d, particle_maxh_rel, global_maxh_rel)
 
-    eigpairs = estimate_eigenvectors(J_sp)
-    mu_min = eigpairs[0][0]
+        F_diff_i = evaluate_forces(0.0, 0.0, 0.0, md_i, jacobian=False)
 
-    print(f"|mu_min| = {abs(mu_min):.6e}")
+        abs_x = abs(float(Fx_orig) - F_diff_i[0])
+        abs_z = abs(float(Fz_orig) - F_diff_i[1])
+
+        rel_x = abs(float(Fx_orig) - F_diff_i[0]) / (abs(float(Fx_orig)) + 1e-30)
+        rel_z = abs(float(Fz_orig) - F_diff_i[1]) / (abs(float(Fz_orig)) + 1e-30)
+
+        print(f"  F_p_x: orig={float(Fx_orig):+.10e}  diff={F_diff_i[0]:+.10e}  abs_err = {abs_x:.4e}  rel_err={rel_x:.4e}")
+        print(f"  F_p_z: orig={float(Fz_orig):+.10e}  diff={F_diff_i[1]:+.10e}  abs_err = {abs_z:.4e}  rel_err={rel_z:.4e}")
+
+    print("PART 3: Taylor tests (AD gradient verification)")
+
+    r_off_t, z_off_t, a_hat_t = test_points[0]
+
+    with stop_annotating():
+        md_t = setup_moving_mesh_hat(
+            r_off_t, z_off_t, a_hat_t, R_hat, H_hat, W_hat, Re, G_hat, U_m_hat,
+            u_bar_2d, p_bar_2d, particle_maxh_rel, global_maxh_rel)
+
+    perturbation_labels = ["delta_r", "delta_z", "delta_a"]
+
+    for func_label, func_idx in [("F_p_x", 0), ("F_p_z", 1)]:
+        for ctrl_idx, ctrl_label in enumerate(perturbation_labels):
+            print(f"\n--- Taylor test: d({func_label})/d({ctrl_label}) ---")
+
+            set_working_tape(Tape())
+            continue_annotation()
+
+            mesh3d_t = md_t['mesh3d']
+            R_space = FunctionSpace(mesh3d_t, "R", 0)
+
+            delta_r = Function(R_space, name="delta_r").assign(0.0)
+            delta_z = Function(R_space, name="delta_z").assign(0.0)
+            delta_a = Function(R_space, name="delta_a").assign(0.0)
+
+            xi = _build_xi_hat(delta_r, delta_z, delta_a, md_t)
+            mesh3d_t.coordinates.assign(md_t['X_ref'] + xi)
+            check_mesh_quality(mesh3d_t, ref_signs=md_t['ref_signs'])
+
+            u_bar_3d_t, p_bar_3d_t, u_cyl_3d_t = build_3d_background_flow_differentiable(
+                md_t['R_hat'], md_t['H_hat'], md_t['W_hat'], md_t['G_hat'],
+                mesh3d_t, md_t['tags'], md_t['u_bar_2d_hat'], md_t['p_bar_tilde_2d_hat'],
+                X_ref=md_t['X_ref'], xi=xi)
+
+            pf_t = perturbed_flow_differentiable(
+                md_t['R_hat'], md_t['H_hat'], md_t['W_hat'], md_t['L_hat'],
+                (md_t['a_hat_init'], delta_a), md_t['Re'],
+                mesh3d_t, md_t['tags'], u_bar_3d_t, p_bar_3d_t,
+                md_t['X_ref'], xi, u_cyl_3d_t)
+
+            F_p_x_t, F_p_z_t = pf_t.F_p()
+
+            J_hat = F_p_x_t if func_idx == 0 else F_p_z_t
+
+            controls_list = [delta_r, delta_z, delta_a]
+            ctrl = Control(controls_list[ctrl_idx])
+
+            h = Function(R_space).assign(1.0)
+
+            rf = ReducedFunctional(J_hat, ctrl)
+
+            results = taylor_to_dict(rf, controls_list[ctrl_idx], h)
+
+            print(f"  Zeroth order (|J(m+eps*h) - J(m)|):")
+            for eps_val, rem in zip(results["R0"]["Rate"], results["R0"]["Rate"]):
+                print(f"    rate = {rem:.4f}")
+
+            print(f"  First order  (|J(m+eps*h) - J(m) - eps*dJ*h|):")
+            for eps_val, rem in zip(results["R1"]["Rate"], results["R1"]["Rate"]):
+                print(f"    rate = {rem:.4f}")
+
+            print(f"  Second order (|J(m+eps*h) - J(m) - eps*dJ*h - 0.5*eps^2*d2J*h*h|):")
+            for eps_val, rem in zip(results["R2"]["Rate"], results["R2"]["Rate"]):
+                print(f"    rate = {rem:.4f}")
+
+            expected_0 = 1.0
+            expected_1 = 2.0
+            expected_2 = 3.0
+
+            rates_0 = results["R0"]["Rate"]
+            rates_1 = results["R1"]["Rate"]
+            rates_2 = results["R2"]["Rate"]
+
+            pass_0 = len(rates_0) > 0 and np.mean(rates_0[-3:]) > 0.9 * expected_0
+            pass_1 = len(rates_1) > 0 and np.mean(rates_1[-3:]) > 0.9 * expected_1
+            pass_2 = len(rates_2) > 0 and np.mean(rates_2[-3:]) > 0.9 * expected_2
+
+            print(f"  PASS zeroth order: {pass_0} (mean last 3 rates: {np.mean(rates_0[-3:]) if len(rates_0) >= 3 else 'N/A'})")
+            print(f"  PASS first order:  {pass_1} (mean last 3 rates: {np.mean(rates_1[-3:]) if len(rates_1) >= 3 else 'N/A'})")
+            print(f"  PASS second order: {pass_2} (mean last 3 rates: {np.mean(rates_2[-3:]) if len(rates_2) >= 3 else 'N/A'})")
+
+            stop_annotating()
+            get_working_tape().clear_tape()
+            gc.collect()

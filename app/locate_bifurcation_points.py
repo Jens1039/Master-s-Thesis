@@ -5,13 +5,86 @@ from firedrake import *
 import gc
 import numpy as np
 
-from nondimensionalization import first_nondimensionalisation
+from nondimensionalization import nondimensionalisation
 from background_flow_differentiable import background_flow_differentiable
 from perturbed_flow_differentiable import MeshFlippedError, check_mesh_quality, setup_moving_mesh_hat, evaluate_forces, estimate_eigenvectors, _build_xi_hat
-from config_paper_parameters import R, H, W, Q, rho, mu, particle_maxh_rel, global_maxh_rel
+from config_paper_parameters import R, H, W, a, Q, rho, mu, particle_maxh_rel, global_maxh_rel
 
 
-def newton_root_refine(r_off_hat_init, z_off_hat_init, a_hat, shared_data, *, tol=1e-14, max_iter=15):
+def _log_mesh_quality(md, label, cycle, *, dr=None, dz=None, da=None):
+    """Compute per-cell quality metrics on the current (deformed) mesh and
+    print summary statistics. Metrics:
+      - oriented det(J): cell volume * reference sign; <= 0 means flipped.
+      - edge ratio: longest edge / shortest edge (regular tet = 1).
+      - dihedral angles [deg]: regular tet = 70.53°, degenerate -> 0 or 180.
+      - |xi|: per-node displacement magnitude vs. reference mesh X_ref.
+    """
+    mesh3d = md['mesh3d']
+
+    # Displacement field xi = current_coords - X_ref (the bump-driven deformation).
+    coords = np.asarray(mesh3d.coordinates.dat.data_ro)
+    X_ref = np.asarray(md['X_ref'].dat.data_ro)
+    xi = coords - X_ref
+    xi_mag = np.linalg.norm(xi, axis=1)
+    a_hat = md['a_hat_init']
+
+    # Oriented detJ
+    DG0 = FunctionSpace(mesh3d, "DG", 0)
+    detJ_fn = Function(DG0)
+    detJ_fn.interpolate(JacobianDeterminant(mesh3d))
+    detJ_oriented = np.asarray(detJ_fn.dat.data_ro) * np.asarray(md['ref_signs'])
+
+    # Per-cell corner vertices via a CG1 scratch space (robust to mesh order)
+    V_lin = VectorFunctionSpace(mesh3d, "CG", 1)
+    verts_fn = Function(V_lin)
+    verts_fn.interpolate(SpatialCoordinate(mesh3d))
+    cnm = V_lin.cell_node_map().values
+    verts = np.asarray(verts_fn.dat.data_ro)[cnm]   # (n_cells, 4, 3)
+
+    # Edge lengths (6 edges per tet)
+    edge_idx = np.array([(0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3)])
+    edges = verts[:, edge_idx[:, 1]] - verts[:, edge_idx[:, 0]]
+    edge_lens = np.linalg.norm(edges, axis=2)
+    edge_ratio = edge_lens.max(axis=1) / np.maximum(edge_lens.min(axis=1), 1e-300)
+
+    # Dihedral angles (one per edge)
+    edge_data = [(0, 1, 2, 3), (0, 2, 1, 3), (0, 3, 1, 2),
+                 (1, 2, 0, 3), (1, 3, 0, 2), (2, 3, 0, 1)]
+    dihedrals = np.empty((verts.shape[0], 6))
+    for k, (i, j, a, b) in enumerate(edge_data):
+        e = verts[:, j] - verts[:, i]
+        e_hat = e / np.maximum(np.linalg.norm(e, axis=1, keepdims=True), 1e-300)
+        va = verts[:, a] - verts[:, i]
+        vb = verts[:, b] - verts[:, i]
+        va_p = va - np.sum(va * e_hat, axis=1, keepdims=True) * e_hat
+        vb_p = vb - np.sum(vb * e_hat, axis=1, keepdims=True) * e_hat
+        denom = np.maximum(np.linalg.norm(va_p, axis=1) * np.linalg.norm(vb_p, axis=1), 1e-300)
+        cos_t = np.sum(va_p * vb_p, axis=1) / denom
+        dihedrals[:, k] = np.arccos(np.clip(cos_t, -1.0, 1.0))
+    dihedrals_deg = np.degrees(dihedrals)
+
+    n_cells = detJ_oriented.size
+    n_flipped = int(np.sum(detJ_oriented <= 0))
+
+    print(f"\n  Mesh quality after {label} (cycle {cycle}):  n_cells={n_cells}  flipped={n_flipped}")
+    if dr is not None or dz is not None or da is not None:
+        print(f"    accumulated:     dr={dr if dr is not None else 0.0:+.6e}  "
+              f"dz={dz if dz is not None else 0.0:+.6e}  "
+              f"da={da if da is not None else 0.0:+.6e}   (a_ref={a_hat:.6f})")
+    print(f"    |xi| (node):     max={xi_mag.max():.4e}  p99={np.percentile(xi_mag, 99):.4e}"
+          f"  median={np.median(xi_mag):.4e}   (relative to a_ref: max={xi_mag.max()/a_hat:.3e})")
+    print(f"    detJ_oriented:   min={detJ_oriented.min():+.3e}  median={np.median(detJ_oriented):+.3e}  max={detJ_oriented.max():+.3e}")
+    print(f"    edge ratio:      median={np.median(edge_ratio):.3f}  p90={np.percentile(edge_ratio, 90):.3f}"
+          f"  p99={np.percentile(edge_ratio, 99):.3f}  max={edge_ratio.max():.3f}   (regular tet = 1)")
+    print(f"    min dihedral°:   min={dihedrals_deg.min():.3f}  p1={np.percentile(dihedrals_deg.min(axis=1), 1):.3f}"
+          f"  p10={np.percentile(dihedrals_deg.min(axis=1), 10):.3f}  median={np.median(dihedrals_deg.min(axis=1)):.3f}   (regular tet ≈ 70.53)")
+    print(f"    max dihedral°:   median={np.median(dihedrals_deg.max(axis=1)):.3f}"
+          f"  p90={np.percentile(dihedrals_deg.max(axis=1), 90):.3f}"
+          f"  p99={np.percentile(dihedrals_deg.max(axis=1), 99):.3f}  max={dihedrals_deg.max():.3f}")
+
+
+def newton_root_refine(r_off_hat_init, z_off_hat_init, a_hat, shared_data, *,
+                       tol=1e-9, max_iter=10):
 
     print("\n" + "=" * 65)
     print(f"  Newton Root Refinement (a_hat = {a_hat:.6f})")
@@ -24,6 +97,14 @@ def newton_root_refine(r_off_hat_init, z_off_hat_init, a_hat, shared_data, *, to
 
     dr, dz = 0.0, 0.0
 
+    # Stall-detector state: same idea as in _ms_trial. Newton on F=0 hits
+    # the FE noise floor of the surface-integrated forces; further iterations
+    # only chase noise gradients, drift the iterate (often toward the bif
+    # point and then *past* it), and eventually tangle the mesh.
+    stall_window = 3
+    stall_ratio  = 0.9
+    res_history  = []
+
     for k in range(max_iter):
         F, J_full = evaluate_forces(dr, dz, 0.0, md)
         J = J_full[:, :2]
@@ -35,8 +116,21 @@ def newton_root_refine(r_off_hat_init, z_off_hat_init, a_hat, shared_data, *, to
         print(f"  Iter {k:2d} | r = {r_cur:+.8f}  z = {z_cur:+.8f} | |F| = {res:.4e}  cond(J) = {np.linalg.cond(J):.2e}")
 
         if res < tol:
-            print(f"  -> Converged after {k} iterations.\n")
+            print(f"  -> Converged after {k} iterations (|F| < tol={tol:.1e}).\n")
             return r_cur, z_cur, md, dr, dz
+
+        # Bail when |F| stops shrinking — usually means we have reached the
+        # FE noise floor of the residual, and further Newton steps will only
+        # diffuse the iterate while burning compute.
+        res_history.append(res)
+        if len(res_history) >= stall_window:
+            window = res_history[-stall_window:]
+            rel_spread = min(window) / max(window) if max(window) > 0 else 1.0
+            if rel_spread > stall_ratio:
+                print(f"  -> Newton STALL: |F| spread {min(window):.3e}..{max(window):.3e} "
+                      f"(ratio {rel_spread:.3f} > {stall_ratio}) over last {stall_window} "
+                      f"iters — bailing out at FE noise floor.")
+                return r_cur, z_cur, md, dr, dz
 
         dx_n = np.linalg.solve(J, -F)
 
@@ -69,7 +163,7 @@ def _ms_trial(dr_init, dz_init, da_init, phi_start, l_vec, md, r_ref, z_ref, a_r
     """Single Moore-Spence trial with a given starting phi.
 
     Uses trust-region with backtracking (shrink Delta on reject).
-    Returns (r, z, a, phi, converged, final_residual).
+    Returns (r, z, a, phi, converged, final_|G|, final_|F|).
     """
 
     dr, dz, da = float(dr_init), float(dz_init), float(da_init)
@@ -77,6 +171,16 @@ def _ms_trial(dr_init, dz_init, da_init, phi_start, l_vec, md, r_ref, z_ref, a_r
     Delta, Delta_max = 1e-2, 1.0
     eta_accept, eta_good = 0.1, 0.75
     res = float('inf')
+    res_F = float('inf')   # final |F| = |G1| — used as a noise-floor diagnostic
+
+    # Stall-detector state: ring buffer of |G| values *after* each accepted
+    # iteration. We bail out when the residual stops shrinking in earnest
+    # — typically a sign that we have hit the FE discretisation noise floor
+    # of J·phi (≈ noise(F)/h) and Newton has nothing left to drive toward.
+    stall_window = 4          # # of accepted iters to look back over
+    stall_ratio  = 0.95       # require min(window)/max(window) ≤ stall_ratio
+    res_history = []
+    prev_res    = None        # for per-iter reduction-ratio diagnostic
 
     for k in range(max_iter):
 
@@ -91,24 +195,35 @@ def _ms_trial(dr_init, dz_init, da_init, phi_start, l_vec, md, r_ref, z_ref, a_r
         G3_val = np.dot(l_vec, phi) - 1.0
         G = np.concatenate([G1, G2, [G3_val]])
         res = np.linalg.norm(G)
+        res_F = float(np.linalg.norm(G1))
 
         eigs = np.linalg.eigvals(J_sp)
         eigenvalue = eigs[np.argmin(np.abs(eigs))]
         r_cur, z_cur, a_cur = r_ref + dr, z_ref + dz, a_ref + da
+        # Per-iter reduction ratio: res / prev_res.  < 0.5 ≈ quadratic Newton,
+        # < 0.9 still linear-ish, > 0.9 stalling (Newton fighting noise).
+        if prev_res is not None and prev_res > 0:
+            iter_ratio = res / prev_res
+            ratio_str = f"  ratio = {iter_ratio:.3f}"
+        else:
+            ratio_str = "  ratio = —    "
+        prev_res = res
+
         print(f"\n  Iter {k:2d} | r = {r_cur:+.8f}  z = {z_cur:+.8f}  a = {a_cur:.8f}")
         print(f"         | |G| = {res:.4e}  |F| = {np.linalg.norm(G1):.4e}"
               f"  |J*phi| = {np.linalg.norm(G2):.4e}"
-              f"  eigenvalue = {eigenvalue:+.4e}")
+              f"  eigenvalue = {eigenvalue:+.4e}"
+              f"{ratio_str}")
 
         if res < tol:
             a_phys = a_cur * L_c
-            print(f"\n  -> Bifurcation point found after {k} iterations!")
+            print(f"\n  -> Bifurcation point found after {k} iterations (|G| < tol={tol:.1e}).")
             print(f"     r_off_hat = {r_cur:.10f}")
             print(f"     z_off_hat = {z_cur:.10f}")
             print(f"     a_hat     = {a_cur:.10f}  (a = {a_phys * 1e6:.4f} um)")
             print(f"     phi       = ({phi[0]:.8f}, {phi[1]:.8f})")
             print(f"     eigenvalue = {eigenvalue:+.6e}")
-            return r_cur, z_cur, a_cur, phi, True, res
+            return r_cur, z_cur, a_cur, phi, True, res, res_F
 
         # Assemble DG (5x5) — every block from AD
         DG = np.zeros((5, 5))
@@ -125,13 +240,13 @@ def _ms_trial(dr_init, dz_init, da_init, phi_start, l_vec, md, r_ref, z_ref, a_r
 
         if cond_DG > 1e14:
             print("  !! DG ill-conditioned — aborting.")
-            return r_cur, z_cur, a_cur, phi, False, res
+            return r_cur, z_cur, a_cur, phi, False, res, res_F
 
         try:
             dy = np.linalg.solve(DG, -G)
         except np.linalg.LinAlgError:
             print("  !! DG singular — aborting.")
-            return r_cur, z_cur, a_cur, phi, False, res
+            return r_cur, z_cur, a_cur, phi, False, res, res_F
 
         print(f"         | step: dr={dy[0]:+.4e}  dz={dy[1]:+.4e}  da={dy[2]:+.4e}")
 
@@ -168,13 +283,31 @@ def _ms_trial(dr_init, dz_init, da_init, phi_start, l_vec, md, r_ref, z_ref, a_r
             phi_new = phi + dy_try[3:5]
             phi = phi_new / np.dot(l_vec, phi_new)
             print(f"         | step ACCEPTED")
+
+            # Stall check: |G| (= res) is from BEFORE the accepted step;
+            # we use it because evaluate_forces at the new (dr,dz,da) is
+            # only re-run at the start of the next iteration. A flat res
+            # over several accepted steps means the FE residual noise
+            # floor has been reached — Newton can't drive it lower.
+            res_history.append(res)
+            if len(res_history) >= stall_window:
+                window = res_history[-stall_window:]
+                rel_spread = min(window) / max(window) if max(window) > 0 else 1.0
+                if rel_spread > stall_ratio:
+                    print(f"         | STALL: |G| spread "
+                          f"{min(window):.3e}..{max(window):.3e} "
+                          f"(ratio {rel_spread:.3f} > {stall_ratio}) "
+                          f"over last {stall_window} accepted iters — "
+                          f"bailing out (likely FE noise floor).")
+                    r_cur, z_cur, a_cur = r_ref + dr, z_ref + dz, a_ref + da
+                    return r_cur, z_cur, a_cur, phi, False, res, res_F
         else:
             print(f"         | step REJECTED")
 
         gc.collect()
 
     r_cur, z_cur, a_cur = r_ref + dr, z_ref + dz, a_ref + da
-    return r_cur, z_cur, a_cur, phi, False, res
+    return r_cur, z_cur, a_cur, phi, False, res, res_F
 
 
 def _globalize_tr(dy, Delta, eta_accept, eta_good, Delta_max, _eval_step, _compute_rho):
@@ -212,7 +345,7 @@ def _globalize_tr(dy, Delta, eta_accept, eta_good, Delta_max, _eval_step, _compu
     return False, dy.copy(), -1.0, Delta
 
 
-def moore_spence_solve(r_off_hat_eq, z_off_hat_eq, a_hat_init, shared_data, *, tol=1e-14, max_iter=20, md=None,
+def moore_spence_solve(r_off_hat_eq, z_off_hat_eq, a_hat_init, shared_data, *, tol=1e-7, max_iter=15, md=None,
                        dr_init=0.0, dz_init=0.0, da_init=0.0):
 
     R_hat, H_hat, W_hat, L_c, U_c, Re, G_hat, U_m_hat, u_2d, p_2d = shared_data
@@ -241,26 +374,27 @@ def moore_spence_solve(r_off_hat_eq, z_off_hat_eq, a_hat_init, shared_data, *, t
     print(f"  Start: r={r_off_hat_eq:.6f} z={z_off_hat_eq:.6f} a={a_hat_init:.6f}")
     print("=" * 65)
 
-    r_bif, z_bif, a_bif, phi_bif, ok, final_res = _ms_trial(
+    r_bif, z_bif, a_bif, phi_bif, ok, final_res, final_F = _ms_trial(
         float(dr_init), float(dz_init), float(da_init),
         phi_start, l_vec, md, r_ref, z_ref, a_ref, L_c, tol, max_iter)
 
     print(f"\n  {'=' * 50}")
-    print(f"  converged={ok}  |G|={final_res:.4e}  a={a_bif:.8f}")
+    print(f"  converged={ok}  |G|={final_res:.4e}  |F|={final_F:.4e}  a={a_bif:.8f}")
     print(f"  {'=' * 50}")
-    return r_bif, z_bif, a_bif, phi_bif, ok
+    return r_bif, z_bif, a_bif, phi_bif, ok, final_F
 
 
 if __name__ == "__main__":
 
     # Initial guess from the bifurcation diagramm
-    r_off_hat_init = 0.61170000
-    z_off_hat_init = 0.00350000
-    a_hat_start = 0.135000
+    r_off_hat_init = 0.6098
+    z_off_hat_init = 0.0274
+    a_hat_start = 0.1375
 
-    R_hat, H_hat, W_hat, L_c, U_c, Re = first_nondimensionalisation(R, H, W, Q, rho, mu, print_values=True)
+    R_hat, H_hat, W_hat, a_hat, L_c, U_c, Re = nondimensionalisation(R, H, W, a, Q, rho, mu, print_values=True)
 
     print("\nparticle_maxh_rel = ", particle_maxh_rel)
+    print("global_maxh_rel = ", global_maxh_rel)
 
     bg = background_flow_differentiable(R_hat, H_hat, W_hat, Re)
 
@@ -268,41 +402,70 @@ if __name__ == "__main__":
 
     shared_data = (R_hat, H_hat, W_hat, L_c, U_c, Re, G_hat, U_m_hat, u_bar_2d, p_bar_tilde_2d)
 
-    # refine initial guess to ensure starting MS with a root
-    r_hat, z_hat, md_newton, dr_newton, dz_newton = newton_root_refine(r_off_hat_init, z_off_hat_init, a_hat_start, shared_data,
-                                                                        max_iter=10)
+    print("\n" + "#" * 65)
+    print(f"  Newton + Moore-Spence")
+    print(f"  Input: r={r_off_hat_init:.10f}  z={z_off_hat_init:.10f}  "
+          f"a={a_hat_start:.10f}")
+    print("#" * 65)
 
-    r_bif, z_bif, a_bif, phi_bif, converged = moore_spence_solve(r_hat, z_hat, a_hat_start, shared_data,
-                                                md=md_newton, dr_init=dr_newton, dz_init=dz_newton, da_init=0.0)
+    r_hat, z_hat, md_newton, dr_newton, dz_newton = newton_root_refine(r_off_hat_init, z_off_hat_init, a_hat_start, shared_data, max_iter=10)
 
-    if converged:
-        print(f"\nBifurcation point: r={r_bif:.10f}  z={z_bif:.10f}  a={a_bif:.10f}")
-    else:
-        print(f"\nMoore-Spence did not converge.")
+    _log_mesh_quality(md_newton, "newton", 0, dr=dr_newton, dz=dz_newton, da=0.0)
 
-    print("\n" + "=" * 65)
-    print("Remeshing sanity check for Moore-Spence")
-    print("=" * 65)
+    print("\n" + "-" * 65)
+    print("  Sanity remesh after NEWTON (fresh mesh @ converged position)")
+    print("-" * 65)
+    md_fresh_newton = setup_moving_mesh_hat(
+        r_hat, z_hat, a_hat_start, R_hat, H_hat, W_hat, Re, G_hat, U_m_hat,
+        u_bar_2d, p_bar_tilde_2d, particle_maxh_rel, global_maxh_rel,
+        a_mesh_size_res_ref=a_hat_start)
+    F_fresh = evaluate_forces(0.0, 0.0, 0.0, md_fresh_newton, jacobian=False)
+    print(f"  Newton point on fresh mesh:  |F| = {np.linalg.norm(F_fresh):.4e}"
+          f"  (F = [{F_fresh[0]:+.4e}, {F_fresh[1]:+.4e}])")
+    _log_mesh_quality(md_fresh_newton, "newton-fresh", 0, dr=0.0, dz=0.0, da=0.0)
+    del md_fresh_newton
+    gc.collect()
 
-    md = setup_moving_mesh_hat(r_bif, z_bif, a_bif, R_hat, H_hat, W_hat, Re, G_hat, U_m_hat,
-                               u_bar_2d, p_bar_tilde_2d, particle_maxh_rel, global_maxh_rel)
+    # Moore-Spence on the Newton-converged deformed mesh (single-shot,
+    # passes md_newton through and continues from the Newton-end deformation).
+    r_bif, z_bif, a_bif, phi_bif, converged, _ = moore_spence_solve(
+        r_hat, z_hat, a_hat_start, shared_data,
+        md=md_newton, dr_init=dr_newton, dz_init=dz_newton, da_init=0.0)
 
-    F, J = evaluate_forces(0.0, 0.0, 0.0, md)
-    J_sp = J[:, :2]
+    # md_newton was built around (r_off_hat_init, z_off_hat_init, a_hat_start),
+    # so xi at MS-end encodes the full offset from those reference values.
+    dr_total = float(r_bif - r_off_hat_init)
+    dz_total = float(z_bif - z_off_hat_init)
+    da_total = float(a_bif - a_hat_start)
+    _log_mesh_quality(md_newton, "ms", 0, dr=dr_total, dz=dz_total, da=da_total)
 
-    print("r_off: ", r_bif)
-    print("z_off: ", z_bif)
-    print("a_hat: ", a_bif)
+    del md_newton
+    gc.collect()
 
-    print(f"\nF_p_x = {F[0]:.6e}")
-    print(f"F_p_z = {F[1]:.6e}")
-    print(f"|F|   = {np.linalg.norm(F):.6e}")
+    # ---- Sanity remesh after Moore-Spence: build a fresh mesh centered at
+    # the bifurcation point and re-evaluate the MS residual components.
+    # If |F|, |J*phi|, eigenvalue are not ~0 on the fresh mesh, the bifurcation
+    # point was a mesh-deformation artefact rather than a physical zero.
+    print("\n" + "-" * 65)
+    print("  Sanity remesh after MOORE-SPENCE (fresh mesh @ bifurcation point)")
+    print("-" * 65)
+    md_fresh_ms = setup_moving_mesh_hat(
+        r_bif, z_bif, a_bif, R_hat, H_hat, W_hat, Re, G_hat, U_m_hat,
+        u_bar_2d, p_bar_tilde_2d, particle_maxh_rel, global_maxh_rel,
+        a_mesh_size_res_ref=a_hat_start)
+    F_ms_fresh, J_ms_fresh = evaluate_forces(0.0, 0.0, 0.0, md_fresh_ms)
+    Jsp_fresh = J_ms_fresh[:, :2]
+    Jphi_fresh = Jsp_fresh @ phi_bif
+    eigs_fresh = np.linalg.eigvals(Jsp_fresh)
+    eig_min_fresh = eigs_fresh[np.argmin(np.abs(eigs_fresh))]
+    print(f"  MS point on fresh mesh:")
+    print(f"    |F|        = {np.linalg.norm(F_ms_fresh):.4e}   (F = [{F_ms_fresh[0]:+.4e}, {F_ms_fresh[1]:+.4e}])")
+    print(f"    |J*phi|    = {np.linalg.norm(Jphi_fresh):.4e}   (phi from MS, l_vec-normalized)")
+    print(f"    eig(J)_min = {eig_min_fresh:+.4e}   (should cross 0 at the true bifurcation)")
+    _log_mesh_quality(md_fresh_ms, "ms-fresh", 0, dr=0.0, dz=0.0, da=0.0)
+    del md_fresh_ms
+    gc.collect()
 
-    print(f"\nJacobian (2x2 spatial part):")
-    print(f"  dF_x/dr = {J_sp[0, 0]:+.6e}   dF_x/dz = {J_sp[0, 1]:+.6e}")
-    print(f"  dF_z/dr = {J_sp[1, 0]:+.6e}   dF_z/dz = {J_sp[1, 1]:+.6e}")
-
-    eigpairs = estimate_eigenvectors(J_sp)
-    mu_min = eigpairs[0][0]
-
-    print(f"|mu_min| = {abs(mu_min):.6e}")
+    print(f"\nBifurcation point: r={r_bif:.10f}  z={z_bif:.10f}  a={a_bif:.10f}")
+    print(f"phi = ({phi_bif[0]:+.8f}, {phi_bif[1]:+.8f})")
+    print(f"converged = {converged}")

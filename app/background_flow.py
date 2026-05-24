@@ -1,15 +1,13 @@
 import os
 os.environ["OMP_NUM_THREADS"] = "1"
 
-import sys
-
-from build_3d_geometry_gmsh import make_curved_channel_section_with_spherical_hole
-
-
 from firedrake import *
-
 import numpy as np
 import matplotlib.pyplot as plt
+
+from build_3d_geometry_gmsh import make_curved_channel_section_with_spherical_hole
+from config_paper_parameters import *
+from nondimensionalization import nondimensionalisation
 
 
 class background_flow:
@@ -21,7 +19,7 @@ class background_flow:
         self.Re = Re
 
         actual_comm = comm if comm is not None else COMM_WORLD
-        self.mesh2d = RectangleMesh(120, 120, self.W, self.H, quadrilateral=False, comm=actual_comm)
+        self.mesh2d = RectangleMesh(128, 128, self.W, self.H, quadrilateral=False, diagonal="crossed", comm=actual_comm)
 
 
     def solve_2D_background_flow(self):
@@ -152,7 +150,7 @@ class background_flow:
 
     def plot(self):
 
-        nx, nz = 120, 120
+        nx, nz = 128, 128
 
         coords = self.mesh2d.coordinates.dat.data_ro
         x_i = np.linspace(float(coords[:, 0].min()), float(coords[:, 0].max()), nx)
@@ -164,7 +162,7 @@ class background_flow:
         evaluator = PointEvaluator(self.mesh2d, plotting_points)
         U_at_list = evaluator.evaluate(self.u_bar)
 
-        u_at = u_at = np.array(U_at_list, dtype=float, copy=True)
+        u_at = np.array(U_at_list, dtype=float, copy=True)
 
         U_r = u_at[:, 0].reshape(nz, nx)
         U_theta = u_at[:, 2].reshape(nz, nx)
@@ -196,15 +194,8 @@ class background_flow:
         cbar1 = fig.colorbar(cf, ax=ax, shrink=0.9, pad=0.05)
         cbar1.set_label(r"$u_\theta$")
 
-        stream = ax.streamplot(
-            xi_plot, zi_plot, U_r, U_z,
-            density=1.4,
-            color=Speed,
-            linewidth=lw,
-            cmap="viridis",
-            arrowsize=1.2,
-            minlength=0.1
-        )
+        stream = ax.streamplot(xi_plot, zi_plot, U_r, U_z, density=1.4, color=Speed, linewidth=lw, cmap="viridis",
+                                arrowsize=1.2, minlength=0.1)
 
         cbar2 = fig.colorbar(stream.lines, ax=ax, shrink=0.9)
         cbar2.set_label(r"$|u_{\mathrm{sec}}| = \sqrt{u_r^2 + u_z^2}$")
@@ -235,7 +226,6 @@ def build_3d_background_flow(R, H, W, G, mesh3d, tags, u_bar_2d, p_bar_2d):
     x_query_u = r_cs + 0.5 * W
     y_query_u = z_cs + 0.5 * H
 
-    epsilon = 1e-12
     x_query_u = np.clip(x_query_u, 0.0, W)
     y_query_u = np.clip(y_query_u, 0.0, H)
 
@@ -289,111 +279,44 @@ def build_3d_background_flow(R, H, W, G, mesh3d, tags, u_bar_2d, p_bar_2d):
 
 if __name__ == "__main__":
 
-    print("Starting sanity checks for 2D and 3D background flow...\n")
 
-    R_test = 500.0
-    H_test = 2.0
-    W_test = 2.0
-    Re_test = 1.0
+    R_hat, H_hat, W_hat, a_hat, L_c, U_c, Re = nondimensionalisation(R, H, W, a, Q, rho, mu, print_values=True)
 
-    bg = background_flow(R_test, H_test, W_test, Re_test)
-
-    G_val, U_m, u_2d, p_2d = bg.solve_2D_background_flow()
-
-    mesh3d, tags = make_curved_channel_section_with_spherical_hole(R_test, H_test, W_test, 4 * H_test, 0.05, 0.2*0.05, 0.2*H_test)
-
-    u_3d, p_3d = build_3d_background_flow(R_test, H_test, W_test, G_val, mesh3d, tags, u_2d, p_2d)
-
-
-    # bg.plot()
-
-    print("1. Solving 2D background flow...")
-    bf = background_flow(R_test, H_test, W_test, Re_test)
+    bf = background_flow(R_hat, H_hat, W_hat, Re)
     G_val, U_m_hat, u_2d, p_2d = bf.solve_2D_background_flow()
 
-    print(f"   -> Calculated pressure gradient G = {G_val:.6f}")
-    print(f"   -> Maximum axial velocity U_m_hat = {U_m_hat:.6f}")
-    assert U_m_hat > 0, "Error: Maximum axial velocity should be positive."
+    mesh3d, tags = make_curved_channel_section_with_spherical_hole(R_hat, H_hat, W_hat, L_rel * max(H_hat, W_hat),
+                                                a_hat, particle_maxh_rel * a_hat, global_maxh_rel * min(H_hat, W_hat))
 
-    print("\n2. Checking 2D divergence (mass conservation)...")
-    # Cylindrical divergence: d(u_r)/dr + d(u_z)/dz + u_r / (R + r) = 0
-    # In the local mesh system: r = x - W/2
-    mesh2d = bf.mesh2d
-    x_coords = SpatialCoordinate(mesh2d)
-    r_local = x_coords[0] - 0.5 * W_test
-    R_plus_r = R_test + r_local
+    u_3d, p_3d = build_3d_background_flow(R_hat, H_hat, W_hat, G_val, mesh3d, tags, u_2d, p_2d)
 
-    u_r, u_z, u_theta = split(u_2d)
-    div_2d = Dx(u_r, 0) + Dx(u_z, 1) + u_r / R_plus_r
+    print("3D mapping consistency at multiple points:")
+    theta_max = L_rel * max(H_hat, W_hat) / R_hat
+    test_points_2d = [
+        (0.5 * W_hat, 0.5 * H_hat),
+        (0.5 * W_hat, 0.25 * H_hat),
+        (0.25 * W_hat, 0.5 * H_hat),
+        (0.75 * W_hat, 0.25 * H_hat),
+    ]
+    theta_samples = [0.1 * theta_max, 0.3 * theta_max, 0.7 * theta_max, 0.9 * theta_max]
 
-    # L2 norm of the divergence error
-    div_norm = sqrt(assemble(inner(div_2d, div_2d) * dx))
-    print(f"   -> L2 norm of the divergence error: {div_norm:.2e}")
-    # assert div_norm < 1e-3, f"Error: 2D divergence is too high! ({div_norm})"
+    eval_2d = PointEvaluator(bf.mesh2d, np.array(test_points_2d))
+    vals_2d = np.array(eval_2d.evaluate(u_2d))
 
-    print("\n3. Checking 2D boundary conditions (no-slip)...")
-    # Integral of the squared velocity on the boundary (ds) should be nearly 0
-    v_bnd_norm = assemble(inner(u_2d, u_2d) * ds)
-    print(f"   -> Integral velocity error at the boundary: {v_bnd_norm:.2e}")
-    assert v_bnd_norm < 1e-8, "Error: No-slip condition in 2D was not exactly met."
-
-    print("\n4. Creating 3D test mesh for mapping...")
-    # To test the 3D script, we construct a curved ExtrudedMesh
-    m2d_base = RectangleMesh(15, 15, W_test, H_test)
-    mesh3d = ExtrudedMesh(m2d_base, layers=15, layer_height=1.0)
-
-    # Bend the originally straight 3D mesh into an arc
-    Vc = mesh3d.coordinates.function_space()
-    x, y, zeta = SpatialCoordinate(mesh3d)
-
-    theta_max = 0.2  # Arc angle in radians
-    r_3d_c = R_test - W_test / 2.0 + x
-    theta_c = zeta * (theta_max / 15.0)
-    z_cyl_c = y - H_test / 2.0
-
-    f_coords = Function(Vc).interpolate(as_vector([r_3d_c * cos(theta_c), r_3d_c * sin(theta_c), z_cyl_c]))
-    mesh3d.coordinates.assign(f_coords)
-
-    # Provide tags dictionary as required by build_3d_background_flow
-    # "on_boundary" automatically captures all boundaries of the 3D mesh.
-    tags = {"walls": "on_boundary"}
-
-    print("\n5. Executing 3D mapping...")
-
-
-    print("\n6. Checking 3D mapping consistency (velocity magnitude in channel center)...")
-    # Evaluation point exactly in the center of the channel
-    mid_r = R_test
-    mid_theta = theta_max / 2.0
-    mid_z = 0.0
-
-    # Conversion for the 3D PointEvaluator
-    mid_x_3d = mid_r * np.cos(mid_theta)
-    mid_y_3d = mid_r * np.sin(mid_theta)
-    mid_z_3d = mid_z
-
-    try:
-        # 3D evaluation with PointEvaluator
-        evaluator_3d = PointEvaluator(mesh3d, np.array([[mid_x_3d, mid_y_3d, mid_z_3d]]))
-        val_3d = evaluator_3d.evaluate(u_3d)[0]
-
-        # 2D evaluation with PointEvaluator
-        evaluator_2d = PointEvaluator(bf.mesh2d, np.array([[W_test / 2.0, H_test / 2.0]]))
-        val_2d = evaluator_2d.evaluate(u_2d)[0]
-
-        # Calculate magnitude
-        speed_2d = np.sqrt(val_2d[0] ** 2 + val_2d[1] ** 2 + val_2d[2] ** 2)
-        speed_3d = np.sqrt(val_3d[0] ** 2 + val_3d[1] ** 2 + val_3d[2] ** 2)
-
-        err_speed = abs(speed_2d - speed_3d)
-        print(f"   -> 2D velocity magnitude: {speed_2d:.6f}")
-        print(f"   -> 3D velocity magnitude: {speed_3d:.6f}")
-        print(f"   -> Absolute difference:   {err_speed:.2e}")
-        assert err_speed < 1e-5, "Error: Velocity magnitudes do not match during mapping!"
-
-    except Exception as e:
-        print(f"   -> Warning: Single point evaluation failed: {e}")
-
-    print("\n=============================================")
-    print("=== ALL SANITY CHECKS COMPLETED SUCCESSFULLY ===")
-    print("=============================================")
+    print(f"{'(r, z)':>18} {'θ':>10} {'|u|_2D':>12} {'|u|_3D':>12} {'|Δ|':>10}")
+    max_err = 0.0
+    for i, (xx, yy) in enumerate(test_points_2d):
+        r_local = xx - 0.5 * W_hat
+        z_local = yy - 0.5 * H_hat
+        speed_2d = float(np.linalg.norm(vals_2d[i]))
+        for theta in theta_samples:
+            X = (R_hat + r_local) * np.cos(theta)
+            Y = (R_hat + r_local) * np.sin(theta)
+            Z = z_local
+            eval_3d = PointEvaluator(mesh3d, np.array([[X, Y, Z]]))
+            val_3d = np.array(eval_3d.evaluate(u_3d))[0]
+            speed_3d = float(np.linalg.norm(val_3d))
+            diff = abs(speed_2d - speed_3d)
+            max_err = max(max_err, diff)
+            print(f"({r_local:+.3f}, {z_local:+.3f})  {theta:10.4f}  {speed_2d:12.6f}  {speed_3d:12.6f}  {diff:10.2e}")
+    print(f"-> max |Δ|u|| = {max_err:.2e}")

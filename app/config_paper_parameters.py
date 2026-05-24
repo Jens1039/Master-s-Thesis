@@ -15,7 +15,7 @@ mu  = 10.02e-4              # dyn. viscosity [Pa·s]
 # ------------------------------------------------------
 
 # ---LENGTH RATIOS FROM THE PAPER-----------------------
-a = 0.13606788 * (H/2)      # radius of the cell/particle [m]
+a = 0.05 * (H/2)      # radius of the cell/particle [m]
 W = 1*H                     # duct width  [m]
 R = 500 * (H/2)             # bend radius [m]
 # ------------------------------------------------------
@@ -26,7 +26,8 @@ Q = 2*2.40961923848e-10     # volumetric flow rate [m^3/s]
 
 # ---NUMERICAL PRECISION--------------------------------
 N_grid = 20
-particle_maxh_rel = 0.025
+particle_maxh_rel = 0.1
 global_maxh_rel = 0.2
 eps_rel = 0.2
+L_rel = 4
 # ------------------------------------------------------
