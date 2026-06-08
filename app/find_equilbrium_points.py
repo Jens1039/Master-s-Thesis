@@ -13,18 +13,16 @@ import pickle
 from mpi4py import MPI
 import numpy as np
 import gc
-import sys
 
-from nondimensionalization import nondimensionalisation
+from problem_setup import *
 from background_flow import background_flow, build_3d_background_flow
-from build_3d_geometry_gmsh import make_curved_channel_section_with_spherical_hole, make_curved_channel_section_from_boundary
+from build_3d_geometry_gmsh import make_curved_channel_section_with_spherical_hole
 from perturbed_flow import perturbed_flow
-from config_lab_parameters import *
 
 
 class F_p_grid:
 
-    def __init__(self, R, H, W, a, G, Re, L, particle_maxh, global_maxh, eps, boundary_pts_2d=None, T_2d_data=None, mesh_n=128):
+    def __init__(self, R, H, W, a, G, Re, L, particle_maxh, global_maxh, eps, U_m=None, boundary_pts_2d=None, T_2d_data=None, mesh_n=128):
 
         self.R = R
         self.H = H
@@ -33,6 +31,7 @@ class F_p_grid:
         self.G = G
         self.Re = Re
         self.L = L
+        self.U_m = U_m
 
         self.particle_maxh = particle_maxh
         self.global_maxh = global_maxh
@@ -60,6 +59,17 @@ class F_p_grid:
         self._original_coords = None
         self._current_r = None
         self._current_z = None
+
+
+    def _deform_channel(self, mesh3d, tags):
+        """Hook: deform the freshly-built (rectangular) 3D channel mesh in place.
+
+        Base class is a no-op — the channel stays rectangular. The deformed
+        cross-section subclass (``force_grid_deformed.F_p_grid_deformed``)
+        overrides this to lift a shape-optimisation ``T_2d`` field onto the
+        mesh so the force grid is computed on the optimised geometry.
+        """
+        return
 
 
     def compute_F_p_grid_ensemble(self, N_grid, u_bg_data_np, p_bg_data_np, checkpoint_dir=None):
@@ -141,19 +151,14 @@ class F_p_grid:
                       f"z={z_loc:+.4f}  -> mesh ...", flush=True)
 
             try:
-                if self.boundary_pts_2d is not None:
-                    mesh3d, tags = make_curved_channel_section_from_boundary(
-                        self.R, self.H, self.W, self.L, self.a,
-                        self.boundary_pts_2d,
-                        self.particle_maxh, self.global_maxh,
-                        x_off=r_loc, z_off=z_loc,
-                        comm=my_comm,
-                    )
-                else:
-                    mesh3d, tags = make_curved_channel_section_with_spherical_hole(self.R, self.H, self.W, self.L, self.a,
-                                                                                   self.particle_maxh, self.global_maxh,
-                                                                                   x_off=r_loc, z_off=z_loc,
-                                                                                   comm=my_comm)
+                mesh3d, tags = make_curved_channel_section_with_spherical_hole(self.R, self.H, self.W, self.L, self.a,
+                                                                               self.particle_maxh, self.global_maxh,
+                                                                               x_off=r_loc, z_off=z_loc,
+                                                                               comm=my_comm)
+                # Optional channel-wall deformation (subclass hook). Base class
+                # leaves the rectangular channel untouched; the deformed-cross-
+                # section subclass lifts a shape-opt T_2d onto this mesh here.
+                self._deform_channel(mesh3d, tags)
             except Exception as e:
                 print(f"[rank {global_rank}] mesh build FAILED at "
                       f"({i},{j}) r={r_loc:+.4f} z={z_loc:+.4f}: {e}",
@@ -356,7 +361,7 @@ class F_p_grid:
         cs = ax.contourf(R_grid, Z_grid, self.phi, levels=levels, cmap="viridis", alpha=1)
 
         cbar = plt.colorbar(cs, ax=ax, fraction=0.046, pad=0.04)
-        cbar.set_label(r"Force Magnitude $\|\mathbf{F}\|$")
+        cbar.set_label(r"Force Magnitude $\|\mathbf{F}_p\|$")
 
         rf = np.linspace(self.r_min, self.r_max, 400)
         zf = np.linspace(self.z_min, self.z_max, 400)
@@ -437,28 +442,27 @@ class F_p_grid:
                                                          label=f"Equilibrium ({eq_type})", linestyle='None')
 
             ax.legend(handles=list(legend_handles.values()), loc='upper right', framealpha=1.0, fontsize='small')
-        ax.set_xlabel("r")
-        ax.set_ylabel("z")
+        ax.set_xlabel(r"$x$")
+        ax.set_ylabel(r"$z$")
 
         # All values are already in first-nondim units (L_c = H/2)
         particle_maxh_rel = self.particle_maxh / self.a
 
-        ax.set_title(f"Force_Map_a={self.a:.5f}_R={self.R:.0f}_W={self.W:.0f}_H={self.H:.0f}_Re={self.Re:.1f}_N_grid={self.N_grid}_particle_maxh_rel={particle_maxh_rel:.2f}")
         plt.tight_layout()
-        filename = f"../images/Sweep_a=0.01_to_0.20_R=500_H=W=2_ss=0.0025/images/Force_Map_a={self.a:.5f}_R={self.R:.0f}_W={self.W:.0f}_H={self.H:.0f}_Re={self.Re:.1f}_N_grid={self.N_grid}_particle_maxh_rel={particle_maxh_rel:.2f}.png"
-        os.makedirs("../images/Sweep_a=0.01_to_0.20_R=500_H=W=2_ss=0.0025/images", exist_ok=True)
+        out_dir = "Force_grids"
+        os.makedirs(out_dir, exist_ok=True)
+        filename = f"{out_dir}/Force_Map_a={self.a:.5f}_R={self.R:.0f}_W={self.W:.0f}_H={self.H:.0f}_Re={self.Re:.1f}_N_grid={self.N_grid}_particle_maxh_rel={particle_maxh_rel:.2f}.png"
         plt.savefig(filename)
         print(f"Plot saved to {filename}")
         plt.show()
 
 
-def force_grid(R, H, W, Q, rho, mu, a, N_grid, particle_maxh_rel, global_maxh_rel, eps_rel):
+def force_grid(R, H, W, a, Re, N_grid, particle_maxh_rel, global_maxh_rel, eps_rel):
 
     comm = MPI.COMM_WORLD
     rank = comm.Get_rank()
 
     cache_dir = "cache"
-    Re = (rho*Q/(W*H)*(H/2))/mu
     cache_filename = f"{cache_dir}/force_grid_R{R:.1f}_H{H:.1f}_W{W:.1f}_a{a:.3f}_Re{Re:.1f}_N{N_grid}.pkl"
 
     cache_exists = False
@@ -486,6 +490,17 @@ def force_grid(R, H, W, Q, rho, mu, a, N_grid, particle_maxh_rel, global_maxh_re
             Fz_grid = cached_data['Fz_grid']
             phi = cached_data['phi']
 
+            # Old caches predate U_m storage; recompute via a cheap 2D BG solve
+            # rather than discarding the (expensive) 3D force grid.
+            if 'U_m' not in params:
+                print("Cache missing U_m — recomputing 2D background flow to obtain it.")
+                bg = background_flow(R, H, W, Re, comm=MPI.COMM_SELF)
+                _, U_m, _, _ = bg.solve_2D_background_flow()
+                params['U_m'] = U_m
+                cached_data['params'] = params
+                with open(cache_filename, 'wb') as f:
+                    pickle.dump(cached_data, f)
+
         else:
             return None
 
@@ -495,22 +510,21 @@ def force_grid(R, H, W, Q, rho, mu, a, N_grid, particle_maxh_rel, global_maxh_re
     else:
         if rank == 0:
             print("Calculating 2D background flow...")
-            R_hat, H_hat, W_hat, a_hat, L_c, U_c, Re = nondimensionalisation(R, H, W, a, Q, rho, mu, print_values=True)
 
-            bg = background_flow(R_hat, H_hat, W_hat, Re, comm=MPI.COMM_SELF)
-            G_hat, U_m_hat, u_bar_2d, p_bar_2d = bg.solve_2D_background_flow()
+            bg = background_flow(R, H, W, Re, comm=MPI.COMM_SELF)
+            G, U_m, u_bar_2d, p_bar_2d = bg.solve_2D_background_flow()
 
             u_data_np = u_bar_2d.dat.data_ro.copy()
             p_data_np = p_bar_2d.dat.data_ro.copy()
 
             params = {
-                'R': R_hat, 'H': H_hat, 'W': W_hat,
-                'a': a_hat, 'G': G_hat, 'Re': Re,
-                'L_c': L_c,
-                'L': 4 * max(H_hat, W_hat),
-                'particle_maxh': particle_maxh_rel * a_hat,
-                'global_maxh': global_maxh_rel * min(H_hat, W_hat),
-                'eps': eps_rel * a_hat
+                'R': R, 'H': H, 'W': W,
+                'a': a, 'G': G, 'Re': Re,
+                'U_m': U_m,
+                'L': 4 * max(H, W),
+                'particle_maxh': particle_maxh_rel * a,
+                'global_maxh': global_maxh_rel * min(H, W),
+                'eps': eps_rel * a
             }
             print("Background flow calculation done. Broadcasting data...")
         else:
@@ -532,7 +546,8 @@ def force_grid(R, H, W, Q, rho, mu, a, N_grid, particle_maxh_rel, global_maxh_re
         f_grid_calc = F_p_grid(
             params['R'], params['H'], params['W'],
             params['a'], params['G'], params['Re'],
-            params['L'], params['particle_maxh'], params['global_maxh'], params['eps']
+            params['L'], params['particle_maxh'], params['global_maxh'], params['eps'],
+            U_m=params['U_m']
         )
 
         grid_values = f_grid_calc.compute_F_p_grid_ensemble(N_grid=N_grid, u_bg_data_np=u_data_np,
@@ -573,7 +588,8 @@ def force_grid(R, H, W, Q, rho, mu, a, N_grid, particle_maxh_rel, global_maxh_re
         f_grid = F_p_grid(
             params['R'], params['H'], params['W'],
             params['a'], params['G'], params['Re'],
-            params['L'], params['particle_maxh'], params['global_maxh'], params['eps']
+            params['L'], params['particle_maxh'], params['global_maxh'], params['eps'],
+            U_m=params['U_m']
         )
 
         f_grid.N_grid = N_grid
@@ -599,36 +615,6 @@ def force_grid(R, H, W, Q, rho, mu, a, N_grid, particle_maxh_rel, global_maxh_re
             "equilibria": classified_equilibria
         }
 
-
-def auto_start_mpi(n_procs=5):
-
-    os.environ["PATH"] = "/opt/homebrew/bin:" + os.environ.get("PATH", "")
-    os.environ["MPICC"] = "/opt/homebrew/bin/mpicc"
-    os.environ["MPICXX"] = "/opt/homebrew/bin/mpicxx"
-    os.environ["CC"] = "/opt/homebrew/bin/mpicc"
-    os.environ["CXX"] = "/opt/homebrew/bin/mpicxx"
-
-    is_mpi = "OMPI_COMM_WORLD_RANK" in os.environ or \
-             "PMI_RANK" in os.environ or \
-             "SLURM_PROCID" in os.environ
-
-    if not is_mpi:
-
-        cmd = ["mpiexec", "-n", str(n_procs), sys.executable, "-u"] + sys.argv
-        print(f"Executing: {' '.join(cmd)}\n")
-
-        mpiexec_path = shutil.which("mpiexec")
-        if mpiexec_path is None:
-            raise FileNotFoundError("mpiexec not found in PATH")
-        os.execv(mpiexec_path, [mpiexec_path] + cmd[1:])
-
-
 if __name__ == "__main__":
 
-    auto_start_mpi(4)
-
-    if MPI.COMM_WORLD.Get_rank() == 0:
-        print("particle_maxh_rel = ", particle_maxh_rel)
-        print("global_maxh_rel = ", global_maxh_rel)
-
-    force_grid(R, H, W, Q, rho, mu, a, N_grid, particle_maxh_rel, global_maxh_rel, eps_rel)
+    force_grid(R, H, W, a, Re, N_grid, particle_maxh_rel, global_maxh_rel, eps_rel)

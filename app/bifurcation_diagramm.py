@@ -2,13 +2,12 @@ import os
 os.environ["OMP_NUM_THREADS"] = "1"
 
 import json
+import sys
 import warnings
 import plotly.graph_objects as go
 
-from nondimensionalization import nondimensionalisation
+from problem_setup import *
 from find_equilbrium_points import *
-from config_paper_parameters import *
-
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", message=".*import SLEPc.*", category=UserWarning)
@@ -16,13 +15,9 @@ warnings.filterwarnings("ignore", message=".*import SLEPc.*", category=UserWarni
 comm = MPI.COMM_WORLD
 rank = comm.Get_rank()
 
-a_hat_start = 0.134
-a_hat_end = 0.137
-a_hat_stepsize = 0.0025
 
-a_hat_values = np.round(np.arange(0.134, 0.137, 0.00025), 7)
+RESULTS_FILE = f"../images/bifurcation_results.json"
 
-RESULTS_FILE = f"../images/bifurcation_results_{a_hat_start, a_hat_end, a_hat_stepsize}.json"
 
 def plot_bifurcation_diagram(data, save=True, show=True):
 
@@ -48,7 +43,7 @@ def plot_bifurcation_diagram(data, save=True, show=True):
             continue
 
         style = type_styles.get(eq_type, type_styles["unclassified"])
-        x_vals = [entry["a_hat"] for entry in points]
+        x_vals = [entry["a"] for entry in points]
         r_vals = [entry["r_norm"] for entry in points]
         z_vals = [entry["z_norm"] for entry in points]
 
@@ -73,10 +68,8 @@ def plot_bifurcation_diagram(data, save=True, show=True):
             ),
         ))
 
-    W_hat = W / (H / 2)
-    H_hat = H / (H / 2)
-    x_min = min(a_hat_values) - 0.005
-    x_max = max(a_hat_values) + 0.005
+    x_min = min(a_values) - 0.005
+    x_max = max(a_values) + 0.005
 
     fig.update_layout(
         title="Bifurcation Diagram (3D): particle size vs equilibrium positions",
@@ -85,16 +78,16 @@ def plot_bifurcation_diagram(data, save=True, show=True):
             yaxis_title="Equilibrium r/(H/2)",
             zaxis_title="Equilibrium z/(H/2)",
             xaxis=dict(range=[x_min, x_max]),
-            yaxis=dict(range=[-W_hat / 2, W_hat / 2]),
-            zaxis=dict(range=[-H_hat / 2, H_hat / 2]),
+            yaxis=dict(range=[-W / 2, W / 2]),
+            zaxis=dict(range=[-H / 2, H / 2]),
         ),
         legend=dict(x=0.01, y=0.99),
         template="plotly_white",
     )
 
     if save:
-        a_min = min(a_hat_values)
-        a_max = max(a_hat_values)
+        a_min = min(a_values)
+        a_max = max(a_values)
         out_dir = "../images/Sweep_a=0.134_to_0.137_R=500_H=W=2_ss=0.0025"
         os.makedirs(out_dir, exist_ok=True)
         html_path = (
@@ -109,8 +102,6 @@ def plot_bifurcation_diagram(data, save=True, show=True):
 
 
 if __name__ == "__main__":
-
-    auto_start_mpi()
 
     os.makedirs("../images/Sweep_a=0.134_to_0.137_R=500_H=W=2_ss=0.0025", exist_ok=True)
 
@@ -130,15 +121,13 @@ if __name__ == "__main__":
 
     if rank == 0:
         print("Computing background flow (shared across all particle sizes)...")
-        R_hat, H_hat, W_hat, a_hat, L_c, U_c, Re = nondimensionalisation(R, H, W, a, Q, rho, mu, print_values=True)
-
-        bg = background_flow(R_hat, H_hat, W_hat, Re, comm=MPI.COMM_SELF)
-        G_hat, U_m_hat, u_bar_2d, p_bar_2d = bg.solve_2D_background_flow()
+        bg = background_flow(R, H, W, Re, comm=MPI.COMM_SELF)
+        G, U_m, u_bar_2d, p_bar_2d = bg.solve_2D_background_flow()
 
         u_data_np = u_bar_2d.dat.data_ro.copy()
         p_data_np = p_bar_2d.dat.data_ro.copy()
 
-        scalar_bg = (R_hat, H_hat, W_hat, L_c, U_c, Re, G_hat)
+        scalar_bg = (R, H, W, L_c, U_c, Re, G, U_m)
         print("Background flow done.")
     else:
         scalar_bg = None
@@ -148,26 +137,26 @@ if __name__ == "__main__":
     scalar_bg = comm.bcast(scalar_bg, root=0)
     u_data_np = comm.bcast(u_data_np, root=0)
     p_data_np = comm.bcast(p_data_np, root=0)
-    (R_hat, H_hat, W_hat, L_c, U_c, Re, G_hat) = scalar_bg
+    (R, H, W, L_c, U_c, Re, G, U_m) = scalar_bg
 
     bifurcation_data = []
 
-    for a_hat in a_hat_values:
-        a_phys = float(a_hat) * (H / 2)
-        a_hat_nd = a_phys / L_c
+    for a in a_values:
+        a_si = float(a) * L_c   # dimensional radius in meters, for display only
 
         if rank == 0:
             print(f"\n{'='*60}")
-            print(f"  a_hat = {a_hat:.5f}  |  a = {a_phys * 1e6:.2f} µm")
+            print(f"  a = {a:.5f}  |  a = {a_si * 1e6:.2f} µm")
             print(f"{'='*60}")
             print("  Computing force grid ...")
 
         force_grid = F_p_grid(
-            R_hat, H_hat, W_hat, a_hat_nd, G_hat, Re,
-            L=4 * max(H_hat, W_hat),
-            particle_maxh=particle_maxh_rel * a_hat_nd,
-            global_maxh=global_maxh_rel * min(H_hat, W_hat),
-            eps=0.2 * a_hat_nd,
+            R, H, W, a, G, Re,
+            L=4 * max(H, W),
+            particle_maxh=particle_maxh_rel * a,
+            global_maxh=global_maxh_rel * min(H, W),
+            eps=0.2 * a,
+            U_m=U_m,
         )
 
         grid_values = force_grid.compute_F_p_grid_ensemble(
@@ -189,7 +178,7 @@ if __name__ == "__main__":
                 r_eq, z_eq = eq["x_eq"]
 
                 bifurcation_data.append({
-                    "a_hat":  float(a_hat),
+                    "a":  float(a),
                     "r_raw":  float(r_eq),
                     "z_raw":  float(z_eq),
                     "r_norm": float(r_eq),

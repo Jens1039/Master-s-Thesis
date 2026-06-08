@@ -4,22 +4,29 @@ os.environ["OMP_NUM_THREADS"] = "1"
 from firedrake import *
 import numpy as np
 import matplotlib.pyplot as plt
+from mpl_toolkits.axes_grid1 import make_axes_locatable
 
 from build_3d_geometry_gmsh import make_curved_channel_section_with_spherical_hole
-from config_paper_parameters import *
-from nondimensionalization import nondimensionalisation
+from problem_setup import *
 
 
 class background_flow:
 
-    def __init__(self, R, H, W, Re, comm=None):
+    def __init__(self, R, H, W, Re, comm=None, mesh2d=None):
         self.R = R
         self.H = H
         self.W = W
         self.Re = Re
 
-        actual_comm = comm if comm is not None else COMM_WORLD
-        self.mesh2d = RectangleMesh(128, 128, self.W, self.H, quadrilateral=False, diagonal="crossed", comm=actual_comm)
+        # If an external 2D mesh is supplied (e.g. a cross-section deformed by
+        # a shape-optimisation T_2d), solve the background flow on it instead of
+        # the default rectangle. The mesh must still span [0, W] x [0, H] in its
+        # reference frame so the cylindrical coordinate map (r = x - W/2) holds.
+        if mesh2d is not None:
+            self.mesh2d = mesh2d
+        else:
+            actual_comm = comm if comm is not None else COMM_WORLD
+            self.mesh2d = RectangleMesh(128, 128, self.W, self.H, quadrilateral=False, diagonal="crossed", comm=actual_comm)
 
 
     def solve_2D_background_flow(self):
@@ -53,8 +60,6 @@ class background_flow:
         # Shortcuts for readability
         def del_r(f):  return Dx(f, 0)
         def del_z(f):  return Dx(f, 1)
-
-        # Below is equation (B1) from Harding et. al. in weak and nondimensionalized form and with the pressure-gradient equation added
 
         F_cont = q * (del_r(u_r) + del_z(u_z) + u_r / (self.R + r)) * (self.R + r) * dx
 
@@ -142,10 +147,10 @@ class background_flow:
 
         # necessary for rescale Re in the same way as Harding et. al.
         u_data = self.u_bar.dat.data_ro
-        U_m_hat = np.max(u_data[:, 2])
-        self.U_m_hat = U_m_hat
+        U_m = np.max(u_data[:, 2])
+        self.U_m = U_m
 
-        return G_val, U_m_hat, u_bar, p_bar_tilde
+        return G_val, U_m, u_bar, p_bar_tilde
 
 
     def plot(self):
@@ -191,17 +196,51 @@ class background_flow:
         ax.set_ylabel(r"$z$")
 
         cf = ax.contourf(Xi_plot, Zi_plot, U_theta, levels=40, cmap="coolwarm")
-        cbar1 = fig.colorbar(cf, ax=ax, shrink=0.9, pad=0.05)
+
+        stream = ax.streamplot(xi_plot, zi_plot, U_r, U_z, density=1.4, color=Speed, linewidth=lw, cmap="viridis", arrowsize=1.2, minlength=0.1)
+
+        divider = make_axes_locatable(ax)
+        cax1 = divider.append_axes("right", size="4%", pad=0.1)
+        cbar1 = fig.colorbar(cf, cax=cax1)
         cbar1.set_label(r"$u_\theta$")
 
-        stream = ax.streamplot(xi_plot, zi_plot, U_r, U_z, density=1.4, color=Speed, linewidth=lw, cmap="viridis",
-                                arrowsize=1.2, minlength=0.1)
-
-        cbar2 = fig.colorbar(stream.lines, ax=ax, shrink=0.9)
-        cbar2.set_label(r"$|u_{\mathrm{sec}}| = \sqrt{u_r^2 + u_z^2}$")
+        cax2 = divider.append_axes("right", size="4%", pad=0.7)
+        cbar2 = fig.colorbar(stream.lines, cax=cax2)
+        cbar2.set_label(r"$\sqrt{u_r^2 + u_z^2}$")
 
         plt.tight_layout()
+        plt.savefig("background_flow.png")
         plt.show()
+
+
+    def plot_mesh(self, filename="mesh_2d_128.png", figsize=(6, 6), linewidth=0.15):
+        # Underlying mesh lives at [0, W] x [0, H]; tick labels are shifted to
+        # the centred [-W/2, W/2] x [-H/2, H/2] convention used elsewhere in
+        # the case study, without modifying the mesh coordinates themselves.
+        from firedrake.pyplot import triplot
+
+        fig, ax = plt.subplots(figsize=figsize)
+        triplot(
+            self.mesh2d,
+            axes=ax,
+            interior_kw={"linewidths": linewidth, "edgecolors": "black", "facecolors": "none"},
+            boundary_kw={"linewidths": 0.8, "colors": "black"},
+        )
+
+        ax.set_aspect("equal", adjustable="box")
+        ax.set_xlabel(r"$r$")
+        ax.set_ylabel(r"$z$")
+
+        xticks = np.linspace(0, self.W, 5)
+        yticks = np.linspace(0, self.H, 5)
+        ax.set_xticks(xticks)
+        ax.set_yticks(yticks)
+        ax.set_xticklabels([f"{x - self.W / 2:g}" for x in xticks])
+        ax.set_yticklabels([f"{y - self.H / 2:g}" for y in yticks])
+
+        plt.tight_layout()
+        plt.savefig(filename, dpi=200, bbox_inches="tight")
+        plt.close(fig)
 
 
 def build_3d_background_flow(R, H, W, G, mesh3d, tags, u_bar_2d, p_bar_2d):
@@ -277,26 +316,112 @@ def build_3d_background_flow(R, H, W, G, mesh3d, tags, u_bar_2d, p_bar_2d):
     return u_bar_3d, p_bar_3d
 
 
+def run_mms_convergence(R, Re, W, H, Ns=(8, 16, 32, 64, 128)):
+    """Method of Manufactured Solutions for the cylindrical background-flow
+    operator solved in ``solve_2D_background_flow`` (the G-driving term and the
+    flow-rate constraint are dropped; the pressure is fixed up to a constant via
+    the constant null space). A smooth field is substituted into the weak form to
+    produce a consistent body force; the problem is re-solved with that force and
+    the matching Dirichlet data, and the velocity/pressure errors are measured
+    under uniform refinement. Prints L2/H1 velocity and L2 pressure errors and
+    the observed convergence rates (expected 3, 2, 2 for Taylor-Hood P2/P1).
+    Fills Table~\\ref{tab:mms_bg} of the thesis."""
+    import math
+
+    def _residual(u, p, v, q, r):
+        Rr = R + r
+        u_r, u_z, u_th = u[0], u[1], u[2]
+        v_r, v_z, v_th = v[0], v[1], v[2]
+        F_cont = q * (Dx(u_r, 0) + Dx(u_z, 1) + u_r / Rr) * Rr * dx
+        F_r = ((u_r * Dx(u_r, 0) + u_z * Dx(u_r, 1) - (u_th ** 2) / Rr) * v_r
+               + Dx(p, 0) * v_r
+               + (1.0 / Re) * dot(grad(u_r), grad(v_r))
+               + (1.0 / Re) * (u_r / Rr ** 2) * v_r) * Rr * dx
+        F_th = ((u_r * Dx(u_th, 0) + u_z * Dx(u_th, 1) + (u_r * u_th) / Rr) * v_th
+                + (1.0 / Re) * dot(grad(u_th), grad(v_th))
+                + (1.0 / Re) * (u_th / Rr ** 2) * v_th) * Rr * dx
+        F_z = ((u_r * Dx(u_z, 0) + u_z * Dx(u_z, 1)) * v_z
+               + Dx(p, 1) * v_z
+               + (1.0 / Re) * dot(grad(u_z), grad(v_z))) * Rr * dx
+        return F_cont + F_r + F_th + F_z
+
+    print(f"\nMMS convergence (background flow): R={R}, Re={Re}, W={W}, H={H}")
+    header = f"{'N':>5} {'h':>11} {'|e_u|_L2':>12} {'rate':>6} {'|e_u|_H1':>12} {'rate':>6} {'|e_p|_L2':>12} {'rate':>6}"
+    print(header)
+    prev = None
+    for N in Ns:
+        mesh = RectangleMesh(N, N, W, H, quadrilateral=False, diagonal="crossed")
+        V = VectorFunctionSpace(mesh, "CG", 2, dim=3)
+        Q = FunctionSpace(mesh, "CG", 1)
+        Z = V * Q
+        w = Function(Z)
+        u, p = split(w)
+        v, q = TestFunctions(Z)
+        x = SpatialCoordinate(mesh)
+        r = x[0] - 0.5 * W
+
+        kx, kz = np.pi / W, np.pi / H
+        ur_m = sin(kx * x[0]) * cos(kz * x[1])
+        uz_m = -cos(kx * x[0]) * sin(kz * x[1])
+        uth_m = sin(kx * x[0]) * sin(kz * x[1]) + 1.0
+        p_m = cos(kx * x[0]) * cos(kz * x[1])
+        u_m = as_vector([ur_m, uz_m, uth_m])
+
+        # forcing = weak residual evaluated at the manufactured solution
+        F = _residual(u, p, v, q, r) - _residual(u_m, p_m, v, q, r)
+
+        bc = DirichletBC(Z.sub(0), u_m, "on_boundary")
+        nullspace = MixedVectorSpaceBasis(
+            Z, [Z.sub(0), VectorSpaceBasis(constant=True, comm=mesh.comm)])
+        w.sub(0).interpolate(u_m)  # initial guess for Newton
+        problem = NonlinearVariationalProblem(F, w, bcs=[bc])
+        solver = NonlinearVariationalSolver(
+            problem, nullspace=nullspace,
+            solver_parameters={"snes_type": "newtonls",
+                               "ksp_type": "preonly",
+                               "pc_type": "lu",
+                               "pc_factor_mat_solver_type": "mumps"})
+        solver.solve()
+        uh, ph = w.subfunctions
+
+        e_u_L2 = math.sqrt(assemble(inner(uh - u_m, uh - u_m) * dx))
+        e_u_H1 = math.sqrt(assemble((inner(uh - u_m, uh - u_m)
+                                     + inner(grad(uh - u_m), grad(uh - u_m))) * dx))
+        area = assemble(Constant(1.0) * dx(domain=mesh))
+        shift = assemble((ph - p_m) * dx) / area
+        e_p_L2 = math.sqrt(assemble((ph - p_m - shift) ** 2 * dx))
+
+        h = max(W, H) / N
+        if prev is None:
+            print(f"{N:5d} {h:11.4e} {e_u_L2:12.4e} {'--':>6} {e_u_H1:12.4e} {'--':>6} {e_p_L2:12.4e} {'--':>6}")
+        else:
+            hp, eu2p, euhp, ep2p = prev
+            ru2 = math.log(eu2p / e_u_L2) / math.log(2.0)
+            ruh = math.log(euhp / e_u_H1) / math.log(2.0)
+            rp2 = math.log(ep2p / e_p_L2) / math.log(2.0)
+            print(f"{N:5d} {h:11.4e} {e_u_L2:12.4e} {ru2:6.2f} {e_u_H1:12.4e} {ruh:6.2f} {e_p_L2:12.4e} {rp2:6.2f}")
+        prev = (h, e_u_L2, e_u_H1, e_p_L2)
+
+
 if __name__ == "__main__":
 
+    bf = background_flow(R, H, W, Re)
+    G_val, U_m, u_2d, p_2d = bf.solve_2D_background_flow()
 
-    R_hat, H_hat, W_hat, a_hat, L_c, U_c, Re = nondimensionalisation(R, H, W, a, Q, rho, mu, print_values=True)
+    bf.plot()
+    bf.plot_mesh()
 
-    bf = background_flow(R_hat, H_hat, W_hat, Re)
-    G_val, U_m_hat, u_2d, p_2d = bf.solve_2D_background_flow()
+    mesh3d, tags = make_curved_channel_section_with_spherical_hole(R, H, W, L_rel * max(H, W), a, particle_maxh_rel * a, global_maxh_rel * min(H, W))
 
-    mesh3d, tags = make_curved_channel_section_with_spherical_hole(R_hat, H_hat, W_hat, L_rel * max(H_hat, W_hat),
-                                                a_hat, particle_maxh_rel * a_hat, global_maxh_rel * min(H_hat, W_hat))
-
-    u_3d, p_3d = build_3d_background_flow(R_hat, H_hat, W_hat, G_val, mesh3d, tags, u_2d, p_2d)
+    u_3d, p_3d = build_3d_background_flow(R, H, W, G_val, mesh3d, tags, u_2d, p_2d)
 
     print("3D mapping consistency at multiple points:")
-    theta_max = L_rel * max(H_hat, W_hat) / R_hat
+    theta_max = L_rel * max(H, W) / R
     test_points_2d = [
-        (0.5 * W_hat, 0.5 * H_hat),
-        (0.5 * W_hat, 0.25 * H_hat),
-        (0.25 * W_hat, 0.5 * H_hat),
-        (0.75 * W_hat, 0.25 * H_hat),
+        (0.5 * W, 0.5 * H),
+        (0.5 * W, 0.25 * H),
+        (0.25 * W, 0.5 * H),
+        (0.75 * W, 0.25 * H),
     ]
     theta_samples = [0.1 * theta_max, 0.3 * theta_max, 0.7 * theta_max, 0.9 * theta_max]
 
@@ -306,12 +431,12 @@ if __name__ == "__main__":
     print(f"{'(r, z)':>18} {'θ':>10} {'|u|_2D':>12} {'|u|_3D':>12} {'|Δ|':>10}")
     max_err = 0.0
     for i, (xx, yy) in enumerate(test_points_2d):
-        r_local = xx - 0.5 * W_hat
-        z_local = yy - 0.5 * H_hat
+        r_local = xx - 0.5 * W
+        z_local = yy - 0.5 * H
         speed_2d = float(np.linalg.norm(vals_2d[i]))
         for theta in theta_samples:
-            X = (R_hat + r_local) * np.cos(theta)
-            Y = (R_hat + r_local) * np.sin(theta)
+            X = (R + r_local) * np.cos(theta)
+            Y = (R + r_local) * np.sin(theta)
             Z = z_local
             eval_3d = PointEvaluator(mesh3d, np.array([[X, Y, Z]]))
             val_3d = np.array(eval_3d.evaluate(u_3d))[0]
@@ -319,4 +444,8 @@ if __name__ == "__main__":
             diff = abs(speed_2d - speed_3d)
             max_err = max(max_err, diff)
             print(f"({r_local:+.3f}, {z_local:+.3f})  {theta:10.4f}  {speed_2d:12.6f}  {speed_3d:12.6f}  {diff:10.2e}")
+    print(f"-> max |Δ|u|| = {max_err:.2e}")
+
+    # --- Verification: MMS convergence study (fills Table tab:mms_bg) ---
+    run_mms_convergence(R, Re, W, H)
     print(f"-> max |Δ|u|| = {max_err:.2e}")

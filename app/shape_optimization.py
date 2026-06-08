@@ -2,16 +2,16 @@ import os
 os.environ["OMP_NUM_THREADS"] = "1"
 
 import pickle
+from contextlib import contextmanager
 from datetime import datetime
 from firedrake import *
 import gc
 from firedrake.adjoint import stop_annotating, annotate_tape, continue_annotation, get_working_tape, set_working_tape, Tape, ReducedFunctional, Control
 
 from background_flow_differentiable import background_flow_differentiable, build_3d_background_flow_differentiable, vom_transfer, _compute_inv_perm
-from perturbed_flow_differentiable import perturbed_flow_differentiable, _build_xi_hat, check_mesh_quality, evaluate_forces, reset_ale_basis_for_step
+from perturbed_flow_differentiable import perturbed_flow_differentiable, _build_xi, check_mesh_quality, evaluate_forces, reset_ale_basis_for_step, DECOUPLED_LIFT
 from locate_bifurcation_points import newton_root_refine, moore_spence_solve
-from config_paper_parameters import *
-from nondimensionalization import nondimensionalisation
+from problem_setup import *
 
 
 # ---------------------------------------------------------------------------
@@ -38,14 +38,87 @@ def _install_solveblock_hessian_guard():
 _install_solveblock_hessian_guard()
 
 
-def _solve_bg_on_mesh(mesh2d, R_hat, H_hat, W_hat, Re_float):
+# ──────────────────────────────────────────────────────────────────────────
+# Ref-swap context manager for ``build_xi_channel_from_T2d``.
+#
+# The VOM lookup inside build_xi_channel_from_T2d uses query points clipped
+# to the reference rectangle [0, W]×[0, H]. As soon as T_2d grows past ~1%
+# of the cross-section, mesh2d.coordinates may sit at deformed positions
+# whose extent no longer covers the clipped query set, so
+# VertexOnlyMesh raises VertexOnlyMeshMissingPointsError.
+#
+# When ``xi_channel_ref_swap(X_ref_2d)`` is active, build_xi_channel_from_T2d
+# performs an off-tape ``mesh2d.coordinates.assign(X_ref_2d)`` BEFORE the
+# VOM construction. The element/local-coord lookup is frozen at that
+# moment (inside its own ``with stop_annotating()``), so the subsequent
+# on-tape interpolate is safe after the coord restoration.
+#
+# The ``restore`` switch governs what happens after the call returns:
+#   - restore=True  (on-tape callers): mesh2d.coords are restored to the
+#     pre-swap state, so any on-tape solve that ran on the deformed mesh
+#     (and whose adjoint backward pass evaluates forms using LIVE
+#     mesh.coords) sees the right state.
+#   - restore=False (off-tape callers, e.g. TR-backtrack): mesh2d stays
+#     at reference. The downstream off-tape MS solve evaluates forces
+#     with mesh2d in its current state, and empirically MS@reference
+#     gives the correct rho sign whereas MS@deformed flips it.
+# ──────────────────────────────────────────────────────────────────────────
+_xi_channel_X_ref_2d = None       # set via xi_channel_ref_swap CM
+_xi_channel_restore  = True       # whether the swap is restored on exit
 
-    bg = background_flow_differentiable(R_hat, H_hat, W_hat, Re_float,
+
+@contextmanager
+def xi_channel_ref_swap(X_ref_2d, restore=True):
+    """Activate the mesh2d → X_ref_2d coord swap inside
+    ``build_xi_channel_from_T2d`` for the duration of the block.
+    """
+    global _xi_channel_X_ref_2d, _xi_channel_restore
+    prev_x, prev_r = _xi_channel_X_ref_2d, _xi_channel_restore
+    _xi_channel_X_ref_2d = X_ref_2d
+    _xi_channel_restore  = restore
+    try:
+        yield
+    finally:
+        _xi_channel_X_ref_2d = prev_x
+        _xi_channel_restore  = prev_r
+
+
+def _solve_bg_on_mesh(mesh2d, R, H, W, Re_float):
+
+    bg = background_flow_differentiable(R, H, W, Re_float,
                                         mesh2d=mesh2d)
     return bg.solve_2D_background_flow()
 
 
-def build_xi_channel_from_T2d(T_2d, mesh3d, X_ref, mesh2d, R_hat, W_hat, H_hat):
+def build_xi_channel_from_T2d(T_2d, mesh3d, X_ref, mesh2d, R, W, H):
+
+    # ── Optional ref-swap (see xi_channel_ref_swap docstring) ──
+    # When the CM is active and T_2d is non-trivially non-zero, swap
+    # mesh2d.coordinates to X_ref_2d off-tape for the VOM construction.
+    # The T_2d-zero early-out matters: at step 1 of the shape-opt loop
+    # T_2d is exactly zero, so mesh2d.coords are already at reference;
+    # the swap is a no-op semantically but firedrake's internal cache
+    # invalidation on the coord Function empirically flipped the resulting
+    # shape-gradient direction in earlier attempts. Comparing via
+    # T_2d.dat.data is robust to function-space-instance differences
+    # between X_ref_2d and mesh2d.coordinates (a naive np.array_equal on
+    # mesh2d.coords vs X_ref_2d returned False due to DOF reorderings).
+    _ref_swap_active = (_xi_channel_X_ref_2d is not None)
+    _saved_coords    = None
+    if _ref_swap_active:
+        with stop_annotating():
+            t_max = float(np.max(np.abs(np.asarray(T_2d.dat.data_ro))))
+        if t_max < 1e-14:
+            _ref_swap_active = False
+            print(f"    [xi-patch] context active, T_2d max={t_max:.2e} < 1e-14 "
+                  f"→ no-op passthrough")
+        else:
+            mode = "swap+restore" if _xi_channel_restore else "swap (no restore)"
+            print(f"    [xi-patch] context active, T_2d max={t_max:.2e} → {mode}")
+            with stop_annotating():
+                if _xi_channel_restore:
+                    _saved_coords = mesh2d.coordinates.copy(deepcopy=True)
+                mesh2d.coordinates.assign(_xi_channel_X_ref_2d)
 
     V_def = X_ref.function_space()
 
@@ -54,12 +127,12 @@ def build_xi_channel_from_T2d(T_2d, mesh3d, X_ref, mesh2d, R_hat, W_hat, H_hat):
         X_ref_arr = X_ref.dat.data_ro.copy()          # (N, 3)
         rho_ref   = np.sqrt(X_ref_arr[:, 0]**2 + X_ref_arr[:, 1]**2)
 
-        s_ref = rho_ref - R_hat + 0.5 * W_hat
-        t_ref = X_ref_arr[:, 2] + 0.5 * H_hat
+        s_ref = rho_ref - R + 0.5 * W
+        t_ref = X_ref_arr[:, 2] + 0.5 * H
 
         query_pts = np.column_stack([
-            np.clip(s_ref, 0.0, W_hat),
-            np.clip(t_ref, 0.0, H_hat),
+            np.clip(s_ref, 0.0, W),
+            np.clip(t_ref, 0.0, H),
         ])
 
         vom_ch   = VertexOnlyMesh(mesh2d, query_pts, missing_points_behaviour="error")
@@ -122,8 +195,9 @@ def compute_DG_at_bif(r_bif, z_bif, a_bif, phi_bif, l_vec, mesh_data, r_ref, z_r
     return DG, F_base, J_sp
 
 
-def eval_forces_with_bg_on_tape(r_off, z_off, a_hat, u_bar_2d, p_bar_2d, G_hat_val, mesh_data, r_ref, z_ref, a_ref,
-                                    T_2d=None, mesh2d=None, rz_on_tape=False):
+def eval_forces_with_bg_on_tape(r_off, z_off, a, u_bar_2d, p_bar_2d, G_val, mesh_data, r_ref, z_ref, a_ref,
+                                    T_2d=None, mesh2d=None, rz_on_tape=False,
+                                    lift_on_tape=False, return_components=False):
 
     md     = mesh_data
     mesh3d = md['mesh3d']
@@ -134,26 +208,28 @@ def eval_forces_with_bg_on_tape(r_off, z_off, a_hat, u_bar_2d, p_bar_2d, G_hat_v
         R_space  = FunctionSpace(mesh3d, "R", 0)
         dr_fn_ctrl = Function(R_space, name="delta_r").assign(float(r_off - r_ref))
         dz_fn_ctrl = Function(R_space, name="delta_z").assign(float(z_off - z_ref))
-        da_fn      = Function(R_space, name="delta_a").assign(float(a_hat  - a_ref))
-        xi_particle = _build_xi_hat(dr_fn_ctrl, dz_fn_ctrl, da_fn, md)
+        da_fn      = Function(R_space, name="delta_a").assign(float(a  - a_ref))
+        xi_particle = _build_xi(dr_fn_ctrl, dz_fn_ctrl, da_fn, md)
     else:
         # Particle position OFF TAPE (r/z/a are fixed constants)
         with stop_annotating():
             R_space  = FunctionSpace(mesh3d, "R", 0)
             dr_fn    = Function(R_space).assign(float(r_off - r_ref))
             dz_fn    = Function(R_space).assign(float(z_off - z_ref))
-            da_fn    = Function(R_space).assign(float(a_hat  - a_ref))
-            xi_particle = _build_xi_hat(dr_fn, dz_fn, da_fn, md)
+            da_fn    = Function(R_space).assign(float(a  - a_ref))
+            xi_particle = _build_xi(dr_fn, dz_fn, da_fn, md)
 
+    xi_lift = None
     if T_2d is not None and mesh2d is not None:
         # --- Channel wall deformation from T_2d (ON TAPE) ---
         xi_channel = build_xi_channel_from_T2d(
             T_2d, mesh3d, md['X_ref'], mesh2d,
-            md['R_hat'], md['W_hat'], md['H_hat'])
+            md['R'], md['W'], md['H'])
 
         if rz_on_tape:
             # Both xi_channel and xi_particle are on tape
             xi_sum = xi_channel + xi_particle
+            xi_particle_for_lift = xi_particle
         else:
             # xi_particle is constant (off tape), gradient flows only
             # through xi_channel → T_2d.
@@ -161,12 +237,22 @@ def eval_forces_with_bg_on_tape(r_off, z_off, a_hat, u_bar_2d, p_bar_2d, G_hat_v
                 xi_particle_fn = Function(md['V_def'], name="xi_particle_const")
                 xi_particle_fn.dat.data[:] = xi_particle.dat.data_ro
             xi_sum = xi_channel + xi_particle_fn   # AddBlock on tape
+            xi_particle_for_lift = xi_particle_fn
 
         # Materialize the full deformation as a Function in V_def.
         # md['xi_baseline'] (snap from past accepted steps) is added
         # off-tape — it does not depend on the current Controls.
         xi_total = Function(md['V_def'], name="xi_total")
         xi_total.assign(md['xi_baseline'] + xi_sum)
+
+        # Channel-decoupled lift geometry (see DECOUPLED_LIFT in
+        # perturbed_flow_differentiable): the u_bar sampling positions exclude
+        # xi_channel, so the lift is smooth in T while xi_particle stays in
+        # (z-sampling for the Hessian-VP kept). Mirrors evaluate_forces' xi_lift
+        # exactly → objective/gradient consistent. At T=0 this == xi_total.
+        if DECOUPLED_LIFT:
+            xi_lift = Function(md['V_def'], name="xi_lift")
+            xi_lift.assign(md['xi_baseline'] + xi_particle_for_lift)
 
         # --- Deform 3D mesh: AssignBlock on tape ---
         mesh3d.coordinates.assign(md['X_ref'] + xi_total)
@@ -181,21 +267,45 @@ def eval_forces_with_bg_on_tape(r_off, z_off, a_hat, u_bar_2d, p_bar_2d, G_hat_v
     with stop_annotating():
         check_mesh_quality(mesh3d, ref_signs=md['ref_signs'])
 
-    # --- 3D background flow with u_bar_2d ON TAPE (VOM / xi=None path) ---
-    # The VOM query points are computed from the CURRENT (deformed) mesh
-    # coordinates, which is physically correct: we evaluate u_bar_2d at
-    # the positions of the deformed 3D nodes.
-    u_bar_3d, p_bar_3d, u_cyl_3d = build_3d_background_flow_differentiable(
-        md['R_hat'], md['H_hat'], md['W_hat'], G_hat_val,
-        mesh3d, md['tags'], u_bar_2d, p_bar_2d,
-        X_ref=None, xi=None)
+    # --- 3D background flow with u_bar_2d ON TAPE ---
+    # CHANNEL-DECOUPLED lift (DECOUPLED_LIFT, see perturbed_flow_differentiable
+    # module header): sample u_bar_2d at xi_lift = X_ref + xi_baseline +
+    # xi_particle (channel-undeformed), so the lift is smooth in T (xi_channel
+    # excluded) while the (z) particle sampling stays on tape. The caller must
+    # leave mesh2d at the REFERENCE cross-section so these channel-undeformed
+    # query points locate correctly. This MATCHES evaluate_forces' xi_lift, so
+    # the shape gradient is consistent with the bif objective. At T=0 it is a
+    # bit-for-bit no-op (xi_lift == xi_total).
+    #
+    # Legacy fallbacks (DECOUPLED_LIFT False): lift_on_tape selects the fully-
+    # coupled branch1 (full xi_total) or the frozen branch2 (X_ref/xi=None).
+    if DECOUPLED_LIFT and xi_lift is not None:
+        u_bar_3d, p_bar_3d, u_cyl_3d = build_3d_background_flow_differentiable(
+            md['R'], md['H'], md['W'], G_val,
+            mesh3d, md['tags'], u_bar_2d, p_bar_2d,
+            X_ref=md['X_ref'], xi=xi_lift)
+    elif lift_on_tape and (T_2d is not None and mesh2d is not None):
+        u_bar_3d, p_bar_3d, u_cyl_3d = build_3d_background_flow_differentiable(
+            md['R'], md['H'], md['W'], G_val,
+            mesh3d, md['tags'], u_bar_2d, p_bar_2d,
+            X_ref=md['X_ref'], xi=xi_total)
+    else:
+        u_bar_3d, p_bar_3d, u_cyl_3d = build_3d_background_flow_differentiable(
+            md['R'], md['H'], md['W'], G_val,
+            mesh3d, md['tags'], u_bar_2d, p_bar_2d,
+            X_ref=None, xi=None)
 
     # --- Perturbed-flow Stokes solve (CachedStokesSolveBlock on tape) ---
     pf = perturbed_flow_differentiable(
-        md['R_hat'], md['H_hat'], md['W_hat'], md['L_hat'],
-        float(a_hat), md['Re'],
+        md['R'], md['H'], md['W'], md['L'],
+        float(a), md['Re'],
         mesh3d, md['tags'], u_bar_3d, p_bar_3d,
         md['X_ref'], xi_total, u_cyl_3d)
+
+    if return_components:
+        F_p_x, F_p_z, _comps = pf.F_p(return_components=True)
+        comps = {k: float(v) for k, v in _comps.items()}
+        return float(F_p_x), float(F_p_z), comps
 
     F_p_x, F_p_z = pf.F_p()
     if rz_on_tape:
@@ -204,14 +314,40 @@ def eval_forces_with_bg_on_tape(r_off, z_off, a_hat, u_bar_2d, p_bar_2d, G_hat_v
 
 
 def compute_shape_gradient(r_bif, z_bif, a_bif, phi_bif, l_vec, a_target, DG_5x5, T_2d, mesh2d, X_ref_2d,
-                            R_hat, H_hat, W_hat, Re_float, mesh_data, r_ref, z_ref, a_ref):
+                            R, H, W, Re_float, mesh_data, r_ref, z_ref, a_ref):
+    """Shape derivative of the *bifurcation parameter* ``a_bif`` w.r.t. T.
 
-    # del J/del y
-    rhs_adj = np.array([0., 0., 2. * float(a_bif - a_target), 0., 0.])
+    Returned cofunction is ∇a (not ∇J). The caller assembles the Gauss-
+    Newton step (a_bif − a_target) · V_a / ‖V_a‖²_M from the Riesz lift
+    V_a — this is the pseudo-inverse of the rank-1 leading-order Hessian
+    2·∇a⊗∇a against the ε-scaled gradient 2ε·∇a. Two payoffs: (i) the
+    ε-free factor ∇a is resolved well by AD whereas ∇J = 2ε·∇a sinks
+    into the noise floor near the optimum; and (ii) the unit step α=1
+    lands at a_target in one shot of the linear-a model, giving the
+    outer trust region a fixed scale. Convergence: GN is quadratic at a
+    zero-residual problem; plain SD on J = (a − a_target)² with fixed
+    step is *linear* at the metric-dependent rate (1 − 2s·g_a²), not
+    cubic — earlier "ε³ stagnation" / "Hessian ∝ ε" claims were wrong.
+
+    Derivation (implicit function on the bifurcation constraint G = 0):
+
+        a = a(T), defined implicitly by G(y, T) = 0 with
+        y = (r, z, a, phi_r, phi_z) ∈ R^5.
+        L_a = a + μ^T G ,    ∂L_a/∂y = 0  ⇒  DG_y^T μ = (0, 0, 1, 0, 0)
+        da/dT = μ_0 · ∂F_p_x/∂T + μ_1 · ∂F_p_z/∂T
+              + μ_2 · ∂(J·phi)_x/∂T + μ_3 · ∂(J·phi)_y/∂T
+        (the last two terms are Hessian-VPs in TLM direction phi=(phi_r, phi_z))
+
+    Note: ``a_target`` is kept in the signature only for callers that
+    still need it for ε bookkeeping; the gradient itself no longer
+    depends on it.
+    """
+    # ∂a/∂y for y = (r, z, a, phi_r, phi_z): pick out the a-component.
+    rhs_adj = np.array([0., 0., 1., 0., 0.])
     cond_DG = np.linalg.cond(DG_5x5)
     print(f"  [Shape] cond(DG) = {cond_DG:.3e}")
 
-    # get lagrange multiplier
+    # get lagrange multiplier (now μ for ``a``, not for ``J`` — ε-free)
     lambda_adj = np.linalg.solve(DG_5x5.T, rhs_adj)
 
     lam_str = ', '.join(f'{v:.4e}' for v in lambda_adj)
@@ -230,13 +366,26 @@ def compute_shape_gradient(r_bif, z_bif, a_bif, phi_bif, l_vec, a_target, DG_5x5
 
     mesh2d.coordinates.assign(X_ref_2d + T_2d)
 
-    G_hat_val, _, u_bar_2d_new, p_bar_2d_new = _solve_bg_on_mesh(mesh2d, R_hat, H_hat, W_hat, Re_float)
+    G_val, _, u_bar_2d_new, p_bar_2d_new = _solve_bg_on_mesh(mesh2d, R, H, W, Re_float)
 
-    print(f"  [Shape] G_hat = {G_hat_val:.6e}")
+    print(f"  [Shape] G = {G_val:.6e}")
 
     print(f"  [Shape] Evaluating forces at y* = "f"(r={r_bif:.4f}, z={z_bif:.4f}, a={a_bif:.4f})...")
-    F_p_x, F_p_z, dr_fn, dz_fn = eval_forces_with_bg_on_tape(r_bif, z_bif, a_bif, u_bar_2d_new, p_bar_2d_new, G_hat_val,
-                                                mesh_data, r_ref, z_ref, a_ref, T_2d=T_2d, mesh2d=mesh2d, rz_on_tape=True)
+    # The eval_forces_with_bg_on_tape internal call to build_xi_channel_from_T2d
+    # does a VOM lookup with query points clipped to [0, W]×[0, H].
+    # mesh2d.coordinates are currently at X_ref_2d + T_2d (deformed, from the
+    # BG NS solve above); once T_2d grows past ~1% of the cross-section the
+    # deformed boundary moves out of the reference rectangle and VOM raises
+    # VertexOnlyMeshMissingPointsError. The context manager swaps
+    # mesh2d.coords to reference (off-tape) for the build_xi_channel call,
+    # then restores so that build_3d_background_flow_differentiable
+    # (called later inside eval_forces) still sees the deformed mesh2d
+    # for the u_bar_2d → 3D lifting.
+    with xi_channel_ref_swap(X_ref_2d):
+        F_p_x, F_p_z, dr_fn, dz_fn = eval_forces_with_bg_on_tape(
+            r_bif, z_bif, a_bif, u_bar_2d_new, p_bar_2d_new, G_val,
+            mesh_data, r_ref, z_ref, a_ref,
+            T_2d=T_2d, mesh2d=mesh2d, rz_on_tape=True)
 
     print(f"  [Shape] F(y*) at current T_2d: " f"F_x = {float(F_p_x):.4e}, F_z = {float(F_p_z):.4e}")
 
@@ -292,7 +441,7 @@ def compute_shape_gradient(r_bif, z_bif, a_bif, phi_bif, l_vec, a_target, DG_5x5
         dr_r = Function(R_sp).assign(float(r_bif - r_ref))
         dz_r = Function(R_sp).assign(float(z_bif - z_ref))
         da_r = Function(R_sp).assign(float(a_bif - a_ref))
-        xi_restore = _build_xi_hat(dr_r, dz_r, da_r, mesh_data)
+        xi_restore = _build_xi(dr_r, dz_r, da_r, mesh_data)
         mesh3d_r.coordinates.assign(
             mesh_data['X_ref'] + mesh_data['xi_baseline']
             + xi_restore + mesh_data['xi_channel'])
@@ -300,74 +449,58 @@ def compute_shape_gradient(r_bif, z_bif, a_bif, phi_bif, l_vec, a_target, DG_5x5
     return shape_grad, lambda_adj
 
 
-def project_z_symmetric(V_rep, mesh2d, H_hat):
-    """Project a 2D shape-deformation field onto the z-symmetric subspace
-    about the channel mid-plane z=H/2.
+def riesz_metric_form(u, v, *, metric="h1",
+                      alpha=1.0, beta=1e-2, mu=None, lam=None):
+    """UFL bilinear form for the Riesz / mesh-moving metric M(u, v).
 
-    A z-symmetric deformation satisfies
-        V_x(x, z) = +V_x(x, H - z)   (x-component symmetric)
-        V_z(x, z) = -V_z(x, H - z)   (z-component antisymmetric: walls bulge in
-                                      mirror image, channel-symmetric shape)
+    metric="h1"  (default, historically-validated vector-Laplacian):
+        M(u,v) = α ∫∇u:∇v dx + β ∫u·v dx
+        Each component is smoothed independently (no coupling).
 
-    Rationale: the underlying problem has a (z, -z) Bif-pair. Any deformation
-    that breaks this symmetry drags the +z Bif toward z=0, where it
-    coalesces with its mirror — a degeneracy that limits step-size and
-    eventually breaks MS convergence. The CR-Riesz metric M is block-
-    diagonal between sym/antisym subspaces (all M-terms are products of
-    sym×antisym → integral over a symmetric domain vanishes), so projecting
-    after the unrestricted Riesz solve is equivalent to solving Riesz on
-    the symmetric subspace directly.
+    metric="elasticity"  (linear elasticity):
+        M(u,v) = 2μ ∫ε(u):ε(v) dx + λ ∫(div u)(div v) dx + β ∫u·v dx,
+        ε(u) = sym(∇u). Couples the components through the symmetric
+        gradient and penalises local volume change via div u — the standard
+        elasticity-based mesh-moving regulariser, which keeps the deformed
+        mesh better conditioned than the plain Laplacian. μ, λ default to α.
+        The β·L² term is retained for coercivity/scale (with corner pinning
+        the form is already coercive, but β keeps it well-scaled).
 
-    Returns (V_sym, max_drift_killed) where max_drift_killed is the maximum
-    per-node L²-norm of the antisymmetric component that was discarded — a
-    diagnostic of how asymmetric V_rep was before projection.
+    IMPORTANT — single source of truth. The TR step/pred calibration in the
+    optimiser silently relies on the identity
+
+        g_a_sq_M = ‖V_a‖²_M = ⟨∇a, V_a⟩    (V_a = M⁻¹·∇a, any SPD M),
+
+    from which gn_scale = −ε/g_a_sq_M lands a at a_target (α=1) and
+    grad_norm_sq_M = 2ε² is the pred slope. This holds for ANY metric ONLY
+    IF the explicit ‖V_a‖²_M assembly uses the SAME form as the Riesz solve.
+    Route every metric evaluation (solve, g_a_sq_M, inner_M_form) through
+    THIS function so they cannot drift apart.
     """
-    from scipy.spatial import cKDTree
-    with stop_annotating():
-        coords = np.asarray(mesh2d.coordinates.dat.data_ro)
-        V_arr  = np.asarray(V_rep.dat.data_ro).copy()
-        mirror_coords = coords.copy()
-        mirror_coords[:, 1] = H_hat - coords[:, 1]
-        _, idx = cKDTree(coords).query(mirror_coords)
-        # Sanity: in a crossed-diagonal RectangleMesh the mirror lookup is
-        # exact. Distances should be ~machine eps.
-        max_mirror_dist = float(np.max(np.linalg.norm(
-            coords[idx] - mirror_coords, axis=1)))
-
-        V_sym = V_arr.copy()
-        V_sym[:, 0] = (V_arr[:, 0] + V_arr[idx, 0]) / 2.0
-        V_sym[:, 1] = (V_arr[:, 1] - V_arr[idx, 1]) / 2.0
-
-        # Antisymmetric component (what we throw away) — for diagnostics.
-        V_anti = V_arr - V_sym
-        max_anti = float(np.max(np.linalg.norm(V_anti, axis=1)))
-
-        V_out = Function(V_rep.function_space())
-        V_out.dat.data[:] = V_sym
-    return V_out, max_anti, max_mirror_dist
+    if metric == "h1":
+        return alpha * inner(grad(u), grad(v)) * dx + beta * inner(u, v) * dx
+    if metric == "elasticity":
+        mu_  = alpha if mu  is None else mu
+        lam_ = alpha if lam is None else lam
+        eps_u = sym(grad(u))
+        eps_v = sym(grad(v))
+        return (2.0 * mu_ * inner(eps_u, eps_v) * dx
+                + lam_ * div(u) * div(v) * dx
+                + beta * inner(u, v) * dx)
+    raise ValueError(f"unknown riesz metric '{metric}' "
+                     f"(expected 'h1' or 'elasticity')")
 
 
 def riesz_representative(shape_grad_cofunction, mesh2d,
                           alpha_elast=1.0, beta_l2=1e-2,
-                          mu_cr=100.0,
                           mask_interior=True,
-                          fix_corners=True, W_hat=None, H_hat=None):
-    """Compute the Cauchy-Riemann Riesz representative of the shape gradient.
+                          fix_corners=True, W=None, H=None,
+                          metric="h1", mu=None, lam=None):
+    """Compute the H¹ Riesz representative of the shape gradient.
 
-    Inner product (Paganini/Wechsung/Farrell 2018, Eq. 44, citing
-    Iglesias/Sturm/Wechsung 2017):
+    Inner product:
 
-        (V, W) = α ∫ ∇V:∇W dx + μ_cr ∫ (BV)·(BW) dx + β ∫ V·W dx
-
-    where B is the 2D Cauchy-Riemann operator
-        BV = (∂_x V_x - ∂_z V_z, ∂_z V_x + ∂_x V_z).
-
-    BV = 0 iff V is conformal (holomorphic) — i.e. an angle-preserving
-    map. Non-conformal modes (shear, anisotropic scaling) get an
-    additional μ_cr-penalty on top of the H¹ Dirichlet energy, so the
-    descent direction is biased toward near-conformal wall-bending
-    rather than shear/scaling modes that the plain elasticity metric
-    treats equally.
+        (V, W) = α ∫ ∇V:∇W dx + β ∫ V·W dx
 
     With ``mask_interior=True`` (default), the interior DOFs of the
     shape-gradient cofunction are zeroed *before* the Riesz solve
@@ -377,13 +510,13 @@ def riesz_representative(shape_grad_cofunction, mesh2d,
 
     With ``fix_corners=True`` (default), the four corners of the
     rectangular cross-section are pinned via homogeneous Dirichlet BC.
-    This eliminates the rigid-body null space (2 translations + 1
-    rotation) AND the uniform-scaling mode. Combined with the CR
-    penalty on shear, only genuine wall-bending modes remain
-    energetically cheap.
+    This eliminates the H¹ semi-norm kernel (the two rigid translations
+    of Ω₀); rotations and uniform scaling have ∇V ≠ 0 and are already
+    suppressed by the α∫∇V:∇W term itself. The L² term β∫V·W is kept
+    for additional coercivity / scale-setting of the bilinear form.
     """
-    if fix_corners and (W_hat is None or H_hat is None):
-        raise ValueError("fix_corners=True requires W_hat and H_hat.")
+    if fix_corners and (W is None or H is None):
+        raise ValueError("fix_corners=True requires W and H.")
     V_2d = shape_grad_cofunction.function_space().dual()
     v    = TrialFunction(V_2d)
     w    = TestFunction(V_2d)
@@ -436,22 +569,16 @@ def riesz_representative(shape_grad_cofunction, mesh2d,
         rhs_label = "full (boundary + interior)"
     print(f"  [Hadamard] Riesz RHS: {rhs_label}")
 
-    # ── Cauchy-Riemann inner product ──
-    # BV = (∂_x V_x - ∂_z V_z, ∂_z V_x + ∂_x V_z); BV = 0 iff V is conformal.
-    # μ_cr ∫ |BV|² penalises shear / non-conformal modes; α ∫ |∇V|² is the
-    # standard H¹ smoothing; β ∫ |V|² stabilises any residual near-null modes
-    # (mostly redundant once corners are pinned).
-    def B_cr(p):
-        return as_vector([
-            p[0].dx(0) - p[1].dx(1),
-            p[0].dx(1) + p[1].dx(0),
-        ])
-
-    a_form = (alpha_elast * inner(grad(v), grad(w)) * dx
-              + mu_cr      * inner(B_cr(v), B_cr(w)) * dx
-              + beta_l2    * inner(v, w) * dx)
-    print(f"  [Riesz] CR metric: α={alpha_elast:.3g}  "
-          f"μ_cr={mu_cr:.3g}  β={beta_l2:.3g}")
+    a_form = riesz_metric_form(v, w, metric=metric,
+                               alpha=alpha_elast, beta=beta_l2,
+                               mu=mu, lam=lam)
+    if metric == "elasticity":
+        _mu  = alpha_elast if mu  is None else mu
+        _lam = alpha_elast if lam is None else lam
+        print(f"  [Riesz] ELASTICITY metric: μ={_mu:.3g}  λ={_lam:.3g}  "
+              f"β={beta_l2:.3g}")
+    else:
+        print(f"  [Riesz] H¹ metric: α={alpha_elast:.3g}  β={beta_l2:.3g}")
 
     V_rep = Function(V_2d, name="V_rep")
 
@@ -462,9 +589,9 @@ def riesz_representative(shape_grad_cofunction, mesh2d,
             atol = 1e-6
             is_corner = (
                 (np.isclose(X_arr[:, 0], 0.0, atol=atol)
-                 | np.isclose(X_arr[:, 0], W_hat, atol=atol))
+                 | np.isclose(X_arr[:, 0], W, atol=atol))
                 & (np.isclose(X_arr[:, 1], 0.0, atol=atol)
-                   | np.isclose(X_arr[:, 1], H_hat, atol=atol))
+                   | np.isclose(X_arr[:, 1], H, atol=atol))
             )
             corner_nodes = np.where(is_corner)[0]
             print(f"  [Riesz] Pinning {len(corner_nodes)} corner nodes "
@@ -516,23 +643,56 @@ def riesz_representative(shape_grad_cofunction, mesh2d,
         print(f"  [Hadamard] |mean V_rep|_2 = {v_mean:.4e}  "
               f"(≪ V_rep_max means no net translation)")
 
-        # ── Conformality diagnostic ──
-        # ‖BV‖²/‖∇V‖²: 0 = fully conformal (V is an angle-preserving map,
-        # i.e. holomorphic), >0 = has non-conformal shear/anisotropic
-        # components. With μ_cr large enough, this ratio should be small;
-        # if it's still O(1), the shear modes still dominate V_rep and we
-        # need to raise μ_cr (or rethink).
-        grad_sq = float(assemble(inner(grad(V_rep), grad(V_rep)) * dx))
-        cr_sq   = float(assemble(inner(B_cr(V_rep), B_cr(V_rep)) * dx))
-        if grad_sq > 0:
-            conformality = cr_sq / grad_sq
-            print(f"  [CR] ‖BV_rep‖² / ‖∇V_rep‖² = {conformality:.4e}  "
-                  f"(0 = conformal, O(1) = shear-dominated)")
-
     return V_rep
 
 
-def check_2d_mesh_quality(mesh2d, tol_min_jacobian=0.05, ref_signs=None):
+def inner_M_form(u, v, riesz_alpha, riesz_beta):
+    """M-bilinear pairing between two V_2d Functions (H¹ Riesz metric).
+
+    Mirrors the metric used by ``riesz_representative`` — H¹ Dirichlet
+    energy + L² stabilisation — so that diagnostic cosines and norms
+    live in the same Hilbert space as V_a itself.
+    """
+    return float(assemble(
+        riesz_alpha  * inner(grad(u), grad(v)) * dx
+      + riesz_beta   * inner(u, v) * dx))
+
+
+def mesh2d_cell_quality(mesh2d):
+    """Per-cell shape quality of a 2D simplex mesh, in its CURRENT coordinate
+    state.
+
+    Uses the normalised "radius-ratio-like" measure for triangles
+
+        q = 4·√3 · Area / (ℓ₁² + ℓ₂² + ℓ₃²)  ∈ (0, 1],
+
+    with q = 1 for an equilateral triangle and q → 0 as the cell degenerates
+    (collapses to a sliver). This is a true *shape* quality — unlike
+    min|J|/max|J|, which conflates cell-size variation with distortion (after
+    a boundary deformation near-wall cells legitimately shrink, dragging the
+    |J| ratio down even when every cell is still well-shaped).
+
+    Returns (q_min, q_mean) over all cells. Cheap, fully vectorised, off-tape.
+    """
+    with stop_annotating():
+        coords = np.asarray(mesh2d.coordinates.dat.data_ro)              # (N, 2)
+        cmap   = mesh2d.coordinates.function_space() \
+                       .cell_node_map().values                          # (ncells, 3)
+        tri = coords[cmap]                                              # (ncells, 3, 2)
+        v0, v1, v2 = tri[:, 0, :], tri[:, 1, :], tri[:, 2, :]
+        a = v1 - v0
+        b = v2 - v0
+        l2 = (np.sum((v1 - v0) ** 2, axis=1)
+              + np.sum((v2 - v1) ** 2, axis=1)
+              + np.sum((v0 - v2) ** 2, axis=1))
+        area = 0.5 * np.abs(a[:, 0] * b[:, 1] - a[:, 1] * b[:, 0])
+        l2_safe = np.where(l2 > 0, l2, 1.0)
+        q = (4.0 * np.sqrt(3.0)) * area / l2_safe
+    return float(q.min()), float(q.mean())
+
+
+def check_2d_mesh_quality(mesh2d, tol_min_jacobian=0.05, ref_signs=None,
+                          tol_quality=None):
 
     try:
         with stop_annotating():
@@ -551,6 +711,19 @@ def check_2d_mesh_quality(mesh2d, tol_min_jacobian=0.05, ref_signs=None):
                       f"(min |J| = {abs_min:.3e}, max |J| = {abs_max:.3e})")
                 return False
 
+        # Hard quality gate: reject a (non-inverted) mesh whose worst cell
+        # shape-quality has dropped below tol_quality. Used by the TR
+        # backtrack to keep deformations gentle enough that the Riesz
+        # elastic mesh-move stays well-conditioned — the lever that fits a
+        # smoother which is already maxed out per step.
+        if tol_quality is not None:
+            q_min, q_mean = mesh2d_cell_quality(mesh2d)
+            if q_min < tol_quality:
+                print(f"  [mesh2d check] FAIL: min cell quality "
+                      f"q_min = {q_min:.3e} < tol_quality = {tol_quality:.3e} "
+                      f"(q_mean = {q_mean:.3e})")
+                return False
+
         if abs_max > 0 and abs_min / abs_max < tol_min_jacobian:
             print(f"  [mesh2d check] WARNING: near-degenerate cell "
                   f"(min |J| / max |J| = {abs_min / abs_max:.3e})")
@@ -565,17 +738,15 @@ def run_shape_optimization(a_target, shared_data, mesh_data_init,
                             *,
                             r_ref, z_ref, a_ref,
                             max_steps=50, tol_J=1e-8,
-                            alpha_step=0.1, alpha_min=1e-8,
+                            alpha_step=1.0, alpha_min=1e-8,
                             alpha_backtrack=0.5, max_backtrack=12,
-                            Delta_max=1e-1, branch_C=1.0,
+                            Delta_max=1.0, branch_C=1.0,
                             riesz_alpha=1.0, riesz_beta=1e-2,
-                            riesz_mu_cr=100.0,
-                            enforce_z_symmetry=False,
                             ms_tol=1e-12, ms_max_iter=30,
                             n_grid_2d=128,
                             plot_dir=None):
 
-    R_hat, H_hat, W_hat, L_c, U_c, Re, _, _, _, _ = shared_data
+    R, H, W, L_c, U_c, Re, _, _, _, _ = shared_data
 
     # Default plot directory: timestamped, so concurrent runs (e.g. one in
     # tmux + one fresh) write to separate folders and don't overwrite each
@@ -584,7 +755,7 @@ def run_shape_optimization(a_target, shared_data, mesh_data_init,
         plot_dir = "images/shape_opt_run_" + datetime.now().strftime("%Y%m%d_%H%M%S")
     print(f"  [ShapeOpt] Cross-section snapshots → {plot_dir}/")
 
-    mesh2d = RectangleMesh(n_grid_2d, n_grid_2d, W_hat, H_hat, quadrilateral=False, diagonal="crossed", comm=COMM_WORLD)
+    mesh2d = RectangleMesh(n_grid_2d, n_grid_2d, W, H, quadrilateral=False, diagonal="crossed", comm=COMM_WORLD)
 
     V_2d   = VectorFunctionSpace(mesh2d, "CG", 1)
     T_2d   = Function(V_2d, name="T_2d")
@@ -613,8 +784,8 @@ def run_shape_optimization(a_target, shared_data, mesh_data_init,
 
     print(f"\n{'#'*70}")
     print(f"#  SHAPE OPTIMISATION  (Algorithm 4.1)")
-    print(f"#  Target:  a_hat* = {a_target:.4f}")
-    print(f"#  Initial: a_hat* = {a_bif:.6f}")
+    print(f"#  Target:  a* = {a_target:.4f}")
+    print(f"#  Initial: a* = {a_bif:.6f}")
     print(f"{'#'*70}")
 
     history     = []
@@ -622,21 +793,57 @@ def run_shape_optimization(a_target, shared_data, mesh_data_init,
 
     # Trust-region backtracking, mirroring the MS inner-loop TR
     # (locate_bifurcation_points._globalize_tr).
-    #   pred  = α · ‖V_rep‖²_L²            (linear J-model)
+    #   pred  = α · 2ε²                    (linear-a J-model: -dJ/dα|_{α=0})
     #   actual = J − J_try
     #   ρ      = actual / pred
-    #   ρ ≥ eta_accept (0.1): accept; ρ > eta_good (0.75): grow Delta ×2
+    #   ρ ≥ eta_accept (0.1): accept; ρ > eta_good (0.4): grow Delta ×2
     #   else: shrink Delta ×0.5, retry
     # alpha_seed plays the role of `Delta` carried across outer steps.
     # alpha_step is the initial trust radius Delta_0; Delta_max is a soft
-    # upper cap on growth (rho > 0.75 doubles but is then clamped). A trial
-    # is also rejected if the new background-flow state deviates more than
-    # branch_C·‖u_new‖ from the previous one (Boullé–Farrell–Paganini eq.
-    # 4.3) — guards against MS converging onto a different bifurcation
-    # branch when alpha is too aggressive.
+    # upper cap on growth. A trial is also rejected if the new background-
+    # flow state deviates more than branch_C·‖u_new‖ from the previous
+    # one (Boullé–Farrell–Paganini eq. 4.3) — guards against MS converging
+    # onto a different bifurcation branch when alpha is too aggressive.
     eta_accept = 0.1
-    eta_good   = 0.75
+    # eta_good lowered from 0.75: under the GN parametrisation the first
+    # accepted steps typically have ρ ≈ 0.5, sitting in the "no growth"
+    # band (between eta_accept and eta_good) and clamping Delta forever
+    # at alpha_step. With eta_good=0.4 the TR auto-promotes Delta on
+    # these steady-good steps, and the eta_accept safety net still
+    # catches over-aggressive trials.
+    eta_good   = 0.4
     alpha_seed = min(float(alpha_step), float(Delta_max))
+
+    # No persistent curvature state. The TR uses pred = α·2ε² as the
+    # linear-a model prediction and trusts the post-MS rho-check
+    # (together with mesh_ok and branch tracking) to catch over-
+    # aggressive alpha. H_obs is computed per trial for diagnostic
+    # printing only — not fed back into any decision logic.
+
+    # Diagnostic state: V_a snapshot from the previous outer step. Used
+    # to test whether V_a is the dominant eigenmode of M⁻¹·∇²a (in which
+    # case L-BFGS would only add a magnitude correction, not a direction
+    # correction, and the per-step Δa ceiling would persist).
+    # Tracked quantities at each step k ≥ 2:
+    #   • cos(V_a_{k-1}, V_a_k)_M           — direction-lock indicator
+    #   • ||η||_M / ||V_a_{k-1}||_M          — magnitude of the V_a-change
+    #     where η := V_a_{k-1} − V_a_k
+    #   • cos²(V_a_{k-1}, η)_M               — Rayleigh tightness; equals 1
+    #     iff η ∝ V_a_{k-1}, i.e. M⁻¹·∇²a·V_a_{k-1} is pure scaling on
+    #     V_a_{k-1} (eigenvector condition). <1 ⇒ V_a rotates between
+    #     steps ⇒ L-BFGS could find directions out of the V_a-plane.
+    prev_V_a      = None
+    prev_g_a_sq_M = None
+
+    # Lag-by-one curvature estimate for the TR quadratic model. After each
+    # accepted step the Curv-Diag block reconstructs
+    #   Q := ⟨V_a, ∇²a·V_a⟩_L²
+    # from (ε_old, ε_new, α). This Q is then used as the curvature in next
+    # iteration's pred. Cheap (no extra Hessian-VP), and the snap-and-reset
+    # keeps the local a-curvature roughly stable between outer steps so a
+    # one-step lag is a reasonable estimator. Step 1 (no history) falls
+    # back to the linear-a model.
+    Q_eff_prev = None
 
     # Tracks the (r,z,a) bif at the START of the previous iteration, so we
     # can print the per-step trajectory delta — a leading indicator for
@@ -673,7 +880,7 @@ def run_shape_optimization(a_target, shared_data, mesh_data_init,
         # outer-loop shape change).
         if plot_dir is not None:
             save_cross_section_plot(step + 1, mesh2d, X_ref_2d, T_2d,
-                                    W_hat, H_hat, a_bif, J, plot_dir)
+                                    W, H, a_bif, J, plot_dir)
 
         if J < tol_J:
             print(f"\n  CONVERGED: J = {J:.4e} < tol = {tol_J:.4e}")
@@ -713,43 +920,100 @@ def run_shape_optimization(a_target, shared_data, mesh_data_init,
         print(f"  [Drift] 3D det(I+∇xi) range = [{detF_min:+.3e}, {detF_max:+.3e}]  "
               f"inverted cells = {n_inv}")
 
-        shape_grad, lambda_adj = compute_shape_gradient(r_bif, z_bif, a_bif, phi_bif, l_vec, a_target, DG_5x5,
-                                            T_2d, mesh2d, X_ref_2d, R_hat, H_hat, W_hat, Re, md, r_ref, z_ref, a_ref)
+        grad_a, lambda_adj = compute_shape_gradient(
+            r_bif, z_bif, a_bif, phi_bif, l_vec, a_target, DG_5x5,
+            T_2d, mesh2d, X_ref_2d, R, H, W, Re, md, r_ref, z_ref, a_ref)
 
-        V_rep = riesz_representative(shape_grad, mesh2d,
-                                      alpha_elast=riesz_alpha, beta_l2=riesz_beta,
-                                      mu_cr=riesz_mu_cr,
-                                      fix_corners=True, W_hat=W_hat, H_hat=H_hat)
-
-        # Optional: project V_rep onto the z-symmetric subspace. Kills any
-        # antisymmetric component that would drag the +z Bif toward z=0.
-        if enforce_z_symmetry:
-            V_rep, max_anti, mirror_dist = project_z_symmetric(
-                V_rep, mesh2d, H_hat)
-            print(f"  [Symm] z-symmetric projection: "
-                  f"max antisym killed = {max_anti:.3e}  "
-                  f"max mirror-lookup dist = {mirror_dist:.2e}")
+        # ── Riesz lift of ∇a (H¹ metric) ──
+        # Same solver as the legacy V_rep = riesz(2ε·∇a) path, but the RHS
+        # is now the ε-free ∇a, so V_a has fixed magnitude across outer
+        # steps and the Gauss-Newton step picks up ε only via the explicit
+        # (a_bif − a_target) factor in the step-direction construction
+        # below.
+        V_a = riesz_representative(
+            grad_a, mesh2d,
+            alpha_elast=riesz_alpha, beta_l2=riesz_beta,
+            fix_corners=True, W=W, H=H)
 
         with stop_annotating():
-            grad_norm_sq_L2 = float(assemble(inner(V_rep, V_rep) * dx))
-            # ‖V_rep‖²_M for the CR-Riesz metric M used by riesz_representative:
-            #   M(V,W) = α·∫∇V:∇W + μ_cr·∫BV·BW + β·∫V·W
-            # With V_rep = M⁻¹·shape_grad we have ⟨shape_grad, V_rep⟩ = ‖V_rep‖²_M,
-            # i.e. this is the exact first-order predicted J-decrease per unit α.
-            Bv = as_vector([V_rep[0].dx(0) - V_rep[1].dx(1),
-                            V_rep[0].dx(1) + V_rep[1].dx(0)])
-            grad_norm_sq_M = float(assemble(
-                riesz_alpha  * inner(grad(V_rep), grad(V_rep)) * dx
-              + riesz_mu_cr  * inner(Bv, Bv) * dx
-              + riesz_beta   * inner(V_rep, V_rep) * dx))
-        grad_norm_L2 = float(grad_norm_sq_L2 ** 0.5)
-        grad_norm_M  = float(grad_norm_sq_M  ** 0.5)
-        print(f"  ||V_rep||_L2 = {grad_norm_L2:.4e}   "
-              f"||V_rep||_M = {grad_norm_M:.4e}  (CR metric)")
+            g_a_sq_L2 = float(assemble(inner(V_a, V_a) * dx))
+            # ‖V_a‖²_M for the H¹ Riesz metric M used by riesz_representative:
+            #   M(V,W) = α·∫∇V:∇W + β·∫V·W
+            # With V_a = M⁻¹·∇a we have ⟨∇a, V_a⟩ = ‖V_a‖²_M = the
+            # directional-derivative coefficient of a along V_a.
+            g_a_sq_M = float(assemble(
+                riesz_alpha  * inner(grad(V_a), grad(V_a)) * dx
+              + riesz_beta   * inner(V_a, V_a) * dx))
+        print(f"  ||V_a||_L2 = {g_a_sq_L2 ** 0.5:.4e}   "
+              f"||V_a||_M = {g_a_sq_M ** 0.5:.4e}  (H¹ metric)")
 
-        if grad_norm_L2 < 1e-14:
-            print("  Gradient effectively zero — cannot proceed.")
+        if g_a_sq_M < 1e-14:
+            print("  ∇a effectively zero — cannot proceed.")
             break
+
+        # ── L-BFGS pre-flight diagnostic ──
+        # Compares V_a against its previous-step snapshot to decide
+        # whether a Newton-direction approximation (L-BFGS) would buy
+        # anything over GN steepest descent. See the [Diag] explanation
+        # at the top of this loop's state init.
+        if prev_V_a is not None:
+            with stop_annotating():
+                cross_M = inner_M_form(prev_V_a, V_a,
+                                        riesz_alpha, riesz_beta)
+                eta = Function(V_2d, name="V_a_step_diff")
+                eta.dat.data[:] = (np.asarray(prev_V_a.dat.data_ro)
+                                   - np.asarray(V_a.dat.data_ro))
+                sn = inner_M_form(prev_V_a, eta,
+                                   riesz_alpha, riesz_beta)
+                nn = inner_M_form(eta, eta,
+                                   riesz_alpha, riesz_beta)
+            cos_VprevV = (cross_M
+                          / ((prev_g_a_sq_M * g_a_sq_M) ** 0.5
+                             if prev_g_a_sq_M * g_a_sq_M > 0 else float('nan')))
+            eta_rel    = ((nn / prev_g_a_sq_M) ** 0.5
+                          if prev_g_a_sq_M > 1e-30 else float('nan'))
+            if nn > 1e-30 and prev_g_a_sq_M > 1e-30:
+                rayleigh_tight = (sn * sn) / (prev_g_a_sq_M * nn)
+            else:
+                rayleigh_tight = float('nan')
+            print(f"  [Diag] cos(V_a_prev, V_a)_M           = {cos_VprevV:+.6f}")
+            print(f"  [Diag] ||eta||_M / ||V_a_prev||_M      = {eta_rel:.4e}  "
+                  f"(eta = V_a_prev − V_a)")
+            print(f"  [Diag] Rayleigh tightness cos²(V_a_prev, eta)_M "
+                  f"= {rayleigh_tight:.6f}  "
+                  f"(1 = locked eigenmode → L-BFGS only rescales)")
+
+        # ── Gauss-Newton step direction ──
+        # Linear-a model:  a(T + s·V_a) ≈ a + s·⟨∇a, V_a⟩_L² = a + s·g_a_sq_M.
+        # Choosing s = (a_target − a)/g_a_sq_M ≡ −ε/g_a_sq_M lands a at
+        # a_target in one shot (α = 1). The TR-BT then scales by α ∈ (0, 1].
+        #
+        # Step-direction sign note. The Riesz solve here uses the SAME
+        # convention as the legacy V_rep = riesz(2ε·∇a) path: with that
+        # RHS, T += α·V_rep was empirically descending (J decreased). So
+        # V_a = V_rep/(2ε) is descending for objective a too. With ε > 0
+        # (a_bif > a_target) we therefore step T += +(ε/g_a_sq_M)·V_a to
+        # *reduce* a — matching the legacy descent direction up to scaling.
+        eps    = float(a_bif - a_target)
+        eps_sq = eps * eps
+        gn_scale = eps / g_a_sq_M
+        V_rep = Function(V_2d, name="step_GN")
+        V_rep.dat.data[:] = gn_scale * np.asarray(V_a.dat.data_ro)
+
+        step_norm_M  = abs(gn_scale) * (g_a_sq_M  ** 0.5)
+        step_norm_L2 = abs(gn_scale) * (g_a_sq_L2 ** 0.5)
+        print(f"  [GN] α=1 step: ||step||_L2 = {step_norm_L2:.4e}  "
+              f"||step||_M = {step_norm_M:.4e}  "
+              f"(ε = {eps:+.4e}, ε² = {eps_sq:.4e})")
+
+        # Under the GN parametrisation the linear J-slope is
+        #     -dJ/dα |_{α=0} = +2·ε² ,
+        # i.e. pred_lin(α) = α·2ε² is the linear-a model's predicted J
+        # reduction. We rely on the actual ρ-check after MS to catch
+        # any over-aggressive α (no model-based pre-rejection): MS
+        # converges cleanly, mesh-quality is monitored, and rho =
+        # (J − J_try)/pred_lin self-corrects via TR backtracking.
+        grad_norm_sq_M = 2.0 * eps_sq
 
         # --- Sanity check: is mesh2d in a clean state BEFORE line search? ---
         # If the tape replay corrupted X_ref_2d or mesh2d.coordinates, the
@@ -806,30 +1070,39 @@ def run_shape_optimization(a_target, shared_data, mesh_data_init,
                 with stop_annotating():
                     G_try, U_m_try, u_bar_try, p_bar_try = \
                         _solve_bg_on_mesh(
-                            mesh2d, R_hat, H_hat, W_hat, Re)
+                            mesh2d, R, H, W, Re)
             except Exception as e:
                 print(f"  [TR-BT bt={bt}] Background flow failed: {e}")
                 Delta *= alpha_backtrack
                 continue
 
-            shared_try = (R_hat, H_hat, W_hat, L_c, U_c, Re,
+            shared_try = (R, H, W, L_c, U_c, Re,
                           G_try, U_m_try, u_bar_try, p_bar_try)
 
             # --- Update mesh_data with new background flow ---
             md_try = dict(md)
-            md_try['u_bar_2d_hat']      = u_bar_try
-            md_try['p_bar_tilde_2d_hat'] = p_bar_try
-            md_try['G_hat']             = G_try
-            md_try['U_m_hat']           = U_m_try
+            md_try['u_bar_2d']      = u_bar_try
+            md_try['p_bar_tilde_2d'] = p_bar_try
+            md_try['G']             = G_try
+            md_try['U_m']           = U_m_try
 
             # --- Lift T_2d_try to 3D and store as static deformation ---
             # evaluate_forces (called from moore_spence_solve) reads md['xi_channel']
-            # to keep the 3D geometry consistent with u_bar_2d_hat on the deformed
+            # to keep the 3D geometry consistent with u_bar_2d on the deformed
             # cross-section. Build off-tape (constant during the MS iterations).
+            #
+            # TR-backtrack is off-tape — no AD adjoint to keep consistent.
+            # The subsequent MS evaluates forces using LIVE mesh2d.coords;
+            # MS@reference empirically gives the correct descent rho whereas
+            # MS@deformed (after restore) flips the rho sign. So:
+            # restore=False — mesh2d stays at reference after the call,
+            # matching the agg.txt manual-swap pattern. The next outer
+            # iteration's pre-LS check re-assigns mesh2d.coords regardless.
             with stop_annotating():
-                xi_ch_try = build_xi_channel_from_T2d(
-                    T_2d_try, md['mesh3d'], md['X_ref'], mesh2d,
-                    md['R_hat'], md['W_hat'], md['H_hat'])
+                with xi_channel_ref_swap(X_ref_2d, restore=False):
+                    xi_ch_try = build_xi_channel_from_T2d(
+                        T_2d_try, md['mesh3d'], md['X_ref'], mesh2d,
+                        md['R'], md['W'], md['H'])
                 xi_ch_static = Function(md['V_def'], name="xi_channel_static")
                 xi_ch_static.dat.data[:] = xi_ch_try.dat.data_ro
             md_try['xi_channel'] = xi_ch_static
@@ -838,8 +1111,8 @@ def run_shape_optimization(a_target, shared_data, mesh_data_init,
             print(f"  [TR-BT bt={bt}] alpha = {alpha:.3e} → running Moore-Spence...")
             try:
                 with stop_annotating():
-                    r_try, z_try, a_try, phi_try, conv_try, F_norm_try = \
-                        moore_spence_solve(
+                    r_try, z_try, a_try, phi_try, conv_try, F_norm_try, \
+                        G_norm_try, stalled_try = moore_spence_solve(
                             r_bif, z_bif, a_bif, shared_try,
                             tol=ms_tol, max_iter=ms_max_iter,
                             md=md_try,
@@ -855,6 +1128,19 @@ def run_shape_optimization(a_target, shared_data, mesh_data_init,
                 })
                 Delta *= alpha_backtrack
                 continue
+
+            # STALL with |F| at machine eps == reached FE resolution of the
+            # bifurcation (residual is all in J·phi at the FE-noise floor);
+            # not a sign that alpha was too aggressive. Gate by |F| so a
+            # genuinely unconverged MS (F stuck non-zero) still shrinks.
+            ms_floor_F = 1e-10
+            if (not conv_try) and stalled_try \
+                    and float(F_norm_try) < ms_floor_F:
+                print(f"  [TR-BT bt={bt}] MS stalled at FE-noise floor "
+                      f"(|F|={F_norm_try:.2e} < {ms_floor_F:.0e}, "
+                      f"|G|={G_norm_try:.2e}); accepting as converged-to-"
+                      f"discretisation-limit.")
+                conv_try = True
 
             # Diagnostic: MS-end |F| per trial. For converged trials it's
             # ~machine precision; for stalled trials it's the FE noise-floor
@@ -903,18 +1189,43 @@ def run_shape_optimization(a_target, shared_data, mesh_data_init,
 
             J_try = (float(a_try) - float(a_target)) ** 2
 
-            # Trust-region acceptance via ρ = actual / predicted.
-            #   predicted reduction:  α · ‖V_rep‖²_M   (linear J-model in the
-            #                         CR-Riesz metric M used to compute V_rep —
-            #                         exact directional-derivative coefficient)
-            #   actual    reduction:  J − J_try
-            pred = alpha * grad_norm_sq_M
+            # Quadratic-a TR model. Under
+            #   a(α) ≈ a_old − α·ε + ½·α²·ε²·Q/g⁴_M ,  Q = ⟨V_a,∇²a·V_a⟩_L²
+            # the J=(a−a*)² reduction along the GN step is
+            #   pred = α·2ε² − α²·ε²·(1 + ε·Q/g⁴_M).
+            # Q comes from the previous accepted step (lag-by-one). Step 1
+            # has Q_eff_prev=None → linear fallback. If the quadratic term
+            # makes pred ≤ 0 the model says no reduction is reachable along
+            # V_rep — force backtrack regardless of J_try.
+            actual_red = float(J) - float(J_try)
+            if Q_eff_prev is not None and np.isfinite(Q_eff_prev):
+                k_dim = eps * Q_eff_prev / (g_a_sq_M ** 2)
+                pred = (alpha * grad_norm_sq_M
+                        - alpha * alpha * eps_sq * (1.0 + k_dim))
+                pred_label = f"quad(k={k_dim:+.3f})"
+            else:
+                k_dim = float('nan')
+                pred = alpha * grad_norm_sq_M
+                pred_label = "lin(init)"
             if pred > 1e-30:
-                rho = (J - J_try) / pred
+                rho = actual_red / pred
+            elif pred < -1e-30:
+                # Quadratic model predicts ascent → reject without trusting
+                # an "accidental" J_try < J that could come from FE noise.
+                rho = -1.0
             else:
                 rho = -1.0 if J_try > J else 1.0
+            # Diagnostic: residual model error in α² units. With the linear
+            # model this was ≈ 2·d²J/dα²; with the quadratic model it now
+            # captures the cubic+ residual and should be ≪ the leading
+            # quadratic term when the lag-by-one Q estimate is good.
+            if alpha > 1e-5:
+                H_obs = 2.0 * (pred - actual_red) / (alpha * alpha)
+            else:
+                H_obs = float('nan')
             print(f"  [TR-BT bt={bt}] a_try = {a_try:.6f},  J_try = {J_try:.4e}  "
-                  f"(vs J = {J:.4e})  rho = {rho:+.4f}")
+                  f"(vs J = {J:.4e})  rho = {rho:+.4f}  "
+                  f"[pred_{pred_label}={pred:.2e}, H_obs={H_obs:.2e}]")
 
             if rho >= eta_accept:
                 # Accept step
@@ -940,9 +1251,10 @@ def run_shape_optimization(a_target, shared_data, mesh_data_init,
             print(f"  [ShapeOpt] TR backtracking failed — stopping.")
             break
 
-        # Update trust radius for the next step (carried via alpha_seed).
-        # Soft cap at Delta_max — protects against runaway growth on a string
-        # of good ρ values; the branch-tracking check is the primary safety net.
+        # Standard TR seed update: grow on good rho, hold otherwise.
+        # No curvature-based cap — if the doubled seed is too aggressive,
+        # the next step's TR backtracks it; if it's just right, we save
+        # MS solves by not artificially shrinking it.
         prev_seed = alpha_seed
         if accepted_rho > eta_good:
             alpha_seed = min(2.0 * Delta, float(Delta_max))
@@ -972,6 +1284,42 @@ def run_shape_optimization(a_target, shared_data, mesh_data_init,
         print(f"  [DIAG step {step+1}] plateau |F| of failed trials: [{failed_str}]"
               f"  | accepted |F|: {accepted_str}")
 
+        # ── Curvature diagnostic (cheap, no extra MS-solve) ──
+        # The GN step is T += α·(ε/g_a²)·V_a. Under the linear-a + Taylor-
+        # quadratic model:
+        #     a(T+step) = a_old − α·ε + ½·α²·(ε/g_a²)²·⟨V_a, ∇²a·V_a⟩_L²
+        # Hence  ε_new = (1−α)·ε + ½·α²·ε²·Q/g_a⁴  with  Q := ⟨V_a, ∇²a·V_a⟩.
+        # Solve for Q from the *observed* (ε_old, ε_new, α, g_a²) of this step
+        # to get the curvature that actually governed the residual.
+        #
+        # - Q stable over outer steps  ⇒  ε_new ∝ ε²  ⇒  quadratic convergence.
+        # - Q growing as ε ↘            ⇒  bifurcation parameter has higher
+        #     local curvature near the target shape — *physical* slowdown.
+        # - Q/g_a² is the dominant M-metric eigenvalue along V_a; per-step
+        #     Δa-ceiling in ANY descent direction is bounded by g_a²/(2·λ_dom).
+        eps_old = float(eps)
+        eps_new = float(a_bif - a_target)
+        ratio   = (eps_new / eps_old) if abs(eps_old) > 1e-30 else float('nan')
+        if abs(alpha) > 1e-12 and eps_sq > 1e-30:
+            Q_eff = (2.0 * (g_a_sq_M ** 2)
+                     * (eps_new - (1.0 - alpha) * eps_old)
+                     / (alpha * alpha * eps_sq))
+        else:
+            Q_eff = float('nan')
+        lam_dom_est = (Q_eff / g_a_sq_M) if g_a_sq_M > 1e-30 else float('nan')
+        print(f"  [Curv-Diag] ε: {eps_old:+.4e} → {eps_new:+.4e}   "
+              f"ratio = {ratio:+.4f}   (quad-conv ⇔ ratio ∝ ε)")
+        print(f"  [Curv-Diag] Q_eff = ⟨V_a, ∇²a·V_a⟩_L² ≈ {Q_eff:.4e}   "
+              f"λ_dom_est = Q_eff/g_a² = {lam_dom_est:.4e}")
+        if np.isfinite(Q_eff):
+            Q_eff_prev = Q_eff
+        target_eps = float(tol_J) ** 0.5
+        if 0 < ratio < 1 and abs(eps_new) > target_eps:
+            steps_remaining = float(np.log(target_eps / abs(eps_new))
+                                    / np.log(ratio))
+            print(f"  [Curv-Diag] If ratio holds: ~{steps_remaining:.1f} more "
+                  f"steps to ε < √tol_J = {target_eps:.2e}")
+
         # ── Snap-and-reset: re-linearise the ALE basis around the new bif ──
         # Absorbs (dr, dz, da) into md['xi_baseline'], updates the spherical-
         # hole centre and reference radius, and re-solves basis_r/z/a at the
@@ -985,6 +1333,15 @@ def run_shape_optimization(a_target, shared_data, mesh_data_init,
         # Restore 2D mesh to accepted T_2d
         with stop_annotating():
             mesh2d.coordinates.assign(X_ref_2d + T_2d)
+
+        # Snapshot V_a for the [Diag] cosine/Rayleigh diagnostic at the
+        # next outer step. V_a here was computed at the *start* of this
+        # step (before T_2d was modified); pairing it against the V_a
+        # recomputed at the start of the next step reveals whether the
+        # descent direction is locked or rotating.
+        with stop_annotating():
+            prev_V_a = V_a.copy(deepcopy=True)
+            prev_g_a_sq_M = g_a_sq_M
 
     # Final objective
     J_final = (float(a_bif) - float(a_target)) ** 2
@@ -1005,7 +1362,7 @@ def run_shape_optimization(a_target, shared_data, mesh_data_init,
     # in-loop snapshot only takes at the *start* of an iteration.
     if plot_dir is not None:
         save_cross_section_plot(step + 2, mesh2d, X_ref_2d, T_2d,
-                                W_hat, H_hat, a_bif, J_final, plot_dir)
+                                W, H, a_bif, J_final, plot_dir)
 
     return {
         'T_2d':      T_2d,
@@ -1023,8 +1380,8 @@ def run_shape_optimization(a_target, shared_data, mesh_data_init,
     }
 
 
-def save_cross_section_plot(step, mesh2d, X_ref_2d, T_2d, W_hat, H_hat,
-                             a_bif, J, output_dir, exaggeration=1000.0):
+def save_cross_section_plot(step, mesh2d, X_ref_2d, T_2d, W, H,
+                             a_bif, J, output_dir, exaggeration=10.0):
     """Save a two-panel PNG visualisation of the current deformed cross-section.
 
     Left panel: TRUE-SCALE. Reference rectangle dashed grey, deformed
@@ -1033,7 +1390,7 @@ def save_cross_section_plot(step, mesh2d, X_ref_2d, T_2d, W_hat, H_hat,
     unphysical magnitudes. For sane runs ‖T_2d‖ ≪ 1, so the deformed
     boundary lies essentially on top of the reference.
 
-    Right panel: EXAGGERATED by a factor (default 1000×). Same content
+    Right panel: EXAGGERATED by a factor (default 10×). Same content
     but the deformation amplitude is multiplied. Makes the *pattern*
     of the wall deformation visible (wall bulges, asymmetries, etc.).
     The title labels this panel as exaggerated; numbers along the axes
@@ -1059,9 +1416,9 @@ def save_cross_section_plot(step, mesh2d, X_ref_2d, T_2d, W_hat, H_hat,
         atol_bd = 1e-9
         on_bd = (
             np.isclose(X_ref_arr[:, 0], 0.0,   atol=atol_bd)
-            | np.isclose(X_ref_arr[:, 0], W_hat, atol=atol_bd)
+            | np.isclose(X_ref_arr[:, 0], W, atol=atol_bd)
             | np.isclose(X_ref_arr[:, 1], 0.0,   atol=atol_bd)
-            | np.isclose(X_ref_arr[:, 1], H_hat, atol=atol_bd)
+            | np.isclose(X_ref_arr[:, 1], H, atol=atol_bd)
         )
         per_node = np.sqrt(np.sum(T_arr ** 2, axis=1))
         bd_max  = float(per_node[on_bd].max())  if on_bd.any() else 0.0
@@ -1074,7 +1431,7 @@ def save_cross_section_plot(step, mesh2d, X_ref_2d, T_2d, W_hat, H_hat,
 
     # Boundaries: true and exaggerated.
     boundary_true = extract_deformed_boundary(mesh2d, X_ref_2d, T_2d,
-                                              W_hat, H_hat)
+                                              W, H)
 
     # Fixed exaggeration factor across all steps so the images are
     # directly comparable: same multiplier on every plot lets the eye
@@ -1085,7 +1442,7 @@ def save_cross_section_plot(step, mesh2d, X_ref_2d, T_2d, W_hat, H_hat,
         T_2d_exag = Function(T_2d.function_space())
         T_2d_exag.dat.data[:] = T_arr_exag
     boundary_exag = extract_deformed_boundary(mesh2d, X_ref_2d, T_2d_exag,
-                                              W_hat, H_hat)
+                                              W, H)
 
     boundary_true_closed = np.vstack([boundary_true, boundary_true[:1]])
     boundary_exag_closed = np.vstack([boundary_exag, boundary_exag[:1]])
@@ -1093,17 +1450,24 @@ def save_cross_section_plot(step, mesh2d, X_ref_2d, T_2d, W_hat, H_hat,
     X_def_true = X_ref_arr + T_arr
     X_def_exag = X_ref_arr + T_arr_exag
 
+    # Shift display coords so the axes are centered on the channel
+    # mid-plane: x, z ∈ [-W/2, W/2] × [-H/2, H/2] rather than the
+    # mesh-frame [0, W] × [0, H]. Pure visualization — underlying
+    # mesh data is untouched.
+    shift = np.array([0.5 * W, 0.5 * H])
+
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 6))
 
-    ref_box = np.array([[0, 0], [W_hat, 0], [W_hat, H_hat],
-                        [0, H_hat], [0, 0]])
+    ref_box = np.array([[0, 0], [W, 0], [W, H],
+                        [0, H], [0, 0]]) - shift
 
     # ── Left: true-scale ──
     ax1.plot(ref_box[:, 0], ref_box[:, 1],
              "--", color="0.5", linewidth=1.2, label="Reference rectangle")
-    ax1.scatter(X_def_true[:, 0], X_def_true[:, 1],
+    ax1.scatter(X_def_true[:, 0] - shift[0], X_def_true[:, 1] - shift[1],
                 s=2, color="0.7", alpha=0.5, label="Mesh nodes")
-    ax1.plot(boundary_true_closed[:, 0], boundary_true_closed[:, 1],
+    ax1.plot(boundary_true_closed[:, 0] - shift[0],
+             boundary_true_closed[:, 1] - shift[1],
              "-", color="C0", linewidth=2.0, label="Deformed boundary")
     ax1.set_aspect("equal")
     ax1.set_xlabel(r"$x$")
@@ -1111,16 +1475,17 @@ def save_cross_section_plot(step, mesh2d, X_ref_2d, T_2d, W_hat, H_hat,
     ax1.set_title("True scale")
     ax1.legend(loc="upper right", fontsize=8, framealpha=0.9)
     ax1.grid(True, alpha=0.3)
-    margin1 = max(0.05 * W_hat, 0.05 * H_hat)
-    ax1.set_xlim(-margin1, W_hat + margin1)
-    ax1.set_ylim(-margin1, H_hat + margin1)
+    margin1 = max(0.05 * W, 0.05 * H)
+    ax1.set_xlim(-0.5 * W - margin1, 0.5 * W + margin1)
+    ax1.set_ylim(-0.5 * H - margin1, 0.5 * H + margin1)
 
     # ── Right: exaggerated ──
     ax2.plot(ref_box[:, 0], ref_box[:, 1],
              "--", color="0.5", linewidth=1.2, label="Reference rectangle")
-    ax2.scatter(X_def_exag[:, 0], X_def_exag[:, 1],
+    ax2.scatter(X_def_exag[:, 0] - shift[0], X_def_exag[:, 1] - shift[1],
                 s=2, color="0.7", alpha=0.5, label="Mesh nodes")
-    ax2.plot(boundary_exag_closed[:, 0], boundary_exag_closed[:, 1],
+    ax2.plot(boundary_exag_closed[:, 0] - shift[0],
+             boundary_exag_closed[:, 1] - shift[1],
              "-", color="C1", linewidth=2.0, label="Deformed boundary")
     ax2.set_aspect("equal")
     ax2.set_xlabel(r"$x$")
@@ -1130,12 +1495,12 @@ def save_cross_section_plot(step, mesh2d, X_ref_2d, T_2d, W_hat, H_hat,
     ax2.grid(True, alpha=0.3)
     # Auto-extend the limits if the exaggerated boundary blows past the reference
     span_x = max(abs(boundary_exag[:, 0].min()),
-                 abs(boundary_exag[:, 0].max() - W_hat))
+                 abs(boundary_exag[:, 0].max() - W))
     span_y = max(abs(boundary_exag[:, 1].min()),
-                 abs(boundary_exag[:, 1].max() - H_hat))
-    margin2 = max(0.05 * W_hat, 0.05 * H_hat, 1.1 * span_x, 1.1 * span_y)
-    ax2.set_xlim(-margin2, W_hat + margin2)
-    ax2.set_ylim(-margin2, H_hat + margin2)
+                 abs(boundary_exag[:, 1].max() - H))
+    margin2 = max(0.05 * W, 0.05 * H, 1.1 * span_x, 1.1 * span_y)
+    ax2.set_xlim(-0.5 * W - margin2, 0.5 * W + margin2)
+    ax2.set_ylim(-0.5 * H - margin2, 0.5 * H + margin2)
 
     # Per-step header
     T_norm = float(np.linalg.norm(T_arr))
@@ -1149,15 +1514,15 @@ def save_cross_section_plot(step, mesh2d, X_ref_2d, T_2d, W_hat, H_hat,
     print(f"  [Plot] Saved {out_path}")
 
 
-def extract_deformed_boundary(mesh2d, X_ref_2d, T_2d, W_hat, H_hat, atol=1e-9):
+def extract_deformed_boundary(mesh2d, X_ref_2d, T_2d, W, H, atol=1e-9):
 
     X_ref = np.asarray(X_ref_2d.dat.data_ro)                 # (N, 2)
     X_def = X_ref + np.asarray(T_2d.dat.data_ro)             # (N, 2)
 
     on_bottom = np.isclose(X_ref[:, 1], 0.0,   atol=atol)
-    on_top    = np.isclose(X_ref[:, 1], H_hat, atol=atol)
+    on_top    = np.isclose(X_ref[:, 1], H, atol=atol)
     on_left   = np.isclose(X_ref[:, 0], 0.0,   atol=atol)
-    on_right  = np.isclose(X_ref[:, 0], W_hat, atol=atol)
+    on_right  = np.isclose(X_ref[:, 0], W, atol=atol)
 
     # Walk CCW starting from (0, 0): bottom (L→R), right (B→T),
     # top (R→L), left (T→B).  Drop corners already included in previous edge.
@@ -1184,8 +1549,8 @@ def extract_deformed_boundary(mesh2d, X_ref_2d, T_2d, W_hat, H_hat, atol=1e-9):
     return X_def[ordered_idx]
 
 
-def save_optimized_section(result, *, R, H, W, Q, rho, mu,
-                           R_hat, H_hat, W_hat, L_c, U_c, Re,
+def save_optimized_section(result, *, R_phys, H_phys, W_phys, Q_phys, rho_phys, mu_phys,
+                           R, H, W, L_c, U_c, Re,
                            a_target, n_grid_2d, filepath):
     """Pickle the optimized cross-section so another script can rebuild the
     deformed 2D mesh, recompute the background flow on it, and hand the
@@ -1214,7 +1579,7 @@ def save_optimized_section(result, *, R, H, W, Q, rho, mu,
     T_2d     = result['T_2d']
 
     boundary_pts_2d = extract_deformed_boundary(
-        mesh2d, X_ref_2d, T_2d, W_hat, H_hat)
+        mesh2d, X_ref_2d, T_2d, W, H)
 
     with stop_annotating():
         T_data     = np.asarray(T_2d.dat.data_ro).copy()
@@ -1227,10 +1592,10 @@ def save_optimized_section(result, *, R, H, W, Q, rho, mu,
         'X_ref_2d_data':   X_ref_data,
         'n_grid_2d':       int(n_grid_2d),
         # --- Geometry + flow parameters (dim) ---
-        'R': R, 'H': H, 'W': W,
-        'Q': Q, 'rho': rho, 'mu': mu,
+        'R_phys': R_phys, 'H_phys': H_phys, 'W_phys': W_phys,
+        'Q_phys': Q_phys, 'rho_phys': rho_phys, 'mu_phys': mu_phys,
         # --- Non-dimensional ---
-        'R_hat': R_hat, 'H_hat': H_hat, 'W_hat': W_hat,
+        'R': R, 'H': H, 'W': W,
         'L_c':   L_c,   'U_c':   U_c,   'Re':    Re,
         # --- Optimization result ---
         'a_target':  a_target,
@@ -1250,28 +1615,25 @@ def save_optimized_section(result, *, R, H, W, Q, rho, mu,
 
 
 def run_from_main(r0, z0, a0, a_target, max_steps=50, tol_J=1e-8,
-                  alpha_step=0.05, riesz_alpha=1.0, riesz_beta=1e-2,
-                  riesz_mu_cr=100.0,
-                  enforce_z_symmetry=False,
+                  alpha_step=1.0, riesz_alpha=1.0, riesz_beta=1e-2,
                   ms_tol=1e-12, ms_max_iter=15, n_grid_2d=128):
 
-    R_hat, H_hat, W_hat, a_hat, L_c, U_c, Re = nondimensionalisation(R, H, W, a, Q, rho, mu, print_values=True)
-
     with stop_annotating():
-        bg = background_flow_differentiable(R_hat, H_hat, W_hat, Re)
-        G_hat, U_m_hat, u_bar_2d, p_bar_tilde = bg.solve_2D_background_flow()
+        bg = background_flow_differentiable(R, H, W, Re)
+        G, U_m, u_bar_2d, p_bar_tilde = bg.solve_2D_background_flow()
 
-    shared_data = (R_hat, H_hat, W_hat, L_c, U_c, Re, G_hat, U_m_hat, u_bar_2d, p_bar_tilde)
+    shared_data = (R, H, W, L_c, U_c, Re, G, U_m, u_bar_2d, p_bar_tilde)
 
     r_eq, z_eq, md0, dr0, dz0 = newton_root_refine(r0, z0, a0, shared_data, tol=1e-10, max_iter=15)
 
     r_ref, z_ref, a_ref = r0, z0, a0
 
     with stop_annotating():
-        r_bif, z_bif, a_bif, phi_bif, conv_ms, F_norm0 = moore_spence_solve(
-            r_eq, z_eq, a0, shared_data,
-            tol=ms_tol, max_iter=ms_max_iter,
-            md=md0, dr_init=dr0, dz_init=dz0)
+        r_bif, z_bif, a_bif, phi_bif, conv_ms, F_norm0, _G0, _stalled0 = \
+            moore_spence_solve(
+                r_eq, z_eq, a0, shared_data,
+                tol=ms_tol, max_iter=ms_max_iter,
+                md=md0, dr_init=dr0, dz_init=dz0)
         print(f"  Initial bifurcation residual: |F| = {F_norm0:.3e}")
 
     if not conv_ms:
@@ -1280,7 +1642,7 @@ def run_from_main(r0, z0, a0, a_target, max_steps=50, tol_J=1e-8,
     bif_init = {'r': r_bif, 'z': z_bif, 'a': a_bif,
                 'phi': phi_bif, 'converged': True}
 
-    print(f"\n  Initial bifurcation: a_hat = {a_bif:.6f} (target = {a_target:.4f})")
+    print(f"\n  Initial bifurcation: a = {a_bif:.6f} (target = {a_target:.4f})")
 
     result = run_shape_optimization(
         a_target, shared_data, md0, bif_init,
@@ -1288,8 +1650,6 @@ def run_from_main(r0, z0, a0, a_target, max_steps=50, tol_J=1e-8,
         max_steps=max_steps, tol_J=tol_J,
         alpha_step=alpha_step,
         riesz_alpha=riesz_alpha, riesz_beta=riesz_beta,
-        riesz_mu_cr=riesz_mu_cr,
-        enforce_z_symmetry=enforce_z_symmetry,
         ms_tol=ms_tol, ms_max_iter=ms_max_iter,
         n_grid_2d=n_grid_2d)
 
@@ -1305,8 +1665,9 @@ def run_from_main(r0, z0, a0, a_target, max_steps=50, tol_J=1e-8,
     try:
         save_optimized_section(
             result,
-            R=R, H=H, W=W, Q=Q, rho=rho, mu=mu,
-            R_hat=R_hat, H_hat=H_hat, W_hat=W_hat,
+            R_phys=R_phys, H_phys=H_phys, W_phys=W_phys,
+            Q_phys=Q_phys, rho_phys=rho_phys, mu_phys=mu_phys,
+            R=R, H=H, W=W,
             L_c=L_c, U_c=U_c, Re=Re,
             a_target=a_target,
             n_grid_2d=n_grid_2d,
@@ -1320,48 +1681,32 @@ def run_from_main(r0, z0, a0, a_target, max_steps=50, tol_J=1e-8,
 
 if __name__ == "__main__":
 
-    a_target = 0.1
+    # a_target imported from problem_setup (= a_target_phys / L_c).
 
     # Initial guess from the bifurcation diagramm
-    r_off_hat_init = 0.6098
-    z_off_hat_init = 0.0
-    a_hat_init = 0.1375
+    r_off_init = 0.6098
+    z_off_init = 0.0
+    a_init = 0.1375
 
     print("\nparticle_maxh_rel = ", particle_maxh_rel)
     print("global_maxh_rel = ", global_maxh_rel)
 
     result = run_from_main(
         a_target=a_target,
-        r0=r_off_hat_init,
-        z0=z_off_hat_init,
-        a0=a_hat_init,
-        max_steps=50,
+        r0=r_off_init,
+        z0=z_off_init,
+        a0=a_init,
+        max_steps=100,
         tol_J=1e-8,
-        # alpha_step: previously held at 1e-3 because α=1e-2 had MS plateau
-        # at the FE noise floor — but that was before CR + corner-fix. With
-        # rigid-body amplification gone (corner BCs) and V_rep ~98% conformal
-        # (CR penalty), the starting |G| in each LS trial should now be clean
-        # enough for Newton to drive to machine precision even at α=1e-2.
-        # If MS plateaus or stalls reappear, the stall detector + Armijo
-        # backtracking will catch it. Per-step ‖T_2d‖_max ≈ 1.5e-4 ≪ 1
-        # so linearization should still hold.
-        alpha_step=1e-2,
-        # H¹ smoothing strength. With the CR penalty doing most of the
-        # mode-selection now, α=10 is overkill — keep it moderate.
-        riesz_alpha=10.0,
+        # α=1 is the *natural* full Newton step under the GN parametrisation
+        # (T += α·ε/g_a²·V_a; α=1 lands at a_target in the linear-a model).
+        # The TR's ρ-check + mesh-ok + branch-tracking catch over-aggressive
+        # trials; max_backtrack=12 halvings reach down to ~1.2e-4 if needed.
+        alpha_step=1.0,
+        # ── safer fallback if step 1 burns too many backtracks ──
+        # alpha_step=1e-2,
+        riesz_alpha=0.1,
         riesz_beta=1e-2,
-        # Cauchy-Riemann penalty (Paganini/Wechsung/Farrell 2018). Penalises
-        # non-conformal modes (shear, anisotropic scaling) preferentially,
-        # biases descent toward conformal wall-bending. Effective shear
-        # penalty ≈ (1 + μ_cr/α) × baseline. 100 / 10 = 10× extra cost for
-        # shear modes.
-        riesz_mu_cr=100.0,
-        # Constrain V_rep to z-symmetric deformations about z=H/2.
-        # Antisymmetric components would drag the +z Bif toward z=0 and
-        # eventually trigger coalescence with the -z mirror Bif (numerical
-        # degeneracy). With this on, dz_Bif/d_step is 0 by construction and
-        # the Bif moves only in (r,a). Flip to False for an asymmetric run.
-        enforce_z_symmetry=False,
         ms_tol=1e-12,
         ms_max_iter=30,
         n_grid_2d=120

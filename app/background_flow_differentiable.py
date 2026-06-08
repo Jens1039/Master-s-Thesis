@@ -9,8 +9,7 @@ import sys
 from scipy.spatial import cKDTree
 
 from build_3d_geometry_gmsh import make_curved_channel_section_with_spherical_hole
-from config_paper_parameters import *
-from nondimensionalization import nondimensionalisation
+from problem_setup import *
 
 
 class VOMTransferBlock(Block):
@@ -142,6 +141,11 @@ class DifferentiableFieldEvalBlock(Block):
 
         super().__init__()
         self.add_dependency(xi_fn)
+        # field_2d is now a tape dependency (idx 1) so the adjoint flows back
+        # into u_bar_2d → the BG-NS SolveBlock → mesh2d.coords → T_2d. Without
+        # this, the dominant ∂u_bar/∂T shape sensitivity is silently dropped
+        # (it was the root cause of the ∂a_bif/∂T Taylor-test failure).
+        self.add_dependency(field_2d)
         self.add_output(out_fn.create_block_variable())
 
         self.X_ref_data = X_ref_data
@@ -246,6 +250,11 @@ class DifferentiableFieldEvalBlock(Block):
 
     def evaluate_adj_component(self, inputs, adj_inputs, block_variable, idx, prepared=None):
 
+        # idx 0 → xi (geometry motion of the sample points);
+        # idx 1 → field_2d (the 2D background field value itself).
+        if idx == 1:
+            return self._adj_wrt_field(inputs, adj_inputs)
+
         if adj_inputs[0] is None:
             return Cofunction(self.V_def.dual())
 
@@ -277,6 +286,130 @@ class DifferentiableFieldEvalBlock(Block):
             adj.dat.data[:] = adj_xi_CG1
 
         return adj
+
+
+    def _adj_wrt_field(self, inputs, adj_inputs):
+        """Adjoint w.r.t. ``field_2d`` (dependency idx 1): the transpose of the
+        point-evaluation ``out[m] = field_2d(qu[m])``. Rebuilds the SAME VOM /
+        query points as the forward eval, scatters the output cotangent into
+        VOM order, and applies the interpolation transpose Vs → V_f.
+
+        Only the field VALUE sensitivity — no s/t active-masking here (clamped
+        points still feel a change in field_2d at the boundary location, unlike
+        the geometry-motion adjoint where ds/dxi vanishes at the clamp).
+        """
+        Vs = self.field_2d.function_space()
+        if adj_inputs[0] is None:
+            return Cofunction(Vs.dual())
+
+        with stop_annotating():
+            xyz = self._get_CG2_positions(inputs[0].dat.data_ro)
+
+            # Reproduce _project_and_eval's VOM construction exactly.
+            r = np.sqrt(xyz[:, 0]**2 + xyz[:, 1]**2)
+            s_raw = r - self.R + 0.5 * self.W
+            t_raw = xyz[:, 2] + 0.5 * self.H
+            qu = np.column_stack([np.clip(s_raw, 0, self.W),
+                                  np.clip(t_raw, 0, self.H)])
+
+            vom = VertexOnlyMesh(self.mesh2d, qu,
+                                 missing_points_behaviour="error")
+            inv_perm = _compute_inv_perm(vom, qu)
+            perm = np.argsort(inv_perm)
+
+            if self.field_dim > 1:
+                V_f = VectorFunctionSpace(vom, "DG", 0, dim=self.field_dim)
+            else:
+                V_f = FunctionSpace(vom, "DG", 0)
+
+            # Forward: out[m] = interp_vom[inv_perm[m]]  ⇒  adjoint scatters the
+            # output cotangent back to VOM-internal order via perm.
+            adj_out = np.asarray(adj_inputs[0].dat.data_ro)
+            adj_vom_data = adj_out[perm]
+
+            adj_field = _interp_adjoint(Vs, V_f, adj_vom_data)
+
+        return adj_field
+
+
+    def _hess_wrt_field(self, inputs, hessian_inputs, adj_inputs):
+        """Second-order adjoint contribution to ``field_2d`` (dependency idx 1).
+
+        The output ``out = field_2d(q(xi))`` is LINEAR in field_2d, so there is
+        no field-field term. Two pieces remain:
+
+          part1 = f_field^T · (2nd-order seed)
+                = value-transpose of ``hessian_inputs`` (same as _adj_wrt_field).
+          part2 = f_{field,xi}[xi_tlm] · a_in
+                = transpose of the GRADIENT-interpolation, weighted by the
+                  geometry motion (ds, dt) of the xi TLM direction. This is the
+                  ∂/∂field of (∂out/∂xi·xi_tlm) = grad(δfield)·(ds,dt) term.
+
+        In the G2 direction the TLM seed lives on the particle position, so
+        field_2d's own TLM is None and only xi's TLM (the other dependency)
+        drives the cross term.
+        """
+        Vs  = self.field_2d.function_space()
+        h_in = hessian_inputs[0]
+        a_in = adj_inputs[0]
+
+        part1 = self._adj_wrt_field(inputs, hessian_inputs) if h_in is not None else None
+
+        xi_tlm_bv = self.get_dependencies()[0].tlm_value   # xi's TLM (idx 0)
+        if a_in is None or xi_tlm_bv is None:
+            return part1
+
+        with stop_annotating():
+            xyz = self._get_CG2_positions(inputs[0].dat.data_ro)
+            r = np.sqrt(xyz[:, 0]**2 + xyz[:, 1]**2)
+            s_raw = r - self.R + 0.5 * self.W
+            t_raw = xyz[:, 2] + 0.5 * self.H
+            qu = np.column_stack([np.clip(s_raw, 0, self.W),
+                                  np.clip(t_raw, 0, self.H)])
+            s_active = (s_raw > 0) & (s_raw < self.W)
+            t_active = (t_raw > 0) & (t_raw < self.H)
+
+            vom = VertexOnlyMesh(self.mesh2d, qu,
+                                 missing_points_behaviour="error")
+            inv_perm = _compute_inv_perm(vom, qu)
+            perm = np.argsort(inv_perm)
+            if self.field_dim > 1:
+                V_f = VectorFunctionSpace(vom, "DG", 0, dim=self.field_dim)
+            else:
+                V_f = FunctionSpace(vom, "DG", 0)
+
+            # Geometry motion (ds, dt) of the xi TLM direction. ∂s/∂xi vanishes
+            # where the point is clamped, so mask the motion there (matches the
+            # masked grad in the forward TLM / value adjoint).
+            d_pos = self.M @ np.asarray(xi_tlm_bv.dat.data_ro)   # (n_CG2, 3)
+            ds = np.where(s_active, (xyz[:, 0]/r)*d_pos[:, 0]
+                                    + (xyz[:, 1]/r)*d_pos[:, 1], 0.0)
+            dt = np.where(t_active, d_pos[:, 2], 0.0)
+
+            adj_data = np.asarray(a_in.dat.data_ro)
+            if adj_data.ndim == 1:
+                adj_data = adj_data[:, np.newaxis]
+
+            # Weights for the s- and t-derivative interpolation transposes.
+            w_s = adj_data * ds[:, np.newaxis]      # (n_CG2, field_dim)
+            w_t = adj_data * dt[:, np.newaxis]
+
+            cov_s = Cofunction(V_f.dual())
+            cov_s.dat.data[:] = w_s[perm].reshape(np.shape(cov_s.dat.data))
+            cov_t = Cofunction(V_f.dual())
+            cov_t.dat.data[:] = w_t[perm].reshape(np.shape(cov_t.dat.data))
+
+            # Transpose of interpolating ∂field/∂s and ∂field/∂t at the points.
+            cross = assemble(Interpolate(Dx(TestFunction(Vs), 0), cov_s))
+            cross_t = assemble(Interpolate(Dx(TestFunction(Vs), 1), cov_t))
+            cross.dat.data[:] = (np.asarray(cross.dat.data_ro)
+                                 + np.asarray(cross_t.dat.data_ro))
+
+        if part1 is None:
+            return cross
+        part1.dat.data[:] = (np.asarray(part1.dat.data_ro)
+                             + np.asarray(cross.dat.data_ro))
+        return part1
 
 
     def evaluate_tlm_component(self, inputs, tlm_inputs, block_variable, idx, prepared=None):
@@ -320,6 +453,12 @@ class DifferentiableFieldEvalBlock(Block):
         # (1) is just self.evaluate_adj_component called on hessian_inputs.
         # (2) needs the second derivatives of field_2d composed with the
         # cylindrical-unfold map (s, t) <- (x, y, z).
+        #
+        # idx 1 → field_2d's 2nd-order contribution (the xi↔field cross term +
+        # value-transpose of the seed), needed for G2 (∂J_zz/∂T).
+        if idx == 1:
+            return self._hess_wrt_field(inputs, hessian_inputs, adj_inputs)
+
         h_in = hessian_inputs[0]
         a_in = adj_inputs[0]
 
@@ -403,10 +542,77 @@ def vom_transfer(u_vom, V_target, inv_perm, V_vom):
 
 
 def _compute_inv_perm(vom, query_pts):
-    tree = cKDTree(vom.coordinates.dat.data_ro)
-    dist, inv_perm = tree.query(query_pts, workers=-1)
+    """Bijective map  query_pts[i] == vom.coordinates[inv_perm[i]].
+
+    The 3D→2D unfold sends MANY 3D nodes (same cross-section position, different
+    azimuth) onto the SAME 2D query point, so query_pts contains coincident
+    points.  An independent KDTree nearest-neighbour query returns the SAME vom
+    vertex index for several coincident queries → a NON-injective ``inv_perm``.
+    The forward (out[n] = field(qu[n])) hides this (duplicates share a value),
+    but every perm-based ADJOINT (perm=argsort(inv_perm)) scatters the per-node
+    output cotangents WRONG — it fails to SUM the cotangents of all 3D nodes
+    collapsing onto one 2D point.  Verified: the field-value adjoint's transpose
+    identity ⟨y,Ex⟩=⟨E^T y,x⟩ broke by up to ~44% for coherent cotangents and
+    was exactly machine-zero for azimuth-antisymmetric ones — the duplicate-
+    summation signature.  (Forward values and the geometry/idx-0 adjoint are
+    UNCHANGED by the choice of bijection, so the verified F_p(x,z,a) path is
+    untouched; only the broken transposes get corrected.)
+
+    Fix: build a TRUE permutation by lexicographically sorting BOTH point sets
+    with the same key and pairing them positionally.  query_pts and
+    vom.coordinates are the same set (VOM only reorders), so equal points line
+    up; coincident points fall in adjacent slots and are paired bijectively
+    (their interpolated values are identical, so any in-cluster pairing is
+    exact — and the assert below proves each query is matched to a coincident
+    vom vertex).
+    """
+    vc = np.asarray(vom.coordinates.dat.data_ro)
+    qp = np.asarray(query_pts)
+
+    # Sanity: same multiset of points (each query has a coincident vom vertex).
+    tree = cKDTree(vc)
+    dist, _ = tree.query(qp, workers=-1)
     assert np.max(dist) < 1e-10, f"VOM mismatch: max dist {np.max(dist):.2e}"
-    return inv_perm.astype(np.int32)
+
+    q_order = np.lexsort(qp.T)        # ordering of query_pts (last column primary)
+    v_order = np.lexsort(vc.T)        # ordering of vom coords, SAME key
+    inv_perm = np.empty(len(q_order), dtype=np.int32)
+    inv_perm[q_order] = v_order.astype(np.int32)
+
+    # Guarantee the pairing is exact: each output node reads its OWN query point
+    # (so the forward is bit-identical to the old KDTree result, only the adjoint
+    # scatter is now a true transpose).
+    assert np.max(np.abs(vc[inv_perm] - qp)) < 1e-10, "non-bijective inv_perm"
+    return inv_perm
+
+
+def _interp_adjoint(Vs, V_f, adj_vom_data):
+    """Transpose (adjoint) of interpolation ``Vs -> V_f`` applied to a VOM-side
+    cotangent ``adj_vom_data`` (numpy, V_f-shaped, in VOM-internal order).
+    Returns a Cofunction in ``Vs.dual()``.
+
+    Modern Firedrake (the ``Interpolate`` BaseForm era — the ``Interpolator``
+    .interpolate() method was removed): the adjoint interpolation is assembled
+    by passing the target-dual Cofunction as the second argument of
+    ``Interpolate``. Correctness is validated by the inline ∂F_r/∂T Taylor
+    checkpoint — a wrong-but-runnable spelling shows up there as a residual
+    that fails to converge.
+    """
+    cov = Cofunction(V_f.dual())
+    cov.dat.data[:] = adj_vom_data
+
+    # Primary: Interpolate(TestFunction(source), target_dual_cofunction) is the
+    # adjoint of interpolation — assembling it yields a Cofunction in Vs.dual().
+    try:
+        return assemble(Interpolate(TestFunction(Vs), cov))
+    except Exception:
+        pass
+
+    # Fallback: build the forward interpolation 2-form with a TrialFunction
+    # (as the forward-interpolation deprecation hint requests) and take the
+    # adjoint action against the cotangent.
+    two_form = Interpolate(TrialFunction(Vs), V_f)
+    return assemble(action(adjoint(two_form), cov))
 
 
 def apply_wall_bc_on_tape(u_fn, V, wall_tag):
@@ -630,13 +836,13 @@ class background_flow_differentiable:
         u_bar       = w.subfunctions[0]
         p_bar_tilde = w.subfunctions[1]
         G_val       = float(w.subfunctions[2].dat.data_ro[0])
-        U_m_hat     = float(np.max(u_bar.dat.data_ro[:, 2]))
+        U_m     = float(np.max(u_bar.dat.data_ro[:, 2]))
 
         self.u_bar       = u_bar
         self.p_bar_tilde = p_bar_tilde
-        self.U_m_hat     = U_m_hat
+        self.U_m     = U_m
 
-        return G_val, U_m_hat, u_bar, p_bar_tilde
+        return G_val, U_m, u_bar, p_bar_tilde
 
 
 def build_3d_background_flow_differentiable(R, H, W, G_val, mesh3d, tags, u_bar_2d, p_bar_2d, X_ref=None, xi=None):
@@ -710,16 +916,14 @@ def build_3d_background_flow_differentiable(R, H, W, G_val, mesh3d, tags, u_bar_
 
 if __name__ == "__main__":
 
-    R_hat, H_hat, W_hat, a_hat, L_c, U_c, Re = nondimensionalisation(R, H, W, a, Q, rho, mu)
+    bg = background_flow_differentiable(R, H, W, Re)
 
-    bg = background_flow_differentiable(R_hat, H_hat, W_hat, Re)
-
-    mesh3d, tags = make_curved_channel_section_with_spherical_hole(R_hat, H_hat, W_hat, L_hat, a_hat, particle_maxh, global_maxh, x_off=0.0, z_off=0.0)
+    mesh3d, tags = make_curved_channel_section_with_spherical_hole(R, H, W, L, a, particle_maxh, global_maxh, x_off=0.0, z_off=0.0)
 
     from background_flow import background_flow, build_3d_background_flow
 
     # Use ONE shared 2D solution to eliminate source (1)
-    G_hat, U_m_hat, u_bar_2d, p_bar_2d = bg.solve_2D_background_flow()
+    G, U_m, u_bar_2d, p_bar_2d = bg.solve_2D_background_flow()
 
     V_3d = VectorFunctionSpace(mesh3d, "CG", 2)
 
@@ -738,8 +942,8 @@ if __name__ == "__main__":
         coords_func = Function(V_coords).interpolate(SpatialCoordinate(mesh3d))
         xyz = coords_func.dat.data_ro.copy()
         r_3d = np.sqrt(xyz[:, 0]**2 + xyz[:, 1]**2)
-        qu = np.column_stack([np.clip(r_3d - R_hat + 0.5*W_hat, 0, W_hat),
-                              np.clip(xyz[:, 2] + 0.5*H_hat, 0, H_hat)])
+        qu = np.column_stack([np.clip(r_3d - R + 0.5*W, 0, W),
+                              np.clip(xyz[:, 2] + 0.5*H, 0, H)])
 
         mesh2d = u_bar_2d.function_space().mesh()
 
@@ -764,7 +968,7 @@ if __name__ == "__main__":
     # ===================================================================
     # Layer B: Different 2D solutions (background_flow vs background_flow_differentiable)
     # ===================================================================
-    bg_orig = background_flow(R_hat, H_hat, W_hat, Re)
+    bg_orig = background_flow(R, H, W, Re)
     G_orig, _, u_bar_orig_2d, _ = bg_orig.solve_2D_background_flow()
 
     with stop_annotating():

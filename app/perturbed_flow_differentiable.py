@@ -15,10 +15,64 @@ import math
 import numpy as np
 
 from background_flow_differentiable import background_flow_differentiable, build_3d_background_flow_differentiable
-from build_3d_geometry_gmsh import make_curved_channel_section_with_spherical_hole
+from build_3d_geometry_gmsh import (
+    make_curved_channel_section_with_spherical_hole,
+    make_curved_channel_section_with_spherical_hole_symmetric,
+)
 from background_flow import background_flow, build_3d_background_flow
 from perturbed_flow import perturbed_flow
-from config_paper_parameters import *
+from problem_setup import *
+
+# ───────────────────────────────────────────────────────────────────────────
+#  DECOUPLED_LIFT — CHANNEL-decoupled 2D→3D background-flow transfer (cf.
+#  Paganini, Wechsung & Farrell, "Higher-order moving mesh methods for
+#  PDE-constrained shape optimization", §6: decoupled discretizations).
+#
+#  The 3D background flow is obtained by sampling the 2D cross-section flow
+#  u_bar_2d at the 3D nodes' unfolded (s,t) positions via a VertexOnlyMesh
+#  transfer. u_bar_2d is piecewise-linear (CG1) → only W^{1,∞}: its gradient
+#  jumps across element boundaries. Differentiating the transfer w.r.t. the
+#  domain deformation samples this jumping gradient at points that MOVE with
+#  the deformation → the lift is only C^0 (not C^1) in the shape → the
+#  transfer Jacobian is non-Hadamard-differentiable at the scale of element
+#  crossings. This breaks a Taylor-verifiable shape gradient.
+#
+#  The deformation splits as  xi = xi_baseline + xi_particle(r,z,a) + xi_channel(T).
+#  Only xi_channel(T) is the SHAPE control; xi_particle is the (r,z,a) particle
+#  motion the bifurcation solver differentiates. The interior part of
+#  xi_channel is pure mesh-extension bookkeeping (an elastic/H^1 extension of
+#  the boundary wall motion), which u_bar_2d does not physically depend on.
+#
+#  DECOUPLED_LIFT = True  → the u_bar SAMPLING POSITIONS exclude xi_channel:
+#  query points are built from X_ref + xi_baseline + xi_particle (channel-
+#  undeformed, sampled on the REFERENCE cross-section), while the perturbed
+#  Stokes flow still runs on the FULLY deformed 3D mesh. Consequences:
+#    • the sampling map is independent of T → smooth (C^1) in the shape →
+#      objective and shape gradient are Taylor-consistent;
+#    • xi_particle stays IN the sampling → the (r,z,a) Jacobian/Hessian the
+#      Moore-Spence Newton relies on is UNCHANGED in quality;
+#    • at T=0 (xi_channel=0) this is a bit-for-bit NO-OP — the entire
+#      validated bifurcation pipeline is untouched. Only T≠0 shape steps see
+#      the channel-decoupled sampling.
+#
+#  JUSTIFICATION (thesis): the dropped term is the lift's sensitivity to how
+#  the interior channel mesh-extension drags the sampling points across
+#  elements — sub-element, and below the ~20 µm fabrication tolerance of a
+#  120 µm channel. u_bar_2d depends on the channel BOUNDARY shape (kept, via
+#  the deformed BG solve), not on the interior mesh distribution. We sample
+#  along the physical reference cross-section, not the bookkeeping extension.
+#
+#  DECOUPLED_LIFT = False → fully coupled (branch 1, full xi). Kept to measure
+#  the (sub-tolerance) bifurcation-point shift between the two models.
+# ───────────────────────────────────────────────────────────────────────────
+DECOUPLED_LIFT = True    # PRODUCTION (restored 2026-06-08). With False AND
+                         # lift_on_tape unset, eval_forces falls to the
+                         # non-differentiable else-branch (off-tape field-sample
+                         # query points), which DROPS ∂(field-sampling)/∂T from
+                         # the shape adjoint → the xi_channel geometry gradient
+                         # came out sign-flipped/~108% wrong (probe #7 vs #10).
+                         # True routes to the on-tape differentiable lift; no-op
+                         # at T=0 so the bif objective is unchanged.
 
 # ---------------------------------------------------------------------------
 #  Monkey-patch: fix AssembleBlock.evaluate_hessian_component
@@ -1591,7 +1645,7 @@ class XiHatBlock(Block):
             inputs, hessian_inputs, block_variable, idx, prepared)
 
 
-def _solve_ale_basis_hat(mesh3d, V_def, tags, theta_half, particle_center, a_hat_init):
+def _solve_ale_basis(mesh3d, V_def, tags, theta_half, particle_center, a_init):
 
     cx, cy, cz = particle_center
     cos_th = math.cos(theta_half)
@@ -1607,7 +1661,7 @@ def _solve_ale_basis_hat(mesh3d, V_def, tags, theta_half, particle_center, a_hat
         mu_field = Function(DG0, name="mu_ale")
         mu_field.dat.data[:] = v_max / np.maximum(v_arr_cell, 1e-300)
         lam_field = Function(DG0, name="lam_ale")
-        lam_field.dat.data[:] = 0.5 * mu_field.dat.data_ro   # nu ≈ 0.25
+        lam_field.dat.data[:] = 0.5 * mu_field.dat.data_ro   # nu = 1/6 ≈ 0.167
 
         u = TrialFunction(V_def)
         v = TestFunction(V_def)
@@ -1638,7 +1692,7 @@ def _solve_ale_basis_hat(mesh3d, V_def, tags, theta_half, particle_center, a_hat
         # basis_a — radial sphere expansion
         xi_a = Function(V_def, name="xi_basis_a")
         X = SpatialCoordinate(mesh3d)
-        a_const = Constant(a_hat_init)
+        a_const = Constant(a_init)
         bc_a_expr = as_vector([(X[0] - cx) / a_const,
                                (X[1] - cy) / a_const,
                                (X[2] - cz) / a_const])
@@ -1656,7 +1710,7 @@ def _solve_ale_basis_hat(mesh3d, V_def, tags, theta_half, particle_center, a_hat
     return basis_r_data, basis_z_data, basis_a_data
 
 
-def _build_xi_hat(delta_r, delta_z, delta_a, md):
+def _build_xi(delta_r, delta_z, delta_a, md):
 
     xi = Function(md['V_def'], name="xi")
     br = md['basis_r_data']
@@ -1674,18 +1728,28 @@ def _build_xi_hat(delta_r, delta_z, delta_a, md):
     return xi
 
 
-def setup_moving_mesh_hat(r_off_hat_init, z_off_hat_init, a_hat_init, R_hat, H_hat, W_hat, Re, G_hat, U_m_hat,
-                                                        u_bar_2d_hat, p_bar_tilde_2d_hat, particle_maxh_rel, global_maxh_rel,
-                                                        a_mesh_size_res_ref=None):
+def setup_moving_mesh(r_off_init, z_off_init, a_init, R, H, W, Re, G, U_m,
+                                                        u_bar_2d, p_bar_tilde_2d, particle_maxh_rel, global_maxh_rel,
+                                                        a_mesh_size_res_ref=None, symmetric_mesh=False):
 
-    L_hat = 4 * max(H_hat, W_hat)
+    L = 4 * max(H, W)
 
     # Option to ensure, that the resolution of our particle is always the same, even if particle size changes to reduce numerical noise
     if a_mesh_size_res_ref is None:
-        a_mesh_size_res_ref = a_hat_init
+        a_mesh_size_res_ref = a_init
 
-    mesh3d, tags = make_curved_channel_section_with_spherical_hole(R_hat, H_hat, W_hat, L_hat, a_hat_init, particle_maxh_rel * a_mesh_size_res_ref,
-                                                                    global_maxh_rel * min(H_hat, W_hat), r_off_hat_init, z_off_hat_init)
+    # symmetric_mesh=True builds the particle with a mirror-paired surface mesh
+    # about z = z_off_init (hemisphere split + setPeriodic reflection), so the
+    # antisymmetric traction noise in F_z cancels to machine precision. Used by
+    # the z-symmetric pitchfork track (z_off_init = 0), where F_z is identically
+    # zero and any nonzero F_z is pure mesh noise. The returned (mesh3d, tags)
+    # have the same structure as the base builder, so the ALE / AD pipeline
+    # downstream is unchanged.
+    _build_mesh = (make_curved_channel_section_with_spherical_hole_symmetric
+                   if symmetric_mesh else
+                   make_curved_channel_section_with_spherical_hole)
+    mesh3d, tags = _build_mesh(R, H, W, L, a_init, particle_maxh_rel * a_mesh_size_res_ref,
+                               global_maxh_rel * min(H, W), r_off_init, z_off_init)
 
     # Mathematically this is the cartesian product of 3 identical spaces of piecewise (on each tetrahedron) linear functions
     V_def = VectorFunctionSpace(mesh3d, "CG", 1)
@@ -1701,15 +1765,15 @@ def setup_moving_mesh_hat(r_off_hat_init, z_off_hat_init, a_hat_init, R_hat, H_h
 
     ref_signs = check_mesh_quality(mesh3d)
 
-    print(f"Mesh in hat coords: R={R_hat:.2f}, H={H_hat:.2f}, W={W_hat:.2f}, a={a_hat_init:.4f}, L={L_hat:.2f}")
+    print(f"Mesh in hat coords: R={R:.2f}, H={H:.2f}, W={W:.2f}, a={a_init:.4f}, L={L:.2f}")
 
     # Linear-elasticity ALE: pre-solve once for three basis displacement
     # fields (one per control: dr, dz, da). Cell-volume-weighted stiffness
     # keeps small cells near the particle nearly rigid; the bulk absorbs
     # the deformation. At run time xi is a linear combination of these
     # fields, evaluated cheaply per evaluate_forces call.
-    basis_r_data, basis_z_data, basis_a_data = _solve_ale_basis_hat(
-        mesh3d, V_def, tags, theta_half, particle_center, a_hat_init)
+    basis_r_data, basis_z_data, basis_a_data = _solve_ale_basis(
+        mesh3d, V_def, tags, theta_half, particle_center, a_init)
 
     # Static channel-wall deformation (T_2d lifted to 3D). Default zero;
     # owners that perform shape optimization update this in-place to keep
@@ -1728,11 +1792,11 @@ def setup_moving_mesh_hat(r_off_hat_init, z_off_hat_init, a_hat_init, R_hat, H_h
         'basis_r_data': basis_r_data,
         'basis_z_data': basis_z_data,
         'basis_a_data': basis_a_data,
-        'R_hat': R_hat, 'H_hat': H_hat, 'W_hat': W_hat,
-        'L_hat': L_hat, 'a_hat_init': a_hat_init,
-        'G_hat': G_hat, 'Re': Re, 'U_m_hat': U_m_hat,
-        'u_bar_2d_hat': u_bar_2d_hat,
-        'p_bar_tilde_2d_hat': p_bar_tilde_2d_hat,
+        'R': R, 'H': H, 'W': W,
+        'L': L, 'a_init': a_init,
+        'G': G, 'Re': Re, 'U_m': U_m,
+        'u_bar_2d': u_bar_2d,
+        'p_bar_tilde_2d': p_bar_tilde_2d,
         'ref_signs': ref_signs,
         'xi_channel':  xi_channel,
         'xi_baseline': xi_baseline,
@@ -1792,13 +1856,13 @@ def reset_ale_basis_for_step(md, dr_absorb, dz_absorb, da_absorb):
         # ['particle_center'] unchanged. ``new_center`` below is used
         # *only* as the BC parameter for basis_a in the re-solve.
         #
-        # ── a_hat_init (DO update md['a_hat_init']) ──
-        # The form computes a_val = md['a_hat_init'] + delta_a, used as
+        # ── a_init (DO update md['a_init']) ──
+        # The form computes a_val = md['a_init'] + delta_a, used as
         # the particle radius in the centrifugal force F_cent ∝ a_val³.
-        # Pre-snap delta_a = drift_da, a_val = a_hat_init_orig + drift_da
+        # Pre-snap delta_a = drift_da, a_val = a_init_orig + drift_da
         # = a_bif. Post-snap delta_a = 0 (we absorbed drift). To keep
         # a_val = a_bif across the snap (and hence F_cent unchanged),
-        # we must set md['a_hat_init'] += drift_da. Without this update,
+        # we must set md['a_init'] += drift_da. Without this update,
         # a_val jumps by O(drift_da) at the snap boundary and |F| at
         # the bif becomes O(drift_da · 3·a²) ≈ a few × 10⁻⁷.
         cos_th = math.cos(md['tags']['theta'] / 2.0)
@@ -1809,14 +1873,14 @@ def reset_ale_basis_for_step(md, dr_absorb, dz_absorb, da_absorb):
             cy + sin_th * dr_absorb,
             cz + dz_absorb,
         )
-        new_a_init = float(md['a_hat_init']) + float(da_absorb)
-        md['a_hat_init'] = new_a_init    # ← critical: keep form's a_val invariant
+        new_a_init = float(md['a_init']) + float(da_absorb)
+        md['a_init'] = new_a_init    # ← critical: keep form's a_val invariant
 
         # 4. Re-solve ALE basis at the new rest state. basis_a's BC uses
         # new_center / new_a_init for clean radial expansion of the
         # current surface.
         theta_half = md['tags']['theta'] / 2.0
-        basis_r, basis_z, basis_a = _solve_ale_basis_hat(
+        basis_r, basis_z, basis_a = _solve_ale_basis(
             mesh3d, md['V_def'], md['tags'], theta_half,
             new_center, new_a_init,
         )
@@ -1825,7 +1889,8 @@ def reset_ale_basis_for_step(md, dr_absorb, dz_absorb, da_absorb):
         md['basis_a_data'] = basis_a
 
 
-def evaluate_forces(delta_r_hat, delta_z_hat, delta_a_hat, mesh_data, *, jacobian=True, hessian_phi=None):
+def evaluate_forces(delta_r, delta_z, delta_a, mesh_data, *, jacobian=True, hessian_phi=None,
+                    return_components=False):
 
     set_working_tape(Tape())
     continue_annotation()
@@ -1834,11 +1899,11 @@ def evaluate_forces(delta_r_hat, delta_z_hat, delta_a_hat, mesh_data, *, jacobia
     mesh3d = md['mesh3d']
     R_space = FunctionSpace(mesh3d, "R", 0)
 
-    delta_r = Function(R_space, name="delta_r").assign(delta_r_hat)
-    delta_z = Function(R_space, name="delta_z").assign(delta_z_hat)
-    delta_a = Function(R_space, name="delta_a").assign(delta_a_hat)
+    delta_r = Function(R_space, name="delta_r").assign(delta_r)
+    delta_z = Function(R_space, name="delta_z").assign(delta_z)
+    delta_a = Function(R_space, name="delta_a").assign(delta_a)
 
-    xi_particle = _build_xi_hat(delta_r, delta_z, delta_a, md)
+    xi_particle = _build_xi(delta_r, delta_z, delta_a, md)
     # Total mesh deformation = absorbed-baseline (past accepted particle
     # motions, snap-and-reset) + current linear-ALE particle motion +
     # cumulative T_2d channel deformation. xi_baseline and xi_channel are
@@ -1848,16 +1913,41 @@ def evaluate_forces(delta_r_hat, delta_z_hat, delta_a_hat, mesh_data, *, jacobia
     mesh3d.coordinates.assign(md['X_ref'] + xi)
     check_mesh_quality(mesh3d, ref_signs=md['ref_signs'])
 
-    u_bar_3d, p_bar_3d, u_cyl_3d = build_3d_background_flow_differentiable(
-        md['R_hat'], md['H_hat'], md['W_hat'], md['G_hat'],
-        mesh3d, md['tags'], md['u_bar_2d_hat'], md['p_bar_tilde_2d_hat'],
-        X_ref=md['X_ref'], xi=xi)
+    # DECOUPLED_LIFT (see module header): sample u_bar_2d at the CHANNEL-
+    # undeformed positions (xi_lift excludes md['xi_channel']) so the lift is
+    # smooth in the shape T, while xi_particle stays in → the (r,z,a) Jacobian
+    # is unchanged. The perturbed flow above already runs on the fully
+    # deformed mesh3d. At T=0 (xi_channel=0) xi_lift == xi → exact no-op.
+    # The caller must leave mesh2d at the REFERENCE cross-section so these
+    # channel-undeformed query points locate correctly (u_bar_2d's deformed-
+    # solution dofs are read material-frame).
+    if DECOUPLED_LIFT:
+        xi_lift = Function(md['V_def'], name="xi_lift")
+        xi_lift.assign(md['xi_baseline'] + xi_particle)        # exclude xi_channel
+        u_bar_3d, p_bar_3d, u_cyl_3d = build_3d_background_flow_differentiable(
+            md['R'], md['H'], md['W'], md['G'],
+            mesh3d, md['tags'], md['u_bar_2d'], md['p_bar_tilde_2d'],
+            X_ref=md['X_ref'], xi=xi_lift)
+    else:
+        u_bar_3d, p_bar_3d, u_cyl_3d = build_3d_background_flow_differentiable(
+            md['R'], md['H'], md['W'], md['G'],
+            mesh3d, md['tags'], md['u_bar_2d'], md['p_bar_tilde_2d'],
+            X_ref=md['X_ref'], xi=xi)
 
     pf = perturbed_flow_differentiable(
-        md['R_hat'], md['H_hat'], md['W_hat'], md['L_hat'],
-        (md['a_hat_init'], delta_a), md['Re'],
+        md['R'], md['H'], md['W'], md['L'],
+        (md['a_init'], delta_a), md['Re'],
         mesh3d, md['tags'], u_bar_3d, p_bar_3d,
         md['X_ref'], xi, u_cyl_3d)
+
+    if return_components:
+        F_p_x, F_p_z, _comps = pf.F_p(return_components=True)
+        comps = {k: float(v) for k, v in _comps.items()}
+        F = np.array([float(F_p_x), float(F_p_z)])
+        stop_annotating()
+        get_working_tape().clear_tape()
+        gc.collect()
+        return F, comps
 
     F_p_x, F_p_z = pf.F_p()
     F = np.array([float(F_p_x), float(F_p_z)])
@@ -1913,41 +2003,41 @@ def evaluate_forces(delta_r_hat, delta_z_hat, delta_a_hat, mesh_data, *, jacobia
 
 
 if __name__ == "__main__":
-
+    L = 8
     test_points = [
         (0.61282900, 0.04137774, 0.13606788),
         (0.55,       0.00,       0.12),
         (0.65,       0.05,       0.10),
     ]
 
-    bg_diff = background_flow_differentiable(R_hat, H_hat, W_hat, Re)
-    G_hat, U_m_hat, u_bar_2d, p_bar_2d = bg_diff.solve_2D_background_flow()
+    bg_diff = background_flow_differentiable(R, H, W, Re)
+    G, U_m, u_bar_2d, p_bar_2d = bg_diff.solve_2D_background_flow()
 
-    bg_orig = background_flow(R_hat, H_hat, W_hat, Re)
+    bg_orig = background_flow(R, H, W, Re)
     G_orig, U_m_orig, u_bar_orig, p_bar_orig = bg_orig.solve_2D_background_flow()
 
     print("Cross-comparison original vs differentiable at multiple points")
 
-    for i, (r_off_i, z_off_i, a_hat_i) in enumerate(test_points):
-        print(f"\n--- Point {i}: r_off={r_off_i}, z_off={z_off_i}, a={a_hat_i} ---")
+    for i, (r_off_i, z_off_i, a_i) in enumerate(test_points):
+        print(f"\n--- Point {i}: r_off={r_off_i}, z_off={z_off_i}, a={a_i} ---")
 
         # Original (must be off-tape: PointEvaluator crashes under annotation)
         with stop_annotating():
             mesh3d_i, tags_i = make_curved_channel_section_with_spherical_hole(
-                R_hat, H_hat, W_hat, L_hat, a_hat_i,
-                particle_maxh_rel * a_hat_i, global_maxh_rel * min(H_hat, W_hat),
+                R, H, W, L, a_i,
+                particle_maxh_rel * a_i, global_maxh_rel * min(H, W),
                 r_off_i, z_off_i)
 
             u_bar_3d_i, p_bar_3d_i = build_3d_background_flow(
-                R_hat, H_hat, W_hat, G_orig, mesh3d_i, tags_i, u_bar_orig, p_bar_orig)
+                R, H, W, G_orig, mesh3d_i, tags_i, u_bar_orig, p_bar_orig)
 
-            pf_i = perturbed_flow(R_hat, H_hat, W_hat, L_hat, a_hat_i, Re,
+            pf_i = perturbed_flow(R, H, W, L, a_i, Re,
                                   mesh3d_i, tags_i, u_bar_3d_i, p_bar_3d_i)
             Fx_orig, Fz_orig = pf_i.F_p()
 
         with stop_annotating():
-            md_i = setup_moving_mesh_hat(
-                r_off_i, z_off_i, a_hat_i, R_hat, H_hat, W_hat, Re, G_hat, U_m_hat,
+            md_i = setup_moving_mesh(
+                r_off_i, z_off_i, a_i, R, H, W, Re, G, U_m,
                 u_bar_2d, p_bar_2d, particle_maxh_rel, global_maxh_rel)
 
         F_diff_i = evaluate_forces(0.0, 0.0, 0.0, md_i, jacobian=False)
@@ -1963,11 +2053,11 @@ if __name__ == "__main__":
 
     print("PART 3: Taylor tests (AD gradient verification)")
 
-    r_off_t, z_off_t, a_hat_t = test_points[0]
+    r_off_t, z_off_t, a_t = test_points[0]
 
     with stop_annotating():
-        md_t = setup_moving_mesh_hat(
-            r_off_t, z_off_t, a_hat_t, R_hat, H_hat, W_hat, Re, G_hat, U_m_hat,
+        md_t = setup_moving_mesh(
+            r_off_t, z_off_t, a_t, R, H, W, Re, G, U_m,
             u_bar_2d, p_bar_2d, particle_maxh_rel, global_maxh_rel)
 
     perturbation_labels = ["delta_r", "delta_z", "delta_a"]
@@ -1986,18 +2076,18 @@ if __name__ == "__main__":
             delta_z = Function(R_space, name="delta_z").assign(0.0)
             delta_a = Function(R_space, name="delta_a").assign(0.0)
 
-            xi = _build_xi_hat(delta_r, delta_z, delta_a, md_t)
+            xi = _build_xi(delta_r, delta_z, delta_a, md_t)
             mesh3d_t.coordinates.assign(md_t['X_ref'] + xi)
             check_mesh_quality(mesh3d_t, ref_signs=md_t['ref_signs'])
 
             u_bar_3d_t, p_bar_3d_t, u_cyl_3d_t = build_3d_background_flow_differentiable(
-                md_t['R_hat'], md_t['H_hat'], md_t['W_hat'], md_t['G_hat'],
-                mesh3d_t, md_t['tags'], md_t['u_bar_2d_hat'], md_t['p_bar_tilde_2d_hat'],
+                md_t['R'], md_t['H'], md_t['W'], md_t['G'],
+                mesh3d_t, md_t['tags'], md_t['u_bar_2d'], md_t['p_bar_tilde_2d'],
                 X_ref=md_t['X_ref'], xi=xi)
 
             pf_t = perturbed_flow_differentiable(
-                md_t['R_hat'], md_t['H_hat'], md_t['W_hat'], md_t['L_hat'],
-                (md_t['a_hat_init'], delta_a), md_t['Re'],
+                md_t['R'], md_t['H'], md_t['W'], md_t['L'],
+                (md_t['a_init'], delta_a), md_t['Re'],
                 mesh3d_t, md_t['tags'], u_bar_3d_t, p_bar_3d_t,
                 md_t['X_ref'], xi, u_cyl_3d_t)
 

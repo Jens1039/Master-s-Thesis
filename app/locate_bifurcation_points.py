@@ -5,10 +5,15 @@ from firedrake import *
 import gc
 import numpy as np
 
-from nondimensionalization import nondimensionalisation
 from background_flow_differentiable import background_flow_differentiable
-from perturbed_flow_differentiable import MeshFlippedError, check_mesh_quality, setup_moving_mesh_hat, evaluate_forces, estimate_eigenvectors, _build_xi_hat
-from config_paper_parameters import R, H, W, a, Q, rho, mu, particle_maxh_rel, global_maxh_rel
+from perturbed_flow_differentiable import MeshFlippedError, check_mesh_quality, setup_moving_mesh, evaluate_forces, estimate_eigenvectors, _build_xi
+from problem_setup import R, H, W, a, L_c, U_c, Re, particle_maxh_rel, global_maxh_rel
+
+
+# Pre-refine the equilibrium with a 2-variable Newton on F(r,z)=0 before
+# starting Moore-Spence. Off → MS gets the raw initial guess and has to
+# resolve (r,z) and (a, φ) jointly.
+USE_NEWTON_REFINEMENT = False
 
 
 def _log_mesh_quality(md, label, cycle, *, dr=None, dz=None, da=None):
@@ -26,7 +31,7 @@ def _log_mesh_quality(md, label, cycle, *, dr=None, dz=None, da=None):
     X_ref = np.asarray(md['X_ref'].dat.data_ro)
     xi = coords - X_ref
     xi_mag = np.linalg.norm(xi, axis=1)
-    a_hat = md['a_hat_init']
+    a = md['a_init']
 
     # Oriented detJ
     DG0 = FunctionSpace(mesh3d, "DG", 0)
@@ -70,9 +75,9 @@ def _log_mesh_quality(md, label, cycle, *, dr=None, dz=None, da=None):
     if dr is not None or dz is not None or da is not None:
         print(f"    accumulated:     dr={dr if dr is not None else 0.0:+.6e}  "
               f"dz={dz if dz is not None else 0.0:+.6e}  "
-              f"da={da if da is not None else 0.0:+.6e}   (a_ref={a_hat:.6f})")
+              f"da={da if da is not None else 0.0:+.6e}   (a_ref={a:.6f})")
     print(f"    |xi| (node):     max={xi_mag.max():.4e}  p99={np.percentile(xi_mag, 99):.4e}"
-          f"  median={np.median(xi_mag):.4e}   (relative to a_ref: max={xi_mag.max()/a_hat:.3e})")
+          f"  median={np.median(xi_mag):.4e}   (relative to a_ref: max={xi_mag.max()/a:.3e})")
     print(f"    detJ_oriented:   min={detJ_oriented.min():+.3e}  median={np.median(detJ_oriented):+.3e}  max={detJ_oriented.max():+.3e}")
     print(f"    edge ratio:      median={np.median(edge_ratio):.3f}  p90={np.percentile(edge_ratio, 90):.3f}"
           f"  p99={np.percentile(edge_ratio, 99):.3f}  max={edge_ratio.max():.3f}   (regular tet = 1)")
@@ -83,16 +88,16 @@ def _log_mesh_quality(md, label, cycle, *, dr=None, dz=None, da=None):
           f"  p99={np.percentile(dihedrals_deg.max(axis=1), 99):.3f}  max={dihedrals_deg.max():.3f}")
 
 
-def newton_root_refine(r_off_hat_init, z_off_hat_init, a_hat, shared_data, *,
+def newton_root_refine(r_off_init, z_off_init, a, shared_data, *,
                        tol=1e-9, max_iter=10):
 
     print("\n" + "=" * 65)
-    print(f"  Newton Root Refinement (a_hat = {a_hat:.6f})")
+    print(f"  Newton Root Refinement (a = {a:.6f})")
     print("=" * 65)
 
-    R_hat, H_hat, W_hat, L_c, U_c, Re, G_hat, U_m_hat, u_2d, p_2d = shared_data
+    R, H, W, L_c, U_c, Re, G, U_m, u_2d, p_2d = shared_data
 
-    md = setup_moving_mesh_hat(r_off_hat_init, z_off_hat_init, a_hat, R_hat, H_hat, W_hat, Re, G_hat, U_m_hat, u_2d, p_2d,
+    md = setup_moving_mesh(r_off_init, z_off_init, a, R, H, W, Re, G, U_m, u_2d, p_2d,
                                particle_maxh_rel, global_maxh_rel)
 
     dr, dz = 0.0, 0.0
@@ -110,8 +115,8 @@ def newton_root_refine(r_off_hat_init, z_off_hat_init, a_hat, shared_data, *,
         J = J_full[:, :2]
 
         res = np.linalg.norm(F)
-        r_cur = r_off_hat_init + dr
-        z_cur = z_off_hat_init + dz
+        r_cur = r_off_init + dr
+        z_cur = z_off_init + dz
 
         print(f"  Iter {k:2d} | r = {r_cur:+.8f}  z = {z_cur:+.8f} | |F| = {res:.4e}  cond(J) = {np.linalg.cond(J):.2e}")
 
@@ -152,9 +157,9 @@ def newton_root_refine(r_off_hat_init, z_off_hat_init, a_hat, shared_data, *,
 
         gc.collect()
 
-    r_cur = r_off_hat_init + dr
-    z_cur = z_off_hat_init + dz
-    print(f"  WARNING: Newton refinement did not converge at a_hat = {a_hat} "
+    r_cur = r_off_init + dr
+    z_cur = z_off_init + dz
+    print(f"  WARNING: Newton refinement did not converge at a = {a} "
           f"after {max_iter} iterations (|F| = {res:.4e}). Continuing anyway.")
     return r_cur, z_cur, md, dr, dz
 
@@ -162,40 +167,44 @@ def newton_root_refine(r_off_hat_init, z_off_hat_init, a_hat, shared_data, *,
 def _ms_trial(dr_init, dz_init, da_init, phi_start, l_vec, md, r_ref, z_ref, a_ref, L_c, tol, max_iter):
     """Single Moore-Spence trial with a given starting phi.
 
-    Uses trust-region with backtracking (shrink Delta on reject).
-    Returns (r, z, a, phi, converged, final_|G|, final_|F|).
+    Globalization: Powell dogleg trust region on the Gauss-Newton model
+    (see ``_globalize_tr``).
+    Returns (r, z, a, phi, converged, final_|M|, final_|F|, stalled_at_floor).
     """
 
     dr, dz, da = float(dr_init), float(dz_init), float(da_init)
     phi = phi_start.copy()
-    Delta, Delta_max = 1e-2, 1.0
+    Delta, Delta_max = 1e-1, 1.0
     eta_accept, eta_good = 0.1, 0.75
     res = float('inf')
-    res_F = float('inf')   # final |F| = |G1| — used as a noise-floor diagnostic
+    res_F = float('inf')   # final |F| = |M1| — used as a noise-floor diagnostic
 
-    # Stall-detector state: ring buffer of |G| values *after* each accepted
-    # iteration. We bail out when the residual stops shrinking in earnest
-    # — typically a sign that we have hit the FE discretisation noise floor
-    # of J·phi (≈ noise(F)/h) and Newton has nothing left to drive toward.
-    stall_window = 4          # # of accepted iters to look back over
+    # Stall-detector state: ring buffer of |M| values.
+    # Counts BOTH accepted and rejected iters: at the noise floor the
+    # function is flat in (dr,dz,da,phi), so the TR keeps rejecting at the
+    # same |M| — the state never advances and an accepted-only stall
+    # detector misses this completely. Including rejected iters lets us
+    # bail after ``stall_window`` Newton iters of no progress instead of
+    # letting MS waste max_iter × 20 TR-attempts at the floor.
+    stall_window = 4          # # of iters to look back over
     stall_ratio  = 0.95       # require min(window)/max(window) ≤ stall_ratio
     res_history = []
     prev_res    = None        # for per-iter reduction-ratio diagnostic
 
     for k in range(max_iter):
 
-        # All entries of DG via AD: 1 forward + 2 reverse + 2 H·v
+        # All entries of DM via AD: 1 forward + 2 reverse + 2 H·v
         F_base, J_full, dJphi_dx = evaluate_forces(
             dr, dz, da, md, hessian_phi=phi)
         J_sp = J_full[:, :2]
         dF_da = J_full[:, 2]
 
-        G1 = F_base
-        G2 = J_sp @ phi
-        G3_val = np.dot(l_vec, phi) - 1.0
-        G = np.concatenate([G1, G2, [G3_val]])
-        res = np.linalg.norm(G)
-        res_F = float(np.linalg.norm(G1))
+        M1 = F_base
+        M2 = J_sp @ phi
+        M3_val = np.dot(l_vec, phi) - 1.0
+        M = np.concatenate([M1, M2, [M3_val]])
+        res = np.linalg.norm(M)
+        res_F = float(np.linalg.norm(M1))
 
         eigs = np.linalg.eigvals(J_sp)
         eigenvalue = eigs[np.argmin(np.abs(eigs))]
@@ -210,47 +219,48 @@ def _ms_trial(dr_init, dz_init, da_init, phi_start, l_vec, md, r_ref, z_ref, a_r
         prev_res = res
 
         print(f"\n  Iter {k:2d} | r = {r_cur:+.8f}  z = {z_cur:+.8f}  a = {a_cur:.8f}")
-        print(f"         | |G| = {res:.4e}  |F| = {np.linalg.norm(G1):.4e}"
-              f"  |J*phi| = {np.linalg.norm(G2):.4e}"
+        print(f"         | |M| = {res:.4e}  |F| = {np.linalg.norm(M1):.4e}"
+              f"  |J*phi| = {np.linalg.norm(M2):.4e}"
               f"  eigenvalue = {eigenvalue:+.4e}"
               f"{ratio_str}")
 
         if res < tol:
             a_phys = a_cur * L_c
-            print(f"\n  -> Bifurcation point found after {k} iterations (|G| < tol={tol:.1e}).")
-            print(f"     r_off_hat = {r_cur:.10f}")
-            print(f"     z_off_hat = {z_cur:.10f}")
-            print(f"     a_hat     = {a_cur:.10f}  (a = {a_phys * 1e6:.4f} um)")
+            print(f"\n  -> Bifurcation point found after {k} iterations (|M| < tol={tol:.1e}).")
+            print(f"     r_off = {r_cur:.10f}")
+            print(f"     z_off = {z_cur:.10f}")
+            print(f"     a     = {a_cur:.10f}  (a = {a_phys * 1e6:.4f} um)")
             print(f"     phi       = ({phi[0]:.8f}, {phi[1]:.8f})")
             print(f"     eigenvalue = {eigenvalue:+.6e}")
-            return r_cur, z_cur, a_cur, phi, True, res, res_F
+            return r_cur, z_cur, a_cur, phi, True, res, res_F, False
 
-        # Assemble DG (5x5) — every block from AD
-        DG = np.zeros((5, 5))
-        DG[0:2, 0:2] = J_sp                # dG1/d(r,z)
-        DG[0:2, 2]   = dF_da               # dG1/da
-        DG[2:4, 0]   = dJphi_dx[:, 0]      # d(J·phi)/dr  via H·phi
-        DG[2:4, 1]   = dJphi_dx[:, 1]      # d(J·phi)/dz  via H·phi
-        DG[2:4, 2]   = dJphi_dx[:, 2]      # d(J·phi)/da  via H·phi
-        DG[2:4, 3:5] = J_sp                # dG2/dphi
-        DG[4, 3:5]   = l_vec               # dG3/dphi
+        # Assemble DM (5x5) — every block from AD
+        DM = np.zeros((5, 5))
+        DM[0:2, 0:2] = J_sp                # dM1/d(r,z)
+        DM[0:2, 2]   = dF_da               # dM1/da
+        DM[2:4, 0]   = dJphi_dx[:, 0]      # d(J·phi)/dr  via H·phi
+        DM[2:4, 1]   = dJphi_dx[:, 1]      # d(J·phi)/dz  via H·phi
+        DM[2:4, 2]   = dJphi_dx[:, 2]      # d(J·phi)/da  via H·phi
+        DM[2:4, 3:5] = J_sp                # dM2/dphi
+        DM[4, 3:5]   = l_vec               # dM3/dphi
 
-        cond_DG = np.linalg.cond(DG)
-        print(f"         | cond(DG) = {cond_DG:.2e}")
+        cond_DM = np.linalg.cond(DM)
+        print(f"         | cond(DM) = {cond_DM:.2e}")
 
-        if cond_DG > 1e14:
-            print("  !! DG ill-conditioned — aborting.")
-            return r_cur, z_cur, a_cur, phi, False, res, res_F
+        if cond_DM > 1e14:
+            print("  !! DM ill-conditioned — aborting.")
+            return r_cur, z_cur, a_cur, phi, False, res, res_F, False
 
         try:
-            dy = np.linalg.solve(DG, -G)
+            p_N = np.linalg.solve(DM, -M)
         except np.linalg.LinAlgError:
-            print("  !! DG singular — aborting.")
-            return r_cur, z_cur, a_cur, phi, False, res, res_F
+            print("  !! DM singular — aborting.")
+            return r_cur, z_cur, a_cur, phi, False, res, res_F, False
 
-        print(f"         | step: dr={dy[0]:+.4e}  dz={dy[1]:+.4e}  da={dy[2]:+.4e}")
+        print(f"         | Newton step: dr={p_N[0]:+.4e}  dz={p_N[1]:+.4e}  da={p_N[2]:+.4e}"
+              f"  |p_N|={np.linalg.norm(p_N):.4e}")
 
-        # ── Helper: evaluate |G| at a candidate step (cheap: only F and J) ──
+        # ── Helper: evaluate |M| at a candidate step (cheap: only F and J) ──
 
         def _eval_step(dy_candidate):
             dr_t = dr + dy_candidate[0]
@@ -261,20 +271,14 @@ def _ms_trial(dr_init, dz_init, da_init, phi_start, l_vec, md, r_ref, z_ref, a_r
                 return float('nan'), False
             try:
                 F_t, J_t = evaluate_forces(dr_t, dz_t, da_t, md)
-                G_t = np.concatenate([F_t, J_t[:, :2] @ phi_t,
+                M_t = np.concatenate([F_t, J_t[:, :2] @ phi_t,
                                       [np.dot(l_vec, phi_t) - 1.0]])
-                return float(np.linalg.norm(G_t)), True
+                return float(np.linalg.norm(M_t)), True
             except MeshFlippedError:
                 return float('nan'), False
 
-        def _compute_rho(dy_try, res_try, step_ok):
-            G_pred = G + DG @ dy_try
-            pred = res**2 - np.linalg.norm(G_pred)**2
-            if step_ok and abs(pred) > 1e-30:
-                return (res**2 - res_try**2) / pred
-            return -1.0 if not step_ok else (1.0 if res_try <= res else -1.0)
-
-        accepted, dy_try, rho, Delta = _globalize_tr(dy, Delta, eta_accept, eta_good, Delta_max, _eval_step, _compute_rho)
+        accepted, dy_try, rho, Delta = _globalize_tr(
+            M, DM, p_N, Delta, eta_accept, eta_good, Delta_max, _eval_step)
 
         if accepted:
             dr += dy_try[0]
@@ -283,79 +287,131 @@ def _ms_trial(dr_init, dz_init, da_init, phi_start, l_vec, md, r_ref, z_ref, a_r
             phi_new = phi + dy_try[3:5]
             phi = phi_new / np.dot(l_vec, phi_new)
             print(f"         | step ACCEPTED")
-
-            # Stall check: |G| (= res) is from BEFORE the accepted step;
-            # we use it because evaluate_forces at the new (dr,dz,da) is
-            # only re-run at the start of the next iteration. A flat res
-            # over several accepted steps means the FE residual noise
-            # floor has been reached — Newton can't drive it lower.
-            res_history.append(res)
-            if len(res_history) >= stall_window:
-                window = res_history[-stall_window:]
-                rel_spread = min(window) / max(window) if max(window) > 0 else 1.0
-                if rel_spread > stall_ratio:
-                    print(f"         | STALL: |G| spread "
-                          f"{min(window):.3e}..{max(window):.3e} "
-                          f"(ratio {rel_spread:.3f} > {stall_ratio}) "
-                          f"over last {stall_window} accepted iters — "
-                          f"bailing out (likely FE noise floor).")
-                    r_cur, z_cur, a_cur = r_ref + dr, z_ref + dz, a_ref + da
-                    return r_cur, z_cur, a_cur, phi, False, res, res_F
         else:
             print(f"         | step REJECTED")
+
+        # Stall check (FE noise floor on |M|). Counts BOTH accepted and
+        # rejected iters — see the comment at the top of this function:
+        # at the noise floor the function is flat and TR-BT rejects
+        # forever at the same |M|, so an accepted-only detector misses it.
+        res_history.append(res)
+        if len(res_history) >= stall_window:
+            window = res_history[-stall_window:]
+            rel_spread = min(window) / max(window) if max(window) > 0 else 1.0
+            if rel_spread > stall_ratio:
+                print(f"         | STALL: |M| spread "
+                      f"{min(window):.3e}..{max(window):.3e} "
+                      f"(ratio {rel_spread:.3f} > {stall_ratio}) "
+                      f"over last {stall_window} iters — "
+                      f"bailing out (likely FE noise floor).")
+                r_cur, z_cur, a_cur = r_ref + dr, z_ref + dz, a_ref + da
+                return r_cur, z_cur, a_cur, phi, False, res, res_F, True
 
         gc.collect()
 
     r_cur, z_cur, a_cur = r_ref + dr, z_ref + dz, a_ref + da
-    return r_cur, z_cur, a_cur, phi, False, res, res_F
+    return r_cur, z_cur, a_cur, phi, False, res, res_F, False
 
 
-def _globalize_tr(dy, Delta, eta_accept, eta_good, Delta_max, _eval_step, _compute_rho):
-    """Trust-region with backtracking: shrink Delta until step is accepted.
+def _globalize_tr(M, DM, p_N, Delta, eta_accept, eta_good, Delta_max, _eval_step):
+    """Powell dogleg trust-region on the Gauss-Newton model.
 
-    The Newton direction dy is computed once (expensive).  The inner loop
-    only clips and re-evaluates (cheap: only F and J per attempt).
+    Subproblem at each iter:   min_p  m(p) := ½‖M + DM·p‖²    s.t.  ‖p‖ ≤ Δ.
+
+    The dogleg path goes from the origin to the Cauchy point p_C
+    (unconstrained minimizer of m along the steepest-descent direction)
+    and then on to the full Newton step p_N. The dogleg point is the
+    unique intersection of this piecewise-linear path with the TR boundary;
+    if p_N lies inside the TR we take it, if even p_C lies outside we clip
+    along -g. Unlike plain backtracking along p_N, the *direction* changes
+    with Δ — that is what makes this a real TR method.
+
     Returns (accepted, dy_try, rho, Delta_updated).
     """
 
+    g    = DM.T @ M                       # ∇m(0) = DM^T M
+    g_sq = float(g @ g)
+    DM_g = DM @ g
+    gBg  = float(DM_g @ DM_g)             # g^T (DM^T DM) g
+
+    norm_pN = float(np.linalg.norm(p_N))
+
+    if gBg > 0.0 and g_sq > 0.0:
+        tau_C   = g_sq / gBg              # arg min_{τ>0} m(-τ g)
+        p_C     = -tau_C * g
+        norm_pC = float(np.linalg.norm(p_C))
+    else:
+        # Pathological: g ∈ ker(DM) or g = 0. Fall through to the
+        # Cauchy-clipped branch (gradient-on-boundary) every attempt.
+        p_C     = None
+        norm_pC = float('inf')
+
+    f0 = float(M @ M)                     # ‖M‖² — used in both pred and ared
+
     for attempt in range(20):
-        step_norm_phys = np.linalg.norm(dy[:3])
-        at_boundary = step_norm_phys > Delta
-        if at_boundary:
-            dy_try = dy * (Delta / step_norm_phys)
+        if norm_pN <= Delta:
+            dy_try, on_boundary, tag = p_N, False, "Newton"
+        elif norm_pC >= Delta:
+            # Even the unconstrained Cauchy point is outside TR — go to
+            # the boundary along -g (steepest descent on the model).
+            if g_sq > 0.0:
+                dy_try = -(Delta / np.sqrt(g_sq)) * g
+            else:
+                dy_try = np.zeros_like(M)
+            on_boundary = True
+            tag         = "Cauchy-clipped"
         else:
-            dy_try = dy.copy()
+            # Dogleg segment p(τ) = p_C + τ·(p_N - p_C), τ ∈ [0, 1].
+            # Solve ‖p(τ)‖² = Δ² for the positive root.
+            d    = p_N - p_C
+            a_q  = float(d @ d)
+            b_q  = 2.0 * float(p_C @ d)
+            c_q  = float(p_C @ p_C) - Delta * Delta
+            disc = b_q * b_q - 4.0 * a_q * c_q
+            tau  = (-b_q + np.sqrt(max(disc, 0.0))) / (2.0 * a_q)
+            tau  = float(np.clip(tau, 0.0, 1.0))
+            dy_try      = p_C + tau * d
+            on_boundary = True
+            tag         = f"dogleg τ={tau:.3f}"
 
         res_try, step_ok = _eval_step(dy_try)
-        rho = _compute_rho(dy_try, res_try, step_ok)
 
-        print(f"         | TR-BT attempt {attempt}: |G_try|={res_try if step_ok else float('nan'):.4e}"
-              f"  rho={rho:+.4f}  Delta={Delta:.4e}")
+        # Reduction ratio: pred from the GN model, ared from the real |M|.
+        Mp_pred = M + DM @ dy_try
+        pred    = f0 - float(Mp_pred @ Mp_pred)
+        if step_ok and pred > 1e-30:
+            rho = (f0 - res_try * res_try) / pred
+        else:
+            rho = -1.0
+
+        print(f"         | TR-DL attempt {attempt} [{tag}]: "
+              f"|M_try|={(res_try if step_ok else float('nan')):.4e}  "
+              f"rho={rho:+.4f}  Delta={Delta:.4e}")
 
         if rho >= eta_accept and step_ok:
-            if rho > eta_good and at_boundary:
-                Delta = min(Delta * 2.0, Delta_max)
+            if rho > eta_good and on_boundary:
+                Delta = min(2.0 * Delta, Delta_max)
             return True, dy_try, rho, Delta
 
         Delta *= 0.5
         if Delta < 1e-12:
-            print("         | TR-BT: Delta too small — giving up.")
+            print("         | TR-DL: Delta too small — giving up.")
             break
 
-    return False, dy.copy(), -1.0, Delta
+    return False, np.zeros_like(M), -1.0, Delta
 
 
-def moore_spence_solve(r_off_hat_eq, z_off_hat_eq, a_hat_init, shared_data, *, tol=1e-7, max_iter=15, md=None,
+def moore_spence_solve(r_off_eq, z_off_eq, a_init, shared_data, *, tol=1e-7, max_iter=15, md=None,
                        dr_init=0.0, dz_init=0.0, da_init=0.0):
 
-    R_hat, H_hat, W_hat, L_c, U_c, Re, G_hat, U_m_hat, u_2d, p_2d = shared_data
-    r_ref = float(r_off_hat_eq) - float(dr_init)
-    z_ref = float(z_off_hat_eq) - float(dz_init)
-    a_ref = float(a_hat_init)   - float(da_init)
+    R, H, W, L_c, U_c, Re, G, U_m, u_2d, p_2d = shared_data
+    r_ref = float(r_off_eq) - float(dr_init)
+    z_ref = float(z_off_eq) - float(dz_init)
+    a_ref = float(a_init)   - float(da_init)
 
     if md is None:
-        md = setup_moving_mesh_hat(r_ref, z_ref, a_ref, R_hat, H_hat, W_hat,
-                                   Re, G_hat, U_m_hat, u_2d, p_2d,
+        md = setup_moving_mesh(r_ref, z_ref, a_ref, R, H, W,
+                                   Re, G, U_m, u_2d, p_2d,
                                    particle_maxh_rel, global_maxh_rel)
 
     F0, J0_full = evaluate_forces(float(dr_init), float(dz_init), float(da_init), md)
@@ -371,75 +427,81 @@ def moore_spence_solve(r_off_hat_eq, z_off_hat_eq, a_hat_init, shared_data, *, t
     print("\n" + "=" * 65)
     print(f"  MOORE-SPENCE (TR)"
           f"  mu={mu:+.4e}  phi=({phi_ev[0]:+.4f}, {phi_ev[1]:+.4f})")
-    print(f"  Start: r={r_off_hat_eq:.6f} z={z_off_hat_eq:.6f} a={a_hat_init:.6f}")
+    print(f"  Start: r={r_off_eq:.6f} z={z_off_eq:.6f} a={a_init:.6f}")
     print("=" * 65)
 
-    r_bif, z_bif, a_bif, phi_bif, ok, final_res, final_F = _ms_trial(
+    r_bif, z_bif, a_bif, phi_bif, ok, final_res, final_F, stalled = _ms_trial(
         float(dr_init), float(dz_init), float(da_init),
         phi_start, l_vec, md, r_ref, z_ref, a_ref, L_c, tol, max_iter)
 
     print(f"\n  {'=' * 50}")
-    print(f"  converged={ok}  |G|={final_res:.4e}  |F|={final_F:.4e}  a={a_bif:.8f}")
+    print(f"  converged={ok}  |M|={final_res:.4e}  |F|={final_F:.4e}  a={a_bif:.8f}")
     print(f"  {'=' * 50}")
-    return r_bif, z_bif, a_bif, phi_bif, ok, final_F
+    return r_bif, z_bif, a_bif, phi_bif, ok, final_F, final_res, stalled
 
 
 if __name__ == "__main__":
 
     # Initial guess from the bifurcation diagramm
-    r_off_hat_init = 0.6098
-    z_off_hat_init = 0.0274
-    a_hat_start = 0.1375
+    r_off_init = 0.6098
+    z_off_init = 0.0274
+    a_start = 0.1375
 
-    R_hat, H_hat, W_hat, a_hat, L_c, U_c, Re = nondimensionalisation(R, H, W, a, Q, rho, mu, print_values=True)
+    bg = background_flow_differentiable(R, H, W, Re)
 
-    print("\nparticle_maxh_rel = ", particle_maxh_rel)
-    print("global_maxh_rel = ", global_maxh_rel)
+    G, U_m, u_bar_2d, p_bar_tilde_2d = bg.solve_2D_background_flow()
 
-    bg = background_flow_differentiable(R_hat, H_hat, W_hat, Re)
+    shared_data = (R, H, W, L_c, U_c, Re, G, U_m, u_bar_2d, p_bar_tilde_2d)
 
-    G_hat, U_m_hat, u_bar_2d, p_bar_tilde_2d = bg.solve_2D_background_flow()
-
-    shared_data = (R_hat, H_hat, W_hat, L_c, U_c, Re, G_hat, U_m_hat, u_bar_2d, p_bar_tilde_2d)
-
+    header = "Newton + Moore-Spence" if USE_NEWTON_REFINEMENT else "Moore-Spence (no Newton pre-refine)"
     print("\n" + "#" * 65)
-    print(f"  Newton + Moore-Spence")
-    print(f"  Input: r={r_off_hat_init:.10f}  z={z_off_hat_init:.10f}  "
-          f"a={a_hat_start:.10f}")
+    print(f"  {header}")
+    print(f"  Input: r={r_off_init:.10f}  z={z_off_init:.10f}  "
+          f"a={a_start:.10f}")
     print("#" * 65)
 
-    r_hat, z_hat, md_newton, dr_newton, dz_newton = newton_root_refine(r_off_hat_init, z_off_hat_init, a_hat_start, shared_data, max_iter=10)
+    if USE_NEWTON_REFINEMENT:
+        r, z, md_ms, dr_init_ms, dz_init_ms = newton_root_refine(
+            r_off_init, z_off_init, a_start, shared_data, max_iter=10)
 
-    _log_mesh_quality(md_newton, "newton", 0, dr=dr_newton, dz=dz_newton, da=0.0)
+        _log_mesh_quality(md_ms, "newton", 0, dr=dr_init_ms, dz=dz_init_ms, da=0.0)
 
-    print("\n" + "-" * 65)
-    print("  Sanity remesh after NEWTON (fresh mesh @ converged position)")
-    print("-" * 65)
-    md_fresh_newton = setup_moving_mesh_hat(
-        r_hat, z_hat, a_hat_start, R_hat, H_hat, W_hat, Re, G_hat, U_m_hat,
-        u_bar_2d, p_bar_tilde_2d, particle_maxh_rel, global_maxh_rel,
-        a_mesh_size_res_ref=a_hat_start)
-    F_fresh = evaluate_forces(0.0, 0.0, 0.0, md_fresh_newton, jacobian=False)
-    print(f"  Newton point on fresh mesh:  |F| = {np.linalg.norm(F_fresh):.4e}"
-          f"  (F = [{F_fresh[0]:+.4e}, {F_fresh[1]:+.4e}])")
-    _log_mesh_quality(md_fresh_newton, "newton-fresh", 0, dr=0.0, dz=0.0, da=0.0)
-    del md_fresh_newton
-    gc.collect()
+        print("\n" + "-" * 65)
+        print("  Sanity remesh after NEWTON (fresh mesh @ converged position)")
+        print("-" * 65)
+        md_fresh_newton = setup_moving_mesh(
+            r, z, a_start, R, H, W, Re, G, U_m,
+            u_bar_2d, p_bar_tilde_2d, particle_maxh_rel, global_maxh_rel,
+            a_mesh_size_res_ref=a_start)
+        F_fresh = evaluate_forces(0.0, 0.0, 0.0, md_fresh_newton, jacobian=False)
+        print(f"  Newton point on fresh mesh:  |F| = {np.linalg.norm(F_fresh):.4e}"
+              f"  (F = [{F_fresh[0]:+.4e}, {F_fresh[1]:+.4e}])")
+        _log_mesh_quality(md_fresh_newton, "newton-fresh", 0, dr=0.0, dz=0.0, da=0.0)
+        del md_fresh_newton
+        gc.collect()
+    else:
+        # Build the MS mesh straight at the initial guess; MS will resolve
+        # the (r, z) shift jointly with (a, φ).
+        r, z = r_off_init, z_off_init
+        md_ms = setup_moving_mesh(
+            r, z, a_start, R, H, W, Re, G, U_m,
+            u_bar_2d, p_bar_tilde_2d, particle_maxh_rel, global_maxh_rel)
+        dr_init_ms, dz_init_ms = 0.0, 0.0
 
-    # Moore-Spence on the Newton-converged deformed mesh (single-shot,
-    # passes md_newton through and continues from the Newton-end deformation).
-    r_bif, z_bif, a_bif, phi_bif, converged, _ = moore_spence_solve(
-        r_hat, z_hat, a_hat_start, shared_data,
-        md=md_newton, dr_init=dr_newton, dz_init=dz_newton, da_init=0.0)
+    # Moore-Spence on the prepared mesh (single-shot, passes md_ms through
+    # and continues from any pre-deformation set above).
+    r_bif, z_bif, a_bif, phi_bif, converged, _F, _M, _stalled = moore_spence_solve(
+        r, z, a_start, shared_data,
+        md=md_ms, dr_init=dr_init_ms, dz_init=dz_init_ms, da_init=0.0)
 
-    # md_newton was built around (r_off_hat_init, z_off_hat_init, a_hat_start),
+    # md_ms was built around (r_off_init, z_off_init, a_start),
     # so xi at MS-end encodes the full offset from those reference values.
-    dr_total = float(r_bif - r_off_hat_init)
-    dz_total = float(z_bif - z_off_hat_init)
-    da_total = float(a_bif - a_hat_start)
-    _log_mesh_quality(md_newton, "ms", 0, dr=dr_total, dz=dz_total, da=da_total)
+    dr_total = float(r_bif - r_off_init)
+    dz_total = float(z_bif - z_off_init)
+    da_total = float(a_bif - a_start)
+    _log_mesh_quality(md_ms, "ms", 0, dr=dr_total, dz=dz_total, da=da_total)
 
-    del md_newton
+    del md_ms
     gc.collect()
 
     # ---- Sanity remesh after Moore-Spence: build a fresh mesh centered at
@@ -449,10 +511,10 @@ if __name__ == "__main__":
     print("\n" + "-" * 65)
     print("  Sanity remesh after MOORE-SPENCE (fresh mesh @ bifurcation point)")
     print("-" * 65)
-    md_fresh_ms = setup_moving_mesh_hat(
-        r_bif, z_bif, a_bif, R_hat, H_hat, W_hat, Re, G_hat, U_m_hat,
+    md_fresh_ms = setup_moving_mesh(
+        r_bif, z_bif, a_bif, R, H, W, Re, G, U_m,
         u_bar_2d, p_bar_tilde_2d, particle_maxh_rel, global_maxh_rel,
-        a_mesh_size_res_ref=a_hat_start)
+        a_mesh_size_res_ref=a_start)
     F_ms_fresh, J_ms_fresh = evaluate_forces(0.0, 0.0, 0.0, md_fresh_ms)
     Jsp_fresh = J_ms_fresh[:, :2]
     Jphi_fresh = Jsp_fresh @ phi_bif
